@@ -17,7 +17,7 @@
 - [ ] Cannot place food on campfire — impact M, effort S — issue "Can't place food on campfire"
 - [ ] Cannot place cushions — impact L, effort S — issue "Cant place cushions"
 - [ ] Water does not carry items — impact M, effort S — issue "Water does not carry items"
-- [ ] Piston-pushed blocks teleport; observer clock breaks piston — impact M, effort M — issues "Piston pushed blocks teleport", "observer clock makes piston bug"
+- [~] Piston-pushed blocks teleport (fixed 2026-10-26 for server-thread/multiplayer clients); observer clock breaks piston (open) — impact M, effort M — issues "Piston pushed blocks teleport", "observer clock makes piston bug"
 - [x] Potions become "uncraftable potion" in inventory / as trade item (fixed 2026-10-26: potion_contents carried both ways) — impact M, effort M — issues "All potions transform into uncraftable potion...", "Uncraftable potion as trade item"
 - [ ] Recipe book: list not selectable, 3x3 recipe drawn in 2x2 grid, overlays persist — impact M, effort M — issues "Recipe book: recipe list cannot be selected...", "recipe book overlays stay visible..."
 - [ ] Block-break textures wrong and jitter — impact L, effort M — issues "Pretty much every break texture...", "Block breaking texture moves a few pixels..."

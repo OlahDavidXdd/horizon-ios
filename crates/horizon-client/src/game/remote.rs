@@ -1833,7 +1833,11 @@ impl Game<'_> {
                         .map(str::to_owned)
                 });
                 if named.as_deref() == Some(&**block) {
-                    self.block_entity_event(p.pos, i32::from(p.b0), i32::from(p.b1));
+                    if matches!(&**block, "minecraft:piston" | "minecraft:sticky_piston") {
+                        self.remote_piston_event(p.pos, i32::from(p.b0), i32::from(p.b1));
+                    } else {
+                        self.block_entity_event(p.pos, i32::from(p.b0), i32::from(p.b1));
+                    }
                 }
             }
             // ClientLevel.levelEvent: LevelEventHandler, as this client's own
@@ -3218,6 +3222,7 @@ impl Game<'_> {
 
     fn tick_remote_level(&mut self) -> Result<()> {
         self.ticks += 1;
+        self.tick_remote_pistons();
         self.track_experience_display();
         // Options.broadcastOptions: a changed render distance is sent again.
         let view = client_view_distance(self.settings.render_distance);
