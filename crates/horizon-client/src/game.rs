@@ -3916,6 +3916,12 @@ impl Game<'_> {
             });
         }
         let state = self.world.block(hit.pos[0], hit.pos[1], hit.pos[2]);
+        // Nothing is dug out of air (MultiPlayerGameMode.startDestroyBlock, ServerPlayerGameMode's START): a block
+        // that broke at once leaves none, and digging on would knock air, which sounds like stone, every tick.
+        if self.res.facts().is_air(state) {
+            self.mining = None;
+            return Ok(());
+        }
         let facts = self.res.facts().get(state);
         if facts.hardness < 0.0 {
             return Ok(());

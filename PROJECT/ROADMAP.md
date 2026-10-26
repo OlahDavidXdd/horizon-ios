@@ -55,7 +55,7 @@
 - [ ] Poor performance in containers / creative search — impact M, effort M — issue "Poor performance in containers and specifically creative/search"
 
 ## Networking
-- [ ] Bossbar does not vanish properly — impact M, effort S — issue "Bossbar does not vanish properly"
+- [x] Bossbar does not vanish properly (fixed 2026-10-26: reset on reconfiguration) — impact M, effort S — issue "Bossbar does not vanish properly"
 - [ ] macOS integrated server panics on broken stdout pipe; world creation hangs — impact M, effort S — issue "macOS: integrated server panics with 'failed printing to stdout'..."
 - [ ] Benchmark counts scene loaded before first chunk is sent — impact L, effort S — issue "`--benchmark`: a scene counts as loaded..."
 - [ ] Playing ping should be optional — impact L, effort S — issue "Playing ping made optional, but on by default"
@@ -70,7 +70,7 @@
 ## Rendering & audio
 - [ ] Shader packs removed; to be rewritten — impact M, effort L — docs/known-issues.md:6
 - [ ] No title-screen background since v0.2.57 — impact M, effort S — issue "No Background on Title Screen after V0.2.57"
-- [ ] Continuous stone breaking sound — impact M, effort S — issue "Continuous stone breaking sound"
+- [x] Continuous stone breaking sound (fixed 2026-10-26: no digging air after an instant break) — impact M, effort S — issue "Continuous stone breaking sound"
 - [ ] Crash loading UI resource pack — impact M, effort M — issue "Crashed when loading UI resource Pack"
 - [ ] End crystal explosion shows no effect on macOS; death-screen tilt glitch; arrow-like particles in water; far kelp flicker — impact L, effort M — issues of those titles
 - [ ] Chinese text stops rendering after a stutter — impact M, effort M — issue "Chinese text stops rendering..."

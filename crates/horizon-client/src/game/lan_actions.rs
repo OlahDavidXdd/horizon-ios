@@ -1737,6 +1737,14 @@ impl Game<'_> {
                 {
                     play.digging = None;
                 }
+                // An instant break (a dead bush, a flower) leaves air where the dig was: the server destroys at
+                // START and records no dig, so nothing goes on being knocked there until the next START.
+                if let Some((pos, _)) = digging
+                    && self.res.facts().is_air(self.world.block(pos[0], pos[1], pos[2]))
+                    && let Some(play) = host.play.get_mut(&conn)
+                {
+                    play.digging = None;
+                }
             }
             // Player.tick: a different main-hand item resets the attack
             // strength, and detectEquipmentUpdates gives the guest its modifiers.
