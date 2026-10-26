@@ -161,6 +161,8 @@ pub(super) struct Remote {
     skin_textures: HashMap<u128, horizon_client::skins::Textures>,
     /// The skin texture each profile's players show, once its download is ready.
     skins: HashMap<u128, String>,
+    /// Skins from Ely.by for the players who came without one (`skins::ElySkins`).
+    ely_skins: horizon_client::skins::ElySkins,
     listed: std::collections::HashSet<u128>,
     /// `ClientboundLoginPacket.onlineMode`: the player list shows heads.
     online_mode: bool,
@@ -425,6 +427,7 @@ impl Game<'_> {
             tab_players: HashMap::new(),
             skin_textures: HashMap::new(),
             skins: HashMap::new(),
+            ely_skins: Default::default(),
             listed: Default::default(),
             online_mode: false,
             level_players: HashMap::new(),
@@ -2566,6 +2569,14 @@ impl Game<'_> {
                                         skins::unpack(&t.value, signature, &skins::TEXTURE_URIS);
                                     r.skin_textures.entry(e.uuid).or_insert(textures);
                                 }
+                                // No skin from the server (single player, LAN, offline mode): the one
+                                // the name wears on Ely.by.
+                                if r.skin_textures
+                                    .get(&e.uuid)
+                                    .is_none_or(|t| t.skin.is_none())
+                                {
+                                    r.ely_skins.ask(e.uuid, name);
+                                }
                             }
                         }
                     }
@@ -2877,9 +2888,19 @@ impl Game<'_> {
     /// never in the tab list: resolve each profile's textures and give the
     /// level's player models their skin.
     fn update_remote_skins(&mut self) {
-        let Some(r) = self.remote.as_ref() else {
+        let Some(r) = self.remote.as_mut() else {
             return;
         };
+        for (uuid, textures) in r.ely_skins.take() {
+            // Still listed, and still without a skin of the server's own.
+            if r.players.contains_key(&uuid) || r.tab_players.contains_key(&uuid) {
+                let entry = r.skin_textures.entry(uuid).or_default();
+                if entry.skin.is_none() {
+                    *entry = textures;
+                }
+            }
+        }
+        let r = &*r;
         let local = r.profile;
         let entries: Vec<(u128, horizon_client::skins::Textures)> = r
             .skin_textures

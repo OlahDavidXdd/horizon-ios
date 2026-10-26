@@ -366,6 +366,98 @@ fn http_get(url: &str) -> Option<Vec<u8>> {
 }
 
 /// SHA-1 (FIPS 180-4).
+/// Ely.by's skin system: a skin from a player's name alone, with no account and no signature, so offline
+/// players (single player, LAN, offline-mode servers) wear the skin they chose there. Ely.by answers with its
+/// own skins, or Mojang's for a name it doesn't hold, and `204 No Content` for neither.
+pub const ELY_TEXTURES: &str = "https://skinsystem.ely.by/textures/";
+
+/// The textures of an Ely.by `textures/<name>` answer: `{"SKIN":{"url":…,"metadata":{"model":"slim"}},"CAPE":…}`.
+/// Counted as signed: the game asked Ely.by for them itself, so nobody else chose them.
+pub fn ely_textures(body: &str) -> Textures {
+    let mut out = Textures {
+        signed: true,
+        ..Textures::default()
+    };
+    let Ok(serde_json::Value::Object(json)) = serde_json::from_str::<serde_json::Value>(body)
+    else {
+        return Textures::default();
+    };
+    for (kind, texture) in json {
+        let Some(url) = texture.get("url").and_then(|u| u.as_str()) else {
+            continue;
+        };
+        // Ely.by names its own files over plain HTTP; the same address answers over HTTPS.
+        let url = match url.strip_prefix("http://ely.by/") {
+            Some(rest) => format!("https://ely.by/{rest}"),
+            None => url.to_owned(),
+        };
+        match kind.as_str() {
+            "SKIN" => {
+                out.slim = texture
+                    .get("metadata")
+                    .and_then(|m| m.get("model"))
+                    .and_then(|m| m.as_str())
+                    == Some("slim");
+                out.skin = Some(url);
+            }
+            "CAPE" => out.cape = Some(url),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `name` is one Ely.by could hold, and safe to put in its URL as it is.
+fn ely_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The Ely.by lookups of one connection: each player asked once, on a thread of its own, and the textures
+/// found handed back by [`ElySkins::take`].
+pub struct ElySkins {
+    asked: std::collections::HashSet<u128>,
+    send: std::sync::mpsc::Sender<(u128, Textures)>,
+    done: std::sync::mpsc::Receiver<(u128, Textures)>,
+}
+
+impl Default for ElySkins {
+    fn default() -> Self {
+        let (send, done) = std::sync::mpsc::channel();
+        Self {
+            asked: Default::default(),
+            send,
+            done,
+        }
+    }
+}
+
+impl ElySkins {
+    /// Ask Ely.by for `name`'s skin, once per player.
+    pub fn ask(&mut self, uuid: u128, name: &str) {
+        if !ely_name(name) || !self.asked.insert(uuid) {
+            return;
+        }
+        let (url, send) = (format!("{ELY_TEXTURES}{name}"), self.send.clone());
+        let _ = std::thread::Builder::new()
+            .name("horizon-ely-skin".into())
+            .spawn(move || {
+                let Some(body) = http_get(&url) else { return };
+                let textures = ely_textures(&String::from_utf8_lossy(&body));
+                if textures.skin.is_some() {
+                    let _ = send.send((uuid, textures));
+                }
+            });
+    }
+
+    /// The skins found since the last call.
+    pub fn take(&mut self) -> Vec<(u128, Textures)> {
+        self.done.try_iter().collect()
+    }
+}
+
 pub fn sha1(data: &[u8]) -> [u8; 20] {
     let mut h: [u32; 5] = [
         0x6745_2301,
@@ -497,5 +589,31 @@ mod tests {
             texture_hash("http://textures.minecraft.net/texture/abc.png?x=1").unwrap(),
             "abc"
         );
+    }
+
+    #[test]
+    fn ely_answers_become_textures() {
+        let slim = super::ely_textures(
+            r#"{"SKIN":{"url":"http://ely.by/storage/skins/69c6.png","metadata":{"model":"slim"}},"CAPE":{"url":"http://ely.by/storage/capes/1.png"}}"#,
+        );
+        assert_eq!(
+            slim.skin.as_deref(),
+            Some("https://ely.by/storage/skins/69c6.png")
+        );
+        assert_eq!(
+            slim.cape.as_deref(),
+            Some("https://ely.by/storage/capes/1.png")
+        );
+        assert!(slim.slim && slim.signed);
+        let mojang =
+            super::ely_textures(r#"{"SKIN":{"url":"http://textures.minecraft.net/texture/2920"}}"#);
+        assert_eq!(
+            mojang.skin.as_deref(),
+            Some("http://textures.minecraft.net/texture/2920")
+        );
+        assert!(!mojang.slim);
+        // 204 No Content: nothing to wear.
+        assert_eq!(super::ely_textures(""), super::Textures::default());
+        assert!(super::ely_name("Steve_01") && !super::ely_name("a b") && !super::ely_name("../x"));
     }
 }
