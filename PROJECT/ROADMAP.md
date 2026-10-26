@@ -18,7 +18,7 @@
 - [ ] Cannot place cushions — impact L, effort S — issue "Cant place cushions"
 - [ ] Water does not carry items — impact M, effort S — issue "Water does not carry items"
 - [ ] Piston-pushed blocks teleport; observer clock breaks piston — impact M, effort M — issues "Piston pushed blocks teleport", "observer clock makes piston bug"
-- [ ] Potions become "uncraftable potion" in inventory / as trade item — impact M, effort M — issues "All potions transform into uncraftable potion...", "Uncraftable potion as trade item"
+- [x] Potions become "uncraftable potion" in inventory / as trade item (fixed 2026-10-26: potion_contents carried both ways) — impact M, effort M — issues "All potions transform into uncraftable potion...", "Uncraftable potion as trade item"
 - [ ] Recipe book: list not selectable, 3x3 recipe drawn in 2x2 grid, overlays persist — impact M, effort M — issues "Recipe book: recipe list cannot be selected...", "recipe book overlays stay visible..."
 - [ ] Block-break textures wrong and jitter — impact L, effort M — issues "Pretty much every break texture...", "Block breaking texture moves a few pixels..."
 - [ ] Ghost items in crafting grid after closing a crafting table; shift-click in chests stops working — impact M, effort M — issues "Ghost blocks/items appear...", "After using Shift + Right-Click..."
@@ -69,7 +69,7 @@
 
 ## Rendering & audio
 - [ ] Shader packs removed; to be rewritten — impact M, effort L — docs/known-issues.md:6
-- [ ] No title-screen background since v0.2.57 — impact M, effort S — issue "No Background on Title Screen after V0.2.57"
+- [x] No title-screen background since v0.2.57 (not reproduced 2026-10-26: CI title scene shows the panorama) — impact M, effort S — issue "No Background on Title Screen after V0.2.57"
 - [x] Continuous stone breaking sound (fixed 2026-10-26: no digging air after an instant break) — impact M, effort S — issue "Continuous stone breaking sound"
 - [ ] Crash loading UI resource pack — impact M, effort M — issue "Crashed when loading UI resource Pack"
 - [ ] End crystal explosion shows no effect on macOS; death-screen tilt glitch; arrow-like particles in water; far kelp flicker — impact L, effort M — issues of those titles

@@ -2285,6 +2285,14 @@ impl Hub {
             .name(id)
             .map(std::sync::Arc::from)
     }
+    /// The `minecraft:potion` (built-in registry) name of a network id.
+    pub fn potion_name(&self, id: i32) -> Option<String> {
+        self.sync
+            .builtin
+            .get("minecraft:potion")?
+            .name(id)
+            .map(str::to_owned)
+    }
     pub fn enchantment_name(&self, id: i32) -> Option<String> {
         self.sync
             .dynamic

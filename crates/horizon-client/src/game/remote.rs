@@ -619,6 +619,13 @@ impl Game<'_> {
             let value = match c {
                 // Read past, not decoded: the item keeps its prototype's value.
                 Component::Raw(_) => continue,
+                Component::Potion(id) => {
+                    let Some(potion) = r.builtin.get("minecraft:potion").and_then(|p| p.name(*id))
+                    else {
+                        continue;
+                    };
+                    Tag::compound([("potion", Tag::String(potion.into()))])
+                }
                 // Trim materials and patterns are synced registries, as enchantments are.
                 Component::Trim { material, pattern } => {
                     let (Some(material), Some(pattern)) = (
@@ -735,16 +742,25 @@ impl Game<'_> {
         }
         Some(Tag::compound(entries))
     }
+    /// The stack as the server reads it, with its components (the creative inventory's slots, picked blocks):
+    /// the same encoder a server uses, with this connection's registry ids. Only count and damage went before,
+    /// so a creative potion, enchanted book or named item reached the server as a plain one.
     fn to_network(&self, s: &Option<ItemStack>) -> Option<Stack> {
-        let s = s.as_ref()?;
-        let mut stack = Stack::new(self.item_id(&s.item), s.count as i32);
-        if s.damage > 0 {
-            stack.added.push((
-                horizon_protocol::item::component::DAMAGE,
-                horizon_protocol::item::Component::Int(s.damage as i32),
-            ));
-        }
-        Some(stack)
+        let r = self.remote.as_ref();
+        horizon_client::lan::guest::stack_to_network(
+            |item| self.item_id(item),
+            |registry, name| {
+                let r = r?;
+                if let Some(ids) = r.builtin.get(registry) {
+                    return ids.id(name);
+                }
+                (0..)
+                    .map_while(|i| r.registries.name(registry, i).map(|n| (i, n)))
+                    .find(|(_, n)| *n == name)
+                    .map(|(i, _)| i)
+            },
+            s,
+        )
     }
     /// A line in the connection's chat, with its styles, click and hover
     /// events (ChatComponent.addMessage).

@@ -22,6 +22,7 @@ pub mod component {
     pub const LORE: i32 = 11;
     pub const RARITY: i32 = 12;
     pub const ENCHANTMENTS: i32 = 13;
+    pub const POTION_CONTENTS: i32 = 53;
     pub const CUSTOM_MODEL_DATA: i32 = 17;
     pub const TOOLTIP_DISPLAY: i32 = 18;
     pub const REPAIR_COST: i32 = 19;
@@ -87,6 +88,9 @@ pub enum Component {
         material: i32,
         pattern: i32,
     },
+    /// `PotionContents` of a plain potion: the `minecraft:potion` registry id, with no custom colour, effects or
+    /// name (any of those stays `Raw`).
+    Potion(i32),
     /// A component Horizon reads past without interpreting it: its encoded
     /// bytes, written back as they came.
     Raw(Vec<u8>),
@@ -251,6 +255,19 @@ impl Component {
                     _ => Self::Raw(bytes.to_vec()),
                 }
             }
+            // PotionContents.STREAM_CODEC: optional potion, optional colour, custom effects, optional name.
+            POTION_CONTENTS => {
+                let start = r.position();
+                skip::component(POTION_CONTENTS, r)?;
+                let bytes = r.since(start);
+                let mut p = Reader::new(bytes);
+                match (p.bool(), p.varint(), p.bool(), p.varint(), p.bool()) {
+                    (Ok(true), Ok(id), Ok(false), Ok(0), Ok(false)) if p.remaining() == 0 => {
+                        Self::Potion(id)
+                    }
+                    _ => Self::Raw(bytes.to_vec()),
+                }
+            }
             other => {
                 let start = r.position();
                 skip::component(other, r)?;
@@ -261,6 +278,13 @@ impl Component {
     fn write(&self, kind: i32, w: &mut Writer) {
         match self {
             Self::Raw(bytes) => w.bytes(bytes),
+            Self::Potion(id) => {
+                w.bool(true);
+                w.varint(*id);
+                w.bool(false);
+                w.varint(0);
+                w.bool(false);
+            }
             Self::Trim { material, pattern } => {
                 w.varint(material + 1);
                 w.varint(pattern + 1);
@@ -604,6 +628,25 @@ mod tests {
             stack.component(component::WRITABLE_BOOK_CONTENT),
             Some(&Component::WritableBook(vec!["hi".into()]))
         );
+    }
+
+    #[test]
+    fn plain_potions_round_trip_and_richer_ones_stay_raw() {
+        let mut potion = Stack::new(1000, 1);
+        potion
+            .added
+            .push((component::POTION_CONTENTS, Component::Potion(21)));
+        round::<Option<Stack>, Slot>(Some(potion));
+        // A custom colour: kept whole as bytes, written back unchanged (potion 21, colour -1, no effects, no name).
+        let bytes = [1, 0xE8, 7, 1, 0, 53, 1, 21, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0];
+        let stack = Slot::read(&mut Reader::new(&bytes)).unwrap().unwrap();
+        assert!(matches!(
+            stack.component(component::POTION_CONTENTS),
+            Some(Component::Raw(_))
+        ));
+        let mut w = Writer::new();
+        Slot::write(&Some(stack), &mut w);
+        assert_eq!(w.data, bytes);
     }
 
     #[test]

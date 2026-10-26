@@ -455,6 +455,13 @@ fn network_stack(
             horizon_protocol::item::Component::Int(s.damage as i32),
         ));
     }
+    // A potion, splash or lingering potion, or tipped arrow keeps its potion (it showed as an uncraftable one).
+    if let Some(id) = s.potion().and_then(|p| synced_id("minecraft:potion", p)) {
+        stack.added.push((
+            horizon_protocol::item::component::POTION_CONTENTS,
+            horizon_protocol::item::Component::Potion(id),
+        ));
+    }
     let enchantments: Vec<(i32, i32)> = s
         .enchantments()
         .iter()
