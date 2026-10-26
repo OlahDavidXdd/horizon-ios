@@ -244,6 +244,8 @@ pub struct Frame<'a> {
     pub additive: &'a [Vertex],
     /// Name tags over everything, without depth (`TEXT_SEE_THROUGH`).
     pub see_through: &'a [Vertex],
+    /// The glowing entities' shapes in their outline colours, drawn into the outline pass.
+    pub glowing: &'a [Vertex],
     /// Camera-relative sun and moon, or the animated End flash (additive,
     /// behind everything and after the resident End sky box).
     pub celestial: &'a [Vertex],
@@ -369,6 +371,11 @@ pub struct Renderer {
     lightning_pipeline: wgpu::RenderPipeline,
     lightning: lightning::Renderer,
     see_through_pipeline: wgpu::RenderPipeline,
+    /// Glowing entities: their shapes into the outline target, then its edges over the world.
+    outline_shape_pipeline: wgpu::RenderPipeline,
+    outline_pipeline: wgpu::RenderPipeline,
+    outline_layout: wgpu::BindGroupLayout,
+    outline_target: Option<(wgpu::TextureView, wgpu::BindGroup, [u32; 2])>,
     celestial_pipeline: wgpu::RenderPipeline,
     celestial_buffer: wgpu::Buffer,
     end_sky: end_sky::EndSky,
@@ -1746,6 +1753,82 @@ impl Renderer {
             alpha_blend,
             false,
         );
+        // The glowing entities' outline (OutlineBufferSource, PostChain entity_outline).
+        let outline_shape_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Entity outline shapes"),
+                layout: Some(&entity_layout),
+                vertex: wgpu::VertexState {
+                    module: &entity_shader,
+                    entry_point: Some("vs_entity"),
+                    compilation_options: Default::default(),
+                    buffers: &entity_vertex,
+                },
+                primitive: Default::default(),
+                // Seen through walls: the outline target has no depth.
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &entity_shader,
+                    entry_point: Some("fs_outline_shape"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let outline_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Entity outline"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let outline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Entity outline"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("gfx/outline.wgsl").into()),
+        });
+        let outline_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Entity outline"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Entity outline"),
+                    bind_group_layouts: &[Some(&outline_layout)],
+                    immediate_size: 0,
+                }),
+            ),
+            vertex: wgpu::VertexState {
+                module: &outline_shader,
+                entry_point: Some("vs_outline"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &outline_shader,
+                entry_point: Some("fs_outline"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format.remove_srgb_suffix(),
+                    blend: Some(alpha_blend),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let entity_pipeline = entity_pipeline(
             "Entities",
             None,
@@ -2252,6 +2335,10 @@ impl Renderer {
             lightning_pipeline,
             lightning: lightning::Renderer::new(),
             see_through_pipeline,
+            outline_shape_pipeline,
+            outline_pipeline,
+            outline_layout,
+            outline_target: None,
             celestial_pipeline,
             celestial_buffer,
             end_sky: end_sky::EndSky::default(),
@@ -2748,6 +2835,83 @@ impl Renderer {
         } else {
             self.release_section(key);
         }
+    }
+    /// The glowing entities' outline: their shapes (`glowing` quads of the entity buffer from vertex `base`) into
+    /// the outline target, then the target's edges blended over `view` (PostChain entity_outline).
+    fn draw_outlines(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        size: [u32; 2],
+        glowing: u32,
+        base: u32,
+    ) {
+        if self.outline_target.as_ref().is_none_or(|t| t.2 != size) {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Entity outline"),
+                size: wgpu::Extent3d {
+                    width: size[0].max(1),
+                    height: size[1].max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let target = texture.create_view(&Default::default());
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Entity outline"),
+                layout: &self.outline_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&target),
+                }],
+            });
+            self.outline_target = Some((target, group, size));
+        }
+        let Some((target, group, _)) = &self.outline_target else {
+            return;
+        };
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Entity outline shapes"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.outline_shape_pipeline);
+            pass.set_bind_group(0, &self.entity_group, &[]);
+            pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+            pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..glowing * 6, base as i32, 0..1);
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Entity outline"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.outline_pipeline);
+        pass.set_bind_group(0, group, &[]);
+        pass.draw(0..3, 0..1);
     }
     /// Horizon's resolution scale (world pixels per window pixel) and FXAA.
     pub fn set_world_post(&mut self, scale: f32, antialias: bool) {
@@ -3489,6 +3653,9 @@ impl Renderer {
             &frame.lightning,
             camera,
         );
+        // After the see-through vertices: the glowing shapes for the outline pass.
+        self.entity_batch.combined.extend_from_slice(frame.glowing);
+        let glowing_quads = (frame.glowing.len() / 4) as u32;
         let all_entities = &self.entity_batch.combined;
         let hand_quads = (frame.hand.len() / 4) as u32;
         let additive_quads = (frame.additive.len() / 4) as u32;
@@ -3531,14 +3698,15 @@ impl Renderer {
                 bytemuck::cast_slice(&frame.celestial[..celestial_vertices]),
             );
         }
-        let max_quads = (world_quads + additive_quads + hand_quads + see_through_quads)
-            .max(cloud_quads)
-            .max(if frame.lightning.bolts.is_empty() {
-                0
-            } else {
-                lightning::QUADS
-            })
-            .max(weather_quads);
+        let max_quads =
+            (world_quads + additive_quads + hand_quads + see_through_quads + glowing_quads)
+                .max(cloud_quads)
+                .max(if frame.lightning.bolts.is_empty() {
+                    0
+                } else {
+                    lightning::QUADS
+                })
+                .max(weather_quads);
         if max_quads > self.index_quads {
             self.index_quads = max_quads.next_power_of_two();
             self.indices = Self::quad_indices(&self.device, self.index_quads);
@@ -3965,6 +4133,22 @@ impl Renderer {
                     0..1,
                 );
             }
+        }
+        if glowing_quads > 0 {
+            let size = match &scaled {
+                Some(_) => self
+                    .world_post
+                    .size()
+                    .unwrap_or([self.config.width, self.config.height]),
+                None => [self.config.width, self.config.height],
+            };
+            self.draw_outlines(
+                &mut encoder,
+                world_view,
+                size,
+                glowing_quads,
+                (world_quads + additive_quads + hand_quads + see_through_quads) * 4,
+            );
         }
         if let Some((color, depth)) = &scaled
             && pack_post

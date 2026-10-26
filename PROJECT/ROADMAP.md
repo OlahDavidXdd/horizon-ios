@@ -25,7 +25,7 @@
 - [ ] Hotbar toolbar screen (save/load keys) not wired to HotbarManager — impact L, effort M — docs/rust-parity.md:1454
 
 ## Entities & mobs
-- [ ] No ender dragon; glowing effect does not work — impact H, effort M — issue "No ender dragon and glowing effect does not work"
+- [~] No ender dragon (upstream PR #2049); glowing effect does not work (fixed 2026-10-26: outlines drawn, team colours) — impact H, effort M — issue "No ender dragon and glowing effect does not work"
 - [x] Skeletons do not aim bows at players — verified 2026-10-26: bow pose raised and drawn (fixed by 3e9fe5a8, the aggressive flag) — impact H, effort S — issue "Skeletons don't aim bows at players when shooting"
 - [x] Peaceful difficulty does nothing — verified 2026-10-26: /difficulty peaceful removes zombies, health 14→20 in 100 ticks — impact H, effort S — issue "peaceful doesn't do anything" (in progress)
 - [ ] Villagers do not take a profession from player-placed workstations — impact M, effort M — issue "Villagers don't get their profession..."

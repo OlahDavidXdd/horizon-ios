@@ -2966,8 +2966,24 @@ impl Game<'_> {
             }
         }
     }
+    /// Entity.getTeamColor for the outline: the colour of the mob's team, else white (RGBA8, A in the high byte).
+    fn outline_color(&self, mob: &Mob) -> u32 {
+        let rgb = self
+            .mob_team(mob.id)
+            .and_then(|team| team.color.as_deref())
+            .and_then(horizon_client::scoreboard::team_color_rgb)
+            .unwrap_or(0xFF_FFFF);
+        // The vertex colour's bytes are R, G, B, A in memory order.
+        0xFF00_0000 | (rgb & 0xFF) << 16 | (rgb & 0xFF00) | (rgb >> 16) & 0xFF
+    }
     /// Mob models and projectiles for the entity pass.
-    pub(super) fn mob_geometry(&self, camera: glam::DVec3, alpha: f64, out: &mut Vec<Vertex>) {
+    pub(super) fn mob_geometry(
+        &self,
+        camera: glam::DVec3,
+        alpha: f64,
+        out: &mut Vec<Vertex>,
+        glowing: &mut Vec<Vertex>,
+    ) {
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
         let scale = f64::from(self.settings.entity_distance);
@@ -3035,9 +3051,21 @@ impl Game<'_> {
                 out,
             );
             self.mob_block_geometry(mob, camera, alpha, packed, out);
+            // Entity.isCurrentlyGlowing: its shape again, in its team's colour, for the outline pass
+            // (OutlineBufferSource). Unlit (normal w 0), so the colour is the colour.
+            if mob.currently_glowing() {
+                let color = self.outline_color(mob);
+                glowing.extend(out[entity_start..].iter().map(|v| Vertex {
+                    color,
+                    normal: [0; 4],
+                    ..*v
+                }));
+            }
             // Glowing outlines and a guardian's beam remain visible independently
             // of whether the body is hidden behind terrain.
-            if !mob.glowing && horizon_client::mobs::guardian::beam(mob, alpha as f32).is_none() {
+            if !mob.currently_glowing()
+                && horizon_client::mobs::guardian::beam(mob, alpha as f32).is_none()
+            {
                 self.cull_entity_vertices(out, entity_start);
             }
             // GuardianRenderer: the laser to the locked target.

@@ -1265,6 +1265,8 @@ struct Game<'a> {
     luminance: Option<horizon_client::dynamic_light::Luminance>,
     /// Name tags drawn over everything (`RenderPipelines.TEXT_SEE_THROUGH`).
     see_through_vertices: Vec<Vertex>,
+    /// The glowing entities' shapes in their outline colour (`OutlineBufferSource`), for the outline pass.
+    glowing_vertices: Vec<Vertex>,
     started: Instant,
     previous: Instant,
     /// FramerateLimitTracker.latestInputTime.
@@ -6871,8 +6873,11 @@ impl Game<'_> {
         // `VaultRenderer`.
         self.vault_geometry(camera, alpha, &mut out);
         self.ominous_item_spawner_geometry(camera, alpha, &mut out);
-        // Mobs and their projectiles.
-        self.mob_geometry(camera, alpha, &mut out);
+        // Mobs and their projectiles, and the glowing ones' outline shapes.
+        let mut glowing = std::mem::take(&mut self.glowing_vertices);
+        glowing.clear();
+        self.mob_geometry(camera, alpha, &mut out, &mut glowing);
+        self.glowing_vertices = glowing;
         self.player_model_geometry(camera, self.clock.camera_fraction(), &mut out);
         self.guest_model_geometry(camera, alpha, &mut out);
         self.fangs_geometry(camera, alpha, &mut out);
@@ -10181,6 +10186,7 @@ impl Game<'_> {
             .then(|| self.border_draw(camera.to_array(), alpha as f32))
             .flatten();
         let see_through = std::mem::take(&mut self.see_through_vertices);
+        let glowing = std::mem::take(&mut self.glowing_vertices);
         if title {
             self.dynamic_lights.clear();
         } else {
@@ -10265,6 +10271,7 @@ impl Game<'_> {
             },
             additive: &additive,
             see_through: &see_through,
+            glowing: if title { &[] } else { &glowing },
             celestial: if self.settings.horizon.sky || title {
                 &celestial
             } else {
@@ -10306,6 +10313,7 @@ impl Game<'_> {
         };
         // Restore storage even when rendering fails (for example, a lost surface).
         self.entity_vertices = entities;
+        self.glowing_vertices = glowing;
         self.see_through_vertices = see_through;
         result
     }
@@ -11910,6 +11918,7 @@ impl<'a> Game<'a> {
             dynamic_lights: Vec::new(),
             luminance: None,
             see_through_vertices: Vec::new(),
+            glowing_vertices: Vec::new(),
             health_hud: hud_layout::HealthHud::default(),
             started: now,
             previous: now,
@@ -12847,6 +12856,7 @@ fn loading_frame(hud: &HudBatch) -> Frame<'_> {
         lightning: Default::default(),
         additive: &[],
         see_through: &[],
+        glowing: &[],
         celestial: &[],
         stars: None,
         hand: &[],
