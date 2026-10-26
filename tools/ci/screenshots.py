@@ -18,6 +18,9 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import lab  # noqa: E402  (tools/lab.py)
+
 SEED = 1234567
 WORLD = "CiScenes"
 
@@ -44,12 +47,8 @@ def main() -> int:
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix="horizon-scenes-"))
-    env = dict(os.environ)
-    for name in ("HORIZON_HOME", "HORIZON_LAUNCHER_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"):
-        folder = scratch / name.lower()
-        folder.mkdir()
-        env[name] = str(folder)
-    env.update(HORIZON_LAUNCHER_NO_SELF_UPDATE="1", HORIZON_NO_AUDIO="1", HORIZON_TELEMETRY_URL="off")
+    # Fresh folders for the game's home, the launcher's and XDG's, no audio: never a real player's files.
+    env = lab.game_env(HORIZON_TELEMETRY_URL="off")
     socket = args.attach or str(scratch / "ctl.sock")
     workdir = args.cwd or env["HORIZON_HOME"]
     log = (out / "game.log").open("w")
