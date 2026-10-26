@@ -107,7 +107,7 @@ def main() -> int:
             ctl("open", WORLD, str(SEED), "creative", timeout=300)
             ctl("wait-ready", "240", timeout=300)
             ctl("command", "gamerule send_command_feedback false")
-            ctl("options-set", "chatVisibility", "hidden", check=False)
+            ctl("options-set", "chatVisibility", "2", check=False)
             ctl("command", "gamerule advance_time false")
             ctl("command", "gamerule advance_weather false")
             ctl("command", "gamerule spawn_mobs false")

@@ -26,8 +26,8 @@
 
 ## Entities & mobs
 - [ ] No ender dragon; glowing effect does not work — impact H, effort M — issue "No ender dragon and glowing effect does not work"
-- [ ] Skeletons do not aim bows at players — impact H, effort S — issue "Skeletons don't aim bows at players when shooting"
-- [ ] Peaceful difficulty does nothing — impact H, effort S — issue "peaceful doesn't do anything" (in progress)
+- [x] Skeletons do not aim bows at players — verified 2026-10-26: bow pose raised and drawn (fixed by 3e9fe5a8, the aggressive flag) — impact H, effort S — issue "Skeletons don't aim bows at players when shooting"
+- [x] Peaceful difficulty does nothing — verified 2026-10-26: /difficulty peaceful removes zombies, health 14→20 in 100 ticks — impact H, effort S — issue "peaceful doesn't do anything" (in progress)
 - [ ] Villagers do not take a profession from player-placed workstations — impact M, effort M — issue "Villagers don't get their profession..."
 - [ ] Projectiles and block entities do not visually update until they land; thrown items lag — impact M, effort M — issues "Projectiles and block entities don't visually update...", "throwable stuff lag/stay in place..."
 - [ ] Mobs/items/minecarts entering portals between server levels, and portal tickets, unhandled — impact M, effort L — docs/server-levels.md:95
@@ -36,7 +36,7 @@
 - [ ] Raider goals, banner fetching, ravager riding not compared against vanilla; village distance not from PoiManager — impact L, effort L — docs/rust-parity.md:1577-1587
 
 ## Player mechanics
-- [ ] Creative players can break blocks holding a sword — impact M, effort S — issue "Creative players can break blocks while holding a sword"
+- [x] Creative players can break blocks holding a sword (fixed 2026-10-26, the tool component's can_destroy_blocks_in_creative) — impact M, effort S — issue "Creative players can break blocks while holding a sword"
 - [ ] Sprint-flying with Control increases speed — impact L, effort S — issue "When flying in sprint, holding control increases speed"
 - [ ] Swimming-upward collision hitbox wrong — impact L, effort S — issue "Collision hitbox wrong when swimming upwards"
 - [ ] Drowning/air supply not tracked (advancement `air` criterion stays 300) — impact M, effort M — docs/rust-parity.md:1374

@@ -3812,6 +3812,11 @@ impl Game<'_> {
             return;
         }
         if self.creative {
+            // MultiPlayerGameMode.startDestroyBlock: nothing is sent for a held item that can't break blocks in
+            // creative mode (a sword, the trident, the mace).
+            if !self.held_destroys_in_creative() {
+                return;
+            }
             let seq = self.next_sequence();
             self.predict_break(hit.pos, state, seq);
             self.send(S::PlayerAction(play::PlayerAction {

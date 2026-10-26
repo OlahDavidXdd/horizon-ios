@@ -3262,6 +3262,14 @@ impl Game<'_> {
     /// mined the block `name`: an item with a `tool` component counts as used
     /// and loses its `damage_per_block` on a block that doesn't break
     /// instantly (`ShearsItem`: on any block but fire).
+    /// Item.canDestroyBlock for a creative player: whether the main hand's item lets them break blocks (its
+    /// `tool` component's `can_destroy_blocks_in_creative`; true for anything without one).
+    fn held_destroys_in_creative(&self) -> bool {
+        self.inventory[self.selected]
+            .as_ref()
+            .and_then(|stack| self.res.items().get(&stack.item))
+            .is_none_or(|info| info.creative_destroy)
+    }
     fn mine_block_with_held(&mut self, name: &str, hardness: f32) {
         let Some(stack) = self.inventory[self.selected].clone() else {
             return;
@@ -3885,6 +3893,11 @@ impl Game<'_> {
             return Ok(());
         }
         if self.creative {
+            // Item.canDestroyBlock: a creative player's sword, trident or mace breaks nothing.
+            if !self.held_destroys_in_creative() {
+                self.mining = None;
+                return Ok(());
+            }
             if self.destroy_delay == 0 {
                 self.break_block(hit.pos)?;
                 self.destroy_delay = 5;
