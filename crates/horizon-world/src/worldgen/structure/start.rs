@@ -831,13 +831,15 @@ pub fn create_starts(
             continue;
         }
         if set.structures.len() == 1 {
+            let structure = set.structures[0].0;
             if let Some(start) = try_generate(
                 registry,
                 resources,
                 bindings,
                 context,
-                set.structures[0].0,
+                structure,
                 chunk,
+                &registry.structures[structure].biomes,
             ) {
                 starts.push(start);
             }
@@ -858,9 +860,15 @@ pub fn create_starts(
                 index += 1;
             }
             let selected = options[index];
-            if let Some(start) =
-                try_generate(registry, resources, bindings, context, selected.0, chunk)
-            {
+            if let Some(start) = try_generate(
+                registry,
+                resources,
+                bindings,
+                context,
+                selected.0,
+                chunk,
+                &registry.structures[selected.0].biomes,
+            ) {
                 starts.push(start);
                 break;
             }
@@ -870,6 +878,21 @@ pub fn create_starts(
     }
     starts
 }
+/// `/place structure`: Structure.generate for `structure` at `chunk`, whatever its set's placement, with `biomes`
+/// as the biomes it may start in (the command passes every biome, as vanilla's `holder -> true` does).
+pub fn generate_structure(
+    registry: &StructureRegistry,
+    resources: &StructureResources,
+    bindings: &FeatureBlockBindings<'_>,
+    context: &mut impl StartContext,
+    structure: usize,
+    chunk: ChunkPos,
+    biomes: &BTreeSet<BiomeId>,
+) -> Option<StructureStart> {
+    try_generate(
+        registry, resources, bindings, context, structure, chunk, biomes,
+    )
+}
 fn try_generate(
     registry: &StructureRegistry,
     resources: &StructureResources,
@@ -877,12 +900,13 @@ fn try_generate(
     context: &mut impl StartContext,
     structure: usize,
     chunk: ChunkPos,
+    biomes: &BTreeSet<BiomeId>,
 ) -> Option<StructureStart> {
     let def = &registry.structures[structure];
     if def.disabled {
         return None;
     }
-    context.set_valid_biomes(&def.biomes);
+    context.set_valid_biomes(biomes);
     let seed = context.seed();
     let mut random = WorldgenRandom::new(LegacyRandom::new(0));
     random.set_large_feature_seed(seed, chunk.x, chunk.z);
@@ -894,7 +918,7 @@ fn try_generate(
                 .ok()?;
             if !jigsaw
                 .checks
-                .pass(context, &def.biomes, chunk, height, jigsaw.project_to)
+                .pass(context, biomes, chunk, height, jigsaw.project_to)
             {
                 return None;
             }
@@ -1176,7 +1200,7 @@ fn try_generate(
             )?;
             let position = [x, y, z];
             let quart = position.map(|v| v >> 2);
-            if !def.biomes.contains(&context.noise_biome(quart)) {
+            if !biomes.contains(&context.noise_biome(quart)) {
                 return None;
             }
             let piece = super::nether_fossil::piece(resources, &mut random, position)?;
@@ -1197,7 +1221,7 @@ fn try_generate(
         StructureKind::Unsupported(_) => return None,
     };
     let quart = position.map(|v| v >> 2);
-    if !def.biomes.contains(&context.noise_biome(quart)) || pieces.is_empty() {
+    if !biomes.contains(&context.noise_biome(quart)) || pieces.is_empty() {
         return None;
     }
     let mut bounding_box = pieces[0].bounding_box();

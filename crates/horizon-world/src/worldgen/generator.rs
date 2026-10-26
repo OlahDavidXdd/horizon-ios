@@ -1673,6 +1673,12 @@ trait SeededPipeline: Send + Sync {
         worker: &mut WorkerState,
         query: &JigsawQuery<'_>,
     ) -> Option<JigsawPieces>;
+    fn structure_start(
+        &self,
+        worker: &mut WorkerState,
+        name: &str,
+        chunk: ChunkPos,
+    ) -> Option<PlacedStructure>;
 }
 impl<R: RandomSource + 'static> SeededPipeline for Pipeline<R>
 where
@@ -2187,6 +2193,47 @@ where
             resources: structures.resources.clone(),
         })
     }
+    fn structure_start(
+        &self,
+        worker: &mut WorkerState,
+        name: &str,
+        chunk: ChunkPos,
+    ) -> Option<PlacedStructure> {
+        // PlaceCommand.placeStructure: Structure.generate with every biome allowed (`holder -> true`) and no set
+        // placement, from the level seed and the chunk.
+        let structures = self.structures.as_ref()?;
+        let index = structures
+            .registry
+            .structures
+            .iter()
+            .position(|def| def.name == name)?;
+        let every_biome: BTreeSet<BiomeId> = (0..self.data.biome_names().len() as u32)
+            .map(BiomeId)
+            .collect();
+        let start = super::structure::start::generate_structure(
+            &structures.registry,
+            &structures.resources,
+            &structures.bindings,
+            &mut StructureQueries {
+                pipeline: self,
+                worker,
+                valid: BTreeSet::new(),
+            },
+            index,
+            chunk,
+            &every_biome,
+        )?;
+        (!start.pieces.is_empty()).then(|| PlacedStructure {
+            start,
+            resources: structures.resources.clone(),
+        })
+    }
+}
+
+/// A structure generated for `/place structure`, and the templates its pieces place.
+pub struct PlacedStructure {
+    pub start: super::structure::start::StructureStart,
+    pub resources: Arc<super::structure::StructureResources>,
 }
 
 /// A `JigsawPlacement.generateJigsaw` request (`/place jigsaw`).
@@ -2486,6 +2533,10 @@ impl GeneratorWorker {
     /// generation context's random (level seed and the position's chunk).
     pub fn jigsaw_pieces(&mut self, query: &JigsawQuery<'_>) -> Option<JigsawPieces> {
         self.pipeline.jigsaw_pieces(&mut self.state, query)
+    }
+    /// `/place structure`: the structure `name` generated at `chunk`, in any biome.
+    pub fn structure_start(&mut self, name: &str, chunk: ChunkPos) -> Option<PlacedStructure> {
+        self.pipeline.structure_start(&mut self.state, name, chunk)
     }
     /// STRUCTURE_STARTS: the structure starts owned by a chunk (cached).
     pub fn structure_starts(

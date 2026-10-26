@@ -176,9 +176,52 @@ impl Game<'_> {
                 {
                     return Err(err("commands.place.structure.invalid", &[&structure]));
                 }
-                self.place_pos(ctx, "pos")?;
-                // Structure.generate is not wired to the live level.
-                Err(err("command.failed", &[]))
+                let pos = self.place_pos(ctx, "pos")?;
+                let terrain = self
+                    .end
+                    .locator()
+                    .ok_or_else(|| err("command.failed", &[]))?;
+                // PlaceCommand.placeStructure: generate the start at the position's chunk, whatever the biome...
+                let placed = terrain
+                    .structure_start(
+                        &structure,
+                        horizon_core::position::ChunkPos::new(pos[0] >> 4, pos[2] >> 4),
+                    )
+                    .ok_or_else(|| err("commands.place.structure.failed", &[]))?;
+                // ...then place it in every chunk its box covers, which must all be loaded.
+                let mut min = [i32::MAX; 2];
+                let mut max = [i32::MIN; 2];
+                for piece in &placed.start.pieces {
+                    let b = piece.bounding_box();
+                    min = [min[0].min(b.min[0] >> 4), min[1].min(b.min[2] >> 4)];
+                    max = [max[0].max(b.max[0] >> 4), max[1].max(b.max[2] >> 4)];
+                }
+                self.place_check_loaded(min, max)?;
+                let chunks: Vec<[i32; 2]> = (min[0]..=max[0])
+                    .flat_map(|x| (min[1]..=max[1]).map(move |z| [x, z]))
+                    .collect();
+                let (min_y, max_y) = (
+                    horizon_client::chunk::MIN_Y,
+                    horizon_client::chunk::MIN_Y + horizon_client::chunk::HEIGHT - 1,
+                );
+                let done = self.with_level(|b, level, ticks| {
+                    b.place_structure(level, ticks, &placed, &chunks, min_y, max_y)
+                });
+                self.process_level_events()
+                    .map_err(|_| err("command.failed", &[]))?;
+                if !done {
+                    return Err(err("commands.place.structure.failed", &[]));
+                }
+                self.feedback(Text::translate(
+                    "commands.place.structure.success",
+                    &[
+                        Text::literal(structure),
+                        num(pos[0]),
+                        num(pos[1]),
+                        num(pos[2]),
+                    ],
+                ));
+                Ok(1)
             }
         }
     }
