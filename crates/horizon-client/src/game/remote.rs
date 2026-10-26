@@ -869,7 +869,13 @@ impl Game<'_> {
                         remote.brand = brand;
                     }
                 }
-                Event::Reconfigured(registries) => self.set_registries(registries),
+                Event::Reconfigured(registries) => {
+                    // ClientPacketListener.handleConfigurationStart: clearClientLevel, whose
+                    // Gui.onDisconnected resets the boss bars. A proxy switching servers goes this way, and
+                    // the old server's bars must not stay up.
+                    self.boss_overlay.reset();
+                    self.set_registries(registries)
+                }
                 Event::PackPush(p) => self.handle_pack_push(p),
                 Event::PackPop(id) => self.handle_pack_pop(id),
                 Event::DecodeError(e) => {
