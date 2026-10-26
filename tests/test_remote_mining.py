@@ -79,6 +79,7 @@ impl Game {
     }
     fn pick(&self) -> Option<Hit> { Some(self.hit) }
     fn held(&self) -> Option<&()> { None }
+    fn held_destroys_in_creative(&self) -> bool { true }
     // Game::destroy_progress (hand.rs) for a harvestable block on the ground.
     fn destroy_progress(&self, _: [i32; 3]) -> f32 {
         self.res.speed / self.res.facts.hardness / 30.0
