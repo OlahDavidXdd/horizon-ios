@@ -40,7 +40,7 @@ struct HomeView: View {
                             account: account, editName: editName) }
                 .tabItem { Label("Play", systemImage: "play.fill") }
                 .tag(Tab.play)
-            page(refresh: { await link.reloadServers() }) { ServersPage(link: link) }
+            page(refresh: { await link.reloadServers() }) { ServersPage(link: link, account: account) }
                 .tabItem { Label("Servers", systemImage: "globe") }
                 .tag(Tab.servers)
             page { PacksPage(link: link) }
@@ -196,8 +196,8 @@ private struct PlayPage: View {
             if let last = link.worlds.first {
                 ContinueCard(world: last, link: link)
             }
-            WorldsSection(link: link)
             AccountCard(account: account)
+            WorldsSection(link: link)
             PlayerCard(name: player.name, face: head.face, edit: editName)
         }
         .animation(.easeInOut(duration: 0.25), value: link.phase)

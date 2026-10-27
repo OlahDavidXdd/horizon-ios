@@ -116,3 +116,21 @@ pub fn active() -> Option<Snapshot> {
     #[cfg(not(target_os = "ios"))]
     None
 }
+
+/// Whether an external keyboard is currently attached (main-thread UIKit input use only).
+pub fn keyboard_connected() -> bool {
+    #[cfg(target_os = "ios")]
+    // SAFETY: a read-only GameController class property, on the game's main thread.
+    return unsafe { objc2_game_controller::GCKeyboard::coalescedKeyboard().is_some() };
+    #[cfg(not(target_os = "ios"))]
+    false
+}
+
+/// Whether a hardware mouse is currently attached (main-thread UIKit input use only).
+pub fn mouse_connected() -> bool {
+    #[cfg(target_os = "ios")]
+    // SAFETY: a read-only GameController class property, on the game's main thread.
+    return unsafe { !objc2_game_controller::GCMouse::mice().is_empty() };
+    #[cfg(not(target_os = "ios"))]
+    false
+}

@@ -873,9 +873,9 @@ async fn open_device(
 const NO_GPU_DRIVER: &str = "No graphics driver with Vulkan or DirectX 12 found: Horizon needs a GPU \
      driver with one of them. Install the latest driver for your NVIDIA, AMD or Intel GPU and \
      start the game again";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const NO_GPU_DRIVER: &str = "No Metal graphics device found";
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
 const NO_GPU_DRIVER: &str = "No Vulkan graphics driver found: Horizon needs the Vulkan loader \
      (libvulkan.so.1) and a Vulkan driver for your GPU (Mesa's, or NVIDIA's)";
 /// Logs a step of the renderer's start, for a native crash in the graphics
@@ -2925,6 +2925,18 @@ impl Renderer {
         dimension: i32,
         pack: Option<horizon_shaders::Post>,
     ) -> Option<(Vec<String>, Vec<String>)> {
+        if let Some(post) = pack.as_ref()
+            && !post.complete
+        {
+            self.pack_atlas = None;
+            self.pack_post = Some((dimension, None));
+            let mut notes = post.notes.clone();
+            notes.push(
+                "Pack disabled because required stages are unavailable. Using normal rendering."
+                    .into(),
+            );
+            return Some((Vec::new(), notes));
+        }
         let post = pack.map(|post| {
             pack_post::PackPost::new(
                 &self.device,
@@ -2933,6 +2945,17 @@ impl Renderer {
                 self.config.format.remove_srgb_suffix(),
             )
         });
+        let report = post.as_ref().map(|p| {
+            let programs: Vec<String> = p.programs().into_iter().map(str::to_owned).collect();
+            let mut notes = p.notes.clone();
+            if programs.is_empty() {
+                notes.push("No supported shader programs loaded. Using normal rendering.".into());
+            }
+            (programs, notes)
+        });
+        // A pack with every program missing or rejected must not replace normal
+        // post-processing (including FXAA) with an expensive identity blit.
+        let post = post.filter(|p| !p.programs().is_empty());
         if post.is_none() {
             self.pack_atlas = None;
         } else if self.pack_atlas.is_none() {
@@ -2952,10 +2975,6 @@ impl Renderer {
             );
             self.queue.submit([encoder.finish()]);
         }
-        let report = post.as_ref().map(|p| {
-            let programs = p.programs().into_iter().map(str::to_owned).collect();
-            (programs, p.notes.clone())
-        });
         self.pack_post = Some((dimension, post));
         report
     }

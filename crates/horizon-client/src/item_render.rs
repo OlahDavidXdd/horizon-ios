@@ -6,6 +6,9 @@
 //! and the special model renderers submit, in pose space. A sink then draws
 //! them: [`gui`] into the HUD batch with the GUI item lighting, [`WorldSink`]
 //! into entity vertices with the level's lighting.
+mod components;
+mod definitions;
+pub use components::{custom_data_matches, tag_json};
 pub mod gui;
 mod special;
 
@@ -19,8 +22,8 @@ use horizon_assets::{
     animation::AnimationMetadata,
     item_bake::{BakedItemModel, SpriteLookup, SpriteMask, bake_item_model},
     item_model::{
-        ClientItem, Components, Context, DisplayContext, FoilType, ItemEnv, ItemModels,
-        LayerContent, LevelState, OwnerState, SpecialModel, StackView,
+        Components, Context, DisplayContext, FoilType, ItemEnv, ItemModels, LayerContent,
+        LevelState, OwnerState, SpecialModel, StackView,
     },
     model::Direction,
     palette::PalettedPermutations,
@@ -371,34 +374,6 @@ pub struct ItemRenderer {
     item_ids: HashMap<String, i32>,
 }
 
-/// Every `items/*.json` client item definition, by identifier.
-fn load_definitions(root: &Path) -> BTreeMap<String, ClientItem> {
-    let mut out = BTreeMap::new();
-    let Ok(namespaces) = fs::read_dir(root.join("assets")) else {
-        return out;
-    };
-    for ns in namespaces.flatten() {
-        let namespace = ns.file_name().to_string_lossy().into_owned();
-        let Ok(files) = fs::read_dir(ns.path().join("items")) else {
-            continue;
-        };
-        for f in files.flatten() {
-            let path = f.path();
-            if path.extension().is_none_or(|e| e != "json") {
-                continue;
-            }
-            let name = path.file_stem().unwrap_or_default().to_string_lossy();
-            if let Some(item) = fs::read_to_string(&path)
-                .ok()
-                .and_then(|t| ClientItem::from_json(&t).ok())
-            {
-                out.insert(format!("{namespace}:{name}"), item);
-            }
-        }
-    }
-    out
-}
-
 impl ItemRenderer {
     /// Load item definitions, item prototypes (`items.json`), every model,
     /// the special renderers' entity models and the grass colormap.
@@ -417,7 +392,7 @@ impl ItemRenderer {
         let prototypes: BTreeMap<String, Components> =
             serde_json::from_slice(&fs::read(root.join("items.json"))?)?;
         let models = ItemModels {
-            definitions: load_definitions(root),
+            definitions: definitions::load(root),
             prototypes,
         };
         let library = library?;
@@ -621,31 +596,6 @@ pub fn glam_matrix(m: &horizon_assets::math::Mat4) -> Mat4 {
 // Stacks
 // ---------------------------------------------------------------------------
 
-/// An NBT value as the JSON its component codec reads.
-pub fn tag_json(tag: &Tag) -> Value {
-    match tag {
-        Tag::End => Value::Null,
-        Tag::Byte(v) => Value::from(*v),
-        Tag::Short(v) => Value::from(*v),
-        Tag::Int(v) => Value::from(*v),
-        Tag::Long(v) => Value::from(*v),
-        Tag::Float(bits) => serde_json::Number::from_f64(f64::from(f32::from_bits(*bits)))
-            .map_or(Value::Null, Value::Number),
-        Tag::Double(bits) => {
-            serde_json::Number::from_f64(f64::from_bits(*bits)).map_or(Value::Null, Value::Number)
-        }
-        Tag::ByteArray(a) => Value::Array(a.iter().map(|b| Value::from(*b as i8)).collect()),
-        Tag::String(s) => Value::String(s.to_string_lossy()),
-        Tag::List(l) => Value::Array(l.iter().map(tag_json).collect()),
-        Tag::Compound(c) => Value::Object(
-            c.iter()
-                .map(|(k, v)| (k.to_string_lossy(), tag_json(v)))
-                .collect(),
-        ),
-        Tag::IntArray(a) => Value::Array(a.iter().map(|v| Value::from(*v)).collect()),
-        Tag::LongArray(a) => Value::Array(a.iter().map(|v| Value::from(*v)).collect()),
-    }
-}
 /// The resolver's view of a client stack: its item, count and component patch.
 pub fn stack_view(stack: &crate::items::ItemStack) -> StackView {
     let mut view = StackView::new(&stack.item, stack.count as i32);

@@ -25,6 +25,8 @@ final class MicrosoftAccount: ObservableObject {
     @Published private(set) var profile: Profile?
     @Published private(set) var state = State.idle
     private var signing: Task<Void, Never>?
+    private var generation = UUID()
+    private var renewing = false
 
     /// The Azure app this build signs in with, if it has one.
     static var clientID: String? {
@@ -46,16 +48,21 @@ final class MicrosoftAccount: ObservableObject {
             state = .failed("Microsoft sign-in isn't set up in this build.")
             return
         }
-        signing?.cancel()
+        cancel()
+        let attempt = generation
         signing = Task {
             do {
                 let tokens = try await deviceCode(client)
-                try await finish(client, microsoft: tokens)
+                try await finish(microsoft: tokens, attempt: attempt)
+                await handOver()
+                guard generation == attempt else { return }
+                if case .failed = state { return }
                 state = .idle
                 Haptics.done()
             } catch is CancellationError {
-                state = .idle
+                if generation == attempt { state = .idle }
             } catch {
+                guard generation == attempt else { return }
                 state = .failed(error.localizedDescription)
                 Haptics.failed()
             }
@@ -63,6 +70,7 @@ final class MicrosoftAccount: ObservableObject {
     }
 
     func cancel() {
+        generation = UUID()
         signing?.cancel()
         signing = nil
         state = .idle
@@ -79,20 +87,26 @@ final class MicrosoftAccount: ObservableObject {
     /// Give the game the account, renewing the Minecraft token first when it has under an hour left. Quiet on
     /// failure: the game then plays offline, and the card says why.
     func handOver() async {
-        guard let profile, let client = Self.clientID, var secrets = Vault.read() else { return }
+        guard profile != nil, let client = Self.clientID, var secrets = Vault.read(), !renewing else { return }
+        let attempt = generation
         if secrets.expires.timeIntervalSinceNow < 3600 {
+            renewing = true
+            defer { renewing = false }
             do {
                 state = .working("Renewing your sign-in…")
                 let microsoft = try await refresh(client, secrets.refresh)
-                try await finish(client, microsoft: microsoft)
+                try await finish(microsoft: microsoft, attempt: attempt)
                 state = .idle
                 guard let renewed = Vault.read() else { return }
                 secrets = renewed
             } catch {
+                guard generation == attempt else { return }
+                _ = await Bridge.send("launcher-session off")
                 state = .failed("Sign in again: \(error.localizedDescription)")
                 return
             }
         }
+        guard generation == attempt, let profile else { return }
         let session: [String: String] = [
             "name": profile.name, "uuid": profile.uuid, "access_token": secrets.token, "user_type": "msa",
         ]
@@ -111,10 +125,11 @@ final class MicrosoftAccount: ObservableObject {
         let start = try await Net.form("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode",
                                        ["client_id": client, "scope": "XboxLive.signin offline_access"])
         guard let device = start["device_code"] as? String, let code = start["user_code"] as? String,
-              let link = (start["verification_uri"] as? String).flatMap(URL.init(string:))
+              let link = (start["verification_uri"] as? String).flatMap(URL.init(string:)),
+              link.scheme == "https"
         else { throw AccountError("Microsoft didn't give a sign-in code.") }
         state = .code(code, link)
-        var interval = UInt64(start["interval"] as? Int ?? 5)
+        var interval = UInt64(max(1, start["interval"] as? Int ?? 5))
         let deadline = Date().addingTimeInterval(TimeInterval(start["expires_in"] as? Int ?? 900))
         while Date() < deadline {
             try await Task.sleep(nanoseconds: interval * 1_000_000_000)
@@ -134,7 +149,7 @@ final class MicrosoftAccount: ObservableObject {
             case "slow_down": interval += 5
             case "authorization_declined": throw AccountError("The sign-in was declined.")
             case "expired_token": throw AccountError("The code expired. Try again.")
-            default: throw AccountError(answer["error_description"] as? String ?? "Microsoft refused the sign-in.")
+            default: throw AccountError("Microsoft refused the sign-in. Try again or check this build’s app configuration.")
             }
         }
         throw AccountError("The code expired. Try again.")
@@ -154,7 +169,7 @@ final class MicrosoftAccount: ObservableObject {
     }
 
     /// Steps 3 to 7: Xbox Live, XSTS, Minecraft, ownership and the profile; then keep it all.
-    private func finish(_ client: String, microsoft: (access: String, refresh: String)) async throws {
+    private func finish(microsoft: (access: String, refresh: String), attempt: UUID) async throws {
         state = .working("Signing in to Xbox Live…")
         let xbl = try await Net.json("https://user.auth.xboxlive.com/user/authenticate", [
             "Properties": ["AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com",
@@ -192,12 +207,15 @@ final class MicrosoftAccount: ObservableObject {
         guard let id = profile["id"] as? String, let name = profile["name"] as? String else {
             throw AccountError("Create your Minecraft profile on minecraft.net first.")
         }
-        Vault.write(Vault.Secrets(refresh: microsoft.refresh, token: token,
-                                  expires: Date().addingTimeInterval(lifetime)))
+        try Task.checkCancellation()
+        guard generation == attempt else { throw CancellationError() }
+        guard Vault.write(Vault.Secrets(refresh: microsoft.refresh, token: token,
+                                       expires: Date().addingTimeInterval(lifetime))) else {
+            throw AccountError("Sign-in could not be saved securely. Unlock this device and try again.")
+        }
         let kept = Profile(name: name, uuid: id)
         UserDefaults.standard.set(try? JSONEncoder().encode(kept), forKey: "microsoftProfile")
         self.profile = kept
-        await handOver()
     }
 
     private static func xboxError(_ code: Int) -> String {
@@ -248,7 +266,9 @@ private enum Net {
 
     /// The JSON object answered, with `status` added for an error status when `allowErrors`.
     private static func send(_ request: URLRequest, allowErrors: Bool) async throws -> [String: Any] {
+        try Task.checkCancellation()
         let (data, response) = try await URLSession.shared.data(for: request)
+        try Task.checkCancellation()
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         if !(200..<300).contains(status) {
@@ -283,13 +303,15 @@ private enum Vault {
         return try? JSONDecoder().decode(Secrets.self, from: data)
     }
 
-    static func write(_ secrets: Secrets?) {
-        SecItemDelete(query as CFDictionary)
-        guard let secrets, let data = try? JSONEncoder().encode(secrets) else { return }
+    @discardableResult
+    static func write(_ secrets: Secrets?) -> Bool {
+        let deleted = SecItemDelete(query as CFDictionary)
+        guard let secrets else { return deleted == errSecSuccess || deleted == errSecItemNotFound }
+        guard let data = try? JSONEncoder().encode(secrets) else { return false }
         var item = query
         item[kSecValueData as String] = data
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(item as CFDictionary, nil)
+        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
     }
 }
 
@@ -345,7 +367,7 @@ struct AccountCard: View {
                     Text("For servers that check accounts (online mode). Single player and LAN don't need it.")
                         .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
                 } else {
-                    Text("This build has no Microsoft sign-in set up yet: it needs Horizon's own approved Azure app (docs/microsoft-account.md). Offline servers and single player work as they are.")
+                    Text("Microsoft sign-in is unavailable in this build. The app developer must configure an approved application ID. Single player and offline servers are available.")
                         .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
                         .fixedSize(horizontal: false, vertical: true)
                 }

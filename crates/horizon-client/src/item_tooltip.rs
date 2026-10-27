@@ -3,6 +3,7 @@
 use crate::{
     hud::rgba,
     items::{ItemInfo, ItemStack},
+    text::{Style, Text},
 };
 use horizon_world::nbt::Tag;
 
@@ -486,15 +487,16 @@ pub fn lines(
     translate: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<String> {
     let mut lines = vec![name_line(stack, translate)];
-    if TooltipDisplay::for_stack(stack).shows("minecraft:lore") {
-        lines.extend(lore_lines(stack));
-    }
+    lines.extend(lore_text(stack).iter().map(Text::plain));
     lines.extend(detail_lines(stack, info, translate));
     lines
 }
 
-/// `LoreComponent.addToTooltip`: the saved component lines, as plain text.
-fn lore_lines(stack: &ItemStack) -> Vec<String> {
+/// `LoreComponent.addToTooltip`: retain component styles and blank lines.
+pub fn lore_text(stack: &ItemStack) -> Vec<Text> {
+    if !TooltipDisplay::for_stack(stack).shows("minecraft:lore") {
+        return Vec::new();
+    }
     let Some(Tag::List(entries)) = stack.data().and_then(|d| d.other("minecraft:lore")) else {
         return Vec::new();
     };
@@ -502,15 +504,112 @@ fn lore_lines(stack: &ItemStack) -> Vec<String> {
         .iter()
         .map(|entry| {
             let json = crate::scoreboard::tag_to_json(entry);
-            let text = crate::component::to_text(&json, &mut |s| crate::text::Text::literal(s));
-            text.plain()
+            crate::component::to_text(&json, &mut |s| Text::literal(s))
+                .with_style(&Style {
+                    color: Some(crate::text::DARK_PURPLE),
+                    italic: Some(true),
+                    ..Style::default()
+                })
+                .resolve_legacy()
         })
         .collect()
+}
+
+/// Plain UI tips and styled item components share the tooltip layout.
+pub trait TooltipLine {
+    fn tooltip_text(&self) -> Text;
+    fn tooltip_color(&self) -> u32;
+}
+impl TooltipLine for Text {
+    fn tooltip_text(&self) -> Text {
+        self.clone()
+    }
+    fn tooltip_color(&self) -> u32 {
+        u32::MAX
+    }
+}
+impl TooltipLine for (String, u32) {
+    fn tooltip_text(&self) -> Text {
+        Text::legacy(&self.0)
+    }
+    fn tooltip_color(&self) -> u32 {
+        self.1
+    }
+}
+pub fn styled_line((text, color): (String, u32)) -> Text {
+    Text::legacy(&text).with_color(color & 0x00ff_ffff)
+}
+
+/// Insert descriptions after the name, before the generated item details.
+pub fn with_lore(stack: &ItemStack, mut lines: Vec<Text>, at: usize) -> Vec<Text> {
+    lines.splice(at..at, lore_text(stack));
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_lore_keeps_components_colors_blank_lines_and_order() {
+        let component = crate::scoreboard::json_to_tag(&serde_json::json!([
+            {"text":"Damage: ","color":"gray","italic":false,"extra":[{"text":"+100","color":"red","bold":true}]},
+            "",
+            {"text":"Item Ability","color":"#12ab34","italic":false},
+            "§6LEGENDARY SWORD"
+        ]));
+        let (damage, data) = crate::item_data::decode_components(Some(&Tag::compound([(
+            "minecraft:lore",
+            component,
+        )])));
+        let mut stack = ItemStack::new("minecraft:diamond_sword", 1);
+        stack.damage = damage;
+        *stack.data_mut() = *data.unwrap();
+        let lines = with_lore(
+            &stack,
+            vec![Text::literal("Sword"), Text::literal("Details")],
+            1,
+        );
+        assert_eq!(
+            lines.iter().map(Text::plain).collect::<Vec<_>>(),
+            [
+                "Sword",
+                "Damage: +100",
+                "",
+                "Item Ability",
+                "LEGENDARY SWORD",
+                "Details"
+            ]
+        );
+        assert_eq!(lines[1].spans[0].style.color, Some(crate::text::GRAY));
+        assert_eq!(lines[1].spans[0].style.italic, Some(false));
+        assert_eq!(lines[1].spans[1].style.color, Some(crate::text::RED));
+        assert_eq!(lines[1].spans[1].style.bold, Some(true));
+        assert_eq!(lines[3].spans[0].style.color, Some(0x12ab34));
+        assert_eq!(lines[4].spans[0].style.color, Some(crate::text::GOLD));
+    }
+
+    #[test]
+    fn hidden_lore_and_hidden_tooltips_do_not_leak_descriptions() {
+        let mut stack = ItemStack::new("minecraft:paper", 1);
+        stack.data_mut().set_other(
+            "minecraft:lore",
+            Some(Tag::List(vec![Tag::String("Description".into())])),
+        );
+        assert_eq!(lore_text(&stack)[0].plain(), "Description");
+        for display in [
+            Tag::compound([("hide_tooltip", Tag::Byte(1))]),
+            Tag::compound([(
+                "hidden_components",
+                Tag::List(vec![Tag::String("minecraft:lore".into())]),
+            )]),
+        ] {
+            stack
+                .data_mut()
+                .set_other("minecraft:tooltip_display", Some(display));
+            assert!(lore_text(&stack).is_empty());
+        }
+    }
 
     #[test]
     fn tooltip_display_controls_name_and_component_visibility() {

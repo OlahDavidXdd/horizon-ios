@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn component_condition_decodes_predicate_type_and_value() {
+    let json = serde_json::json!({
+        "property": "minecraft:component", "predicate": "custom_data",
+        "value": "{td_attune_mode:1}"
+    });
+    assert_eq!(
+        ConditionProperty::decode(json.as_object().unwrap()).unwrap(),
+        ConditionProperty::Component(serde_json::json!({
+            "minecraft:custom_data": "{td_attune_mode:1}"
+        }))
+    );
+    let missing_value = serde_json::json!({"property":"component", "predicate":"custom_data"});
+    assert!(ConditionProperty::decode(missing_value.as_object().unwrap()).is_err());
+}
+
+#[test]
 fn identifier_adds_default_namespace() {
     assert_eq!(identifier("stone").unwrap(), "minecraft:stone");
     assert_eq!(identifier("a:b").unwrap(), "a:b");

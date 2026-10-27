@@ -108,6 +108,11 @@ impl Game<'_> {
         for request in horizon_ios_launcher::take() {
             let command = request.line.split_whitespace().next().unwrap_or_default();
             match command {
+                "launcher-visible" => {
+                    horizon_ios_launcher::set_covered(request.line.ends_with(" true"));
+                    request.answer(r#"{"ok":true}"#);
+                }
+
                 "launcher-state" => {
                     let state = json!({
                         "phase": if self.title.is_some() { "title" } else { "world" },
@@ -310,6 +315,11 @@ impl Loading {
         for request in horizon_ios_launcher::take() {
             let command = request.line.split_whitespace().next().unwrap_or_default();
             match command {
+                "launcher-visible" => {
+                    horizon_ios_launcher::set_covered(request.line.ends_with(" true"));
+                    request.answer(r#"{"ok":true}"#);
+                }
+
                 "launcher-start" => {
                     horizon_ios_launcher::start();
                     request.answer(r#"{"ok":true}"#);

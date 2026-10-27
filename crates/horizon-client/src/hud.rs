@@ -447,6 +447,18 @@ impl HudAtlas {
             edition.3 = pixels;
         }
         images.push(("horizon/white".into(), 4, 4, vec![255; 64]));
+        // Item baking uses the missing sprite for absent definitions and textures.
+        // Always provide it: otherwise submit_quads silently drops every missing-model face.
+        let missing = (0..16 * 16)
+            .flat_map(|i| {
+                if (i % 16 / 8 == 0) == (i / 16 / 8 == 0) {
+                    [0, 0, 0, 255]
+                } else {
+                    [255, 0, 255, 255]
+                }
+            })
+            .collect();
+        images.push(("horizon/missingno".into(), 16, 16, missing));
         if full {
             Self::slots(&mut images, crate::trims::slot_size(root));
         }
@@ -1573,6 +1585,13 @@ mod tests {
     #[test]
     fn an_atlas_with_no_textures_holds_the_slot_text_is_drawn_into() {
         let atlas = HudAtlas::without_pack(Path::new("/horizon-test-no-such-root")).unwrap();
+        let missing = atlas.sprites["horizon/missingno"];
+        assert_eq!(missing.texels((atlas.width, atlas.height)), (16, 16));
+        let x = (missing.u0 * atlas.width as f32).round() as usize;
+        let y = (missing.v0 * atlas.height as f32).round() as usize;
+        let at = |dx| (y * atlas.width as usize + x + dx) * 4;
+        assert_eq!(&atlas.pixels[at(0)..at(0) + 4], &[0, 0, 0, 255]);
+        assert_eq!(&atlas.pixels[at(8)..at(8) + 4], &[255, 0, 255, 255]);
         assert_eq!(
             atlas.sprites["horizon/ui-text"].texels((atlas.width, atlas.height)),
             (2048, 1024)

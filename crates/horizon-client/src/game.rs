@@ -65,6 +65,7 @@ mod growth;
 mod hand;
 mod import_screen;
 mod initial_spawn;
+mod input_mode;
 mod integrated;
 mod item_draw;
 mod item_particles;
@@ -4683,6 +4684,11 @@ impl Game<'_> {
             return;
         }
         if !capture {
+            #[cfg(target_os = "ios")]
+            {
+                self.left = false;
+                self.right = false;
+            }
             self.stop_mining();
         }
         // The real pointer takes over from an agent's.
@@ -10910,10 +10916,23 @@ impl ApplicationHandler for Game<'_> {
         if self.window.as_ref().is_none_or(|w| w.id() != id) {
             return;
         }
+        if horizon_ios_launcher::covered()
+            && matches!(
+                &event,
+                WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::Touch(_)
+            )
+        {
+            return;
+        }
         if let WindowEvent::KeyboardInput { event, .. } = &event
             && let PhysicalKey::Code(key) = event.physical_key
         {
             if event.state == ElementState::Pressed {
+                self.touch_keyboard_used();
                 self.physical_keys.insert(key);
             } else {
                 self.physical_keys.remove(&key);
@@ -10921,6 +10940,7 @@ impl ApplicationHandler for Game<'_> {
         }
         if let WindowEvent::Focused(false) = &event {
             self.physical_keys.clear();
+            self.modifiers = winit::keyboard::ModifiersState::empty();
         }
         if let WindowEvent::ModifiersChanged(m) = &event {
             self.modifiers = m.state();
@@ -11017,6 +11037,29 @@ impl ApplicationHandler for Game<'_> {
             return;
         }
         let result: Result<()> = (|| {
+            #[cfg(target_os = "ios")]
+            if let WindowEvent::KeyboardInput { event, .. } = &event
+                && event.state == ElementState::Pressed
+                && let PhysicalKey::Code(key) = event.physical_key
+                && self.keyboard_menu_key(event_loop, key)?
+            {
+                return Ok(());
+            }
+            // A field or menu may have opened since key-down. Release the translated binding
+            // before that screen consumes it, including keys rebound to mouse actions.
+            #[cfg(target_os = "ios")]
+            if let WindowEvent::KeyboardInput { event, .. } = &event
+                && event.state == ElementState::Released
+                && let PhysicalKey::Code(key) = event.physical_key
+            {
+                self.extras_key(key, false, false);
+                match self.settings.keys.translate(key) {
+                    Some(Ok(key)) => self.mapped_key(key, false, false)?,
+                    Some(Err(button)) => self.play_mouse(button, false)?,
+                    None => {}
+                }
+                return Ok(());
+            }
             match event {
                 WindowEvent::CloseRequested => {
                     self.begin_closing_save(true)?;
@@ -11521,6 +11564,9 @@ impl ApplicationHandler for Game<'_> {
                     self.mapped_key(key, event.state == ElementState::Pressed, event.repeat)?;
                 }
                 WindowEvent::RedrawRequested => {
+                    if horizon_ios_launcher::covered() {
+                        return Ok(());
+                    }
                     self.observe_fullscreen();
                     let now = Instant::now();
                     let frame_cpu = self
@@ -11712,6 +11758,17 @@ impl ApplicationHandler for Game<'_> {
         }
     }
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if horizon_ios_launcher::covered() {
+            return;
+        }
+        if matches!(
+            &event,
+            DeviceEvent::MouseMotion { .. }
+                | DeviceEvent::Button { .. }
+                | DeviceEvent::MouseWheel { .. }
+        ) {
+            self.touch_mouse_used();
+        }
         if self.pending_save.is_none()
             && self.captured
             && self.focused
@@ -11753,6 +11810,29 @@ impl ApplicationHandler for Game<'_> {
         self.poll_launcher(event_loop);
         if self.pending_save.is_some() {
             return;
+        }
+        if horizon_ios_launcher::covered() {
+            self.capture(false);
+            self.previous = Instant::now();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(33),
+            ));
+            return;
+        }
+        #[cfg(target_os = "ios")]
+        {
+            // UIKit pointer lock is a gameplay request; every overlay/text field releases it.
+            let want = self.focused
+                && self.title.is_none()
+                && self.screen == Screen::Playing
+                && self.player.is_some()
+                && self.sign_edit.is_none()
+                && self.book.is_none()
+                && self.server_packs.prompt.is_none()
+                && !self.pause;
+            if self.captured != want {
+                self.capture(want);
+            }
         }
         self.poll_pads(event_loop);
         self.sync_system_keyboard();
@@ -13194,6 +13274,12 @@ impl Loading {
             event_loop.exit();
             return;
         }
+        if horizon_ios_launcher::covered() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(33),
+            ));
+            return;
+        }
         if let Some(w) = &self.window {
             if self.options.as_ref().is_some_and(|o| o.offscreen) {
                 self.draw();
@@ -13204,6 +13290,9 @@ impl Loading {
         event_loop.set_control_flow(ControlFlow::Poll);
     }
     fn draw(&mut self) {
+        if horizon_ios_launcher::covered() {
+            return;
+        }
         let Some(size) = self
             .renderer
             .as_ref()

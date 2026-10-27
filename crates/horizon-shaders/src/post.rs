@@ -52,6 +52,9 @@ pub struct PostProgram {
 }
 
 pub struct Post {
+    /// False when an enabled stage failed or requires geometry the caller does not provide.
+    /// Running only the remaining post passes can turn an incomplete frame black.
+    pub complete: bool,
     /// The folder the programs came from: `""` for `shaders` itself, else `world0`...
     pub folder: String,
     pub programs: Vec<PostProgram>,
@@ -86,6 +89,7 @@ pub fn load_post(
     terrain: Option<&GbuffersInputs>,
 ) -> Post {
     let mut post = Post {
+        complete: true,
         folder: folder.to_owned(),
         programs: Vec::new(),
         deferred_pre: flips(properties, "deferred_pre"),
@@ -94,6 +98,17 @@ pub fn load_post(
         config: Config::default(),
         notes: Vec::new(),
     };
+    if terrain.is_none() {
+        for file in pack.list(folder) {
+            if let Some(name) = file.strip_suffix(".fsh")
+                && (name.starts_with("gbuffers_") || name == "shadow")
+                && enabled(properties, folder, name, macros)
+            {
+                post.complete = false;
+                post.notes.push(format!("{name}: requires pack geometry/shadow rendering, which this renderer does not provide; pack disabled"));
+            }
+        }
+    }
     let mut loader = Loader {
         pack,
         folder,
@@ -153,13 +168,21 @@ impl Loader<'_> {
         };
         let (vsh, fsh) = (path("vsh"), path("fsh"));
         let notes = &mut self.post.notes;
-        if !self.pack.exists(&fsh) || !self.pack.exists(&vsh) {
-            return None;
-        }
         if !enabled(self.properties, self.folder, &name, self.macros) {
             return None;
         }
+        let (has_fragment, has_vertex) = (self.pack.exists(&fsh), self.pack.exists(&vsh));
+        if !has_fragment || !has_vertex {
+            if has_fragment || has_vertex {
+                self.post.complete = false;
+                notes.push(format!(
+                    "{name}: missing vertex or fragment stage; pack disabled"
+                ));
+            }
+            return None;
+        }
         if self.pack.exists(&path("gsh")) {
+            self.post.complete = false;
             notes.push(format!(
                 "{name}: uses a geometry stage (not supported); skipped"
             ));
@@ -172,6 +195,7 @@ impl Loader<'_> {
             .flat_map(|pp| diagnostics(pp))
             .collect();
         if !problems.is_empty() {
+            self.post.complete = false;
             notes.extend(problems);
             notes.push(format!("{name}: skipped"));
             return None;
@@ -179,6 +203,7 @@ impl Loader<'_> {
         let program = match translate(&vertex, &fragment) {
             Ok(p) => p,
             Err(errors) => {
+                self.post.complete = false;
                 notes.extend(
                     errors
                         .iter()
@@ -324,12 +349,17 @@ mod tests {
         );
         assert!(notes.contains("composite5.fsh:2:"), "{notes}");
         assert!(notes.contains("composite5: skipped"), "{notes}");
+        assert!(
+            !post.complete,
+            "a valid final pass cannot repair failed earlier stages"
+        );
 
         let mut macros = Macros::standard();
         macros.define("HQ", "");
         let post = load_post(&pack, "world-1", &properties, &macros, None);
         let names: Vec<&str> = post.programs.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["final"]);
+        assert!(post.complete);
         let post = load_post(&pack, "", &properties, &macros, None);
         assert!(post.programs.iter().any(|p| p.name == "composite3"));
     }
@@ -348,6 +378,7 @@ mod tests {
             None,
         );
         assert!(post.notes.is_empty(), "{:?}", post.notes);
+        assert!(post.complete);
         let names: Vec<&str> = post.programs.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["composite", "composite1", "final"]);
         assert_eq!(post.programs[0].buffers, [0, 2]);
@@ -356,5 +387,34 @@ mod tests {
             post.config.buffers[2].format,
             crate::Format::parse("RGBA16F").unwrap()
         );
+    }
+
+    #[test]
+    fn geometry_packs_cannot_run_as_post_only_even_if_final_translates() {
+        let pack = Pack::from_zip_bytes(
+            "t",
+            zip(&[
+                ("shaders/final.vsh", VSH),
+                ("shaders/final.fsh", FSH),
+                ("shaders/gbuffers_terrain.fsh", "geometry stage"),
+                ("shaders/shadow.fsh", "shadow stage"),
+                ("shaders/world-1/final.vsh", VSH),
+                ("shaders/world-1/final.fsh", FSH),
+            ]),
+        )
+        .unwrap();
+        let macros = Macros::standard();
+        let properties = Properties::default();
+        let post = load_post(&pack, "", &properties, &macros, None);
+        assert_eq!(post.programs.len(), 1);
+        assert!(!post.complete);
+        assert!(post.notes.iter().any(|n| n.contains("gbuffers_terrain")));
+        assert!(post.notes.iter().any(|n| n.contains("shadow")));
+        assert!(load_post(&pack, "world-1", &properties, &macros, None).complete);
+        let properties = Properties::parse(
+            "program.gbuffers_terrain.enabled=false\nprogram.shadow.enabled=false",
+            &macros,
+        );
+        assert!(load_post(&pack, "", &properties, &macros, None).complete);
     }
 }

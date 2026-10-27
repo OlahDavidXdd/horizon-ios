@@ -32,3 +32,18 @@
 /crash-reports/
 /debug/
 /ci-artifacts/
+
+/packaging/ios/HorizonIOS.xcodeproj/
+/third_party/winit/target/
+# Local iOS exports, signing material, and per-user Xcode state.
+*.ipa
+*.xcarchive/
+*.mobileprovision
+*.p12
+*.xcuserstate
+**/xcuserdata/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template

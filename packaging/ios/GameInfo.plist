@@ -65,6 +65,25 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Horizon finds worlds opened to LAN, and takes game files from your computer on this network.</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneClassName</key>
+					<string>UIWindowScene</string>
+					<key>UISceneConfigurationName</key>
+					<string>Horizon</string>
+					<key>UISceneDelegateClassName</key>
+					<string>WinitSceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIDeviceFamily</key>

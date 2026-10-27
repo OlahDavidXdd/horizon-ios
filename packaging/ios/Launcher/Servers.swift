@@ -5,6 +5,7 @@ import UIKit
 /// latency, tap to join, hold to remove; Add Server and Direct Connection above.
 struct ServersPage: View {
     @ObservedObject var link: GameLink
+    @ObservedObject var account: MicrosoftAccount
     @State private var adding = false
     @State private var direct = ""
     @State private var removing: Server?
@@ -12,6 +13,7 @@ struct ServersPage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             PageTitle(title: "Servers", subtitle: "Play with others on Java Edition 26.3 servers.")
+            AccountCard(account: account)
             VStack(alignment: .leading, spacing: 10) {
                 Field(title: "DIRECT CONNECTION", placeholder: "play.example.com or 192.168.1.20:25565",
                       text: $direct)

@@ -24,6 +24,8 @@ thread_local! {
     static CHOSEN: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
     /// The pack whose programs the renderer holds, and for which dimension.
     static LOADED: RefCell<Option<(String, i32)>> = const { RefCell::new(None) };
+    /// Runtime pipeline results, kept separate from the saved choice. A selected pack can fail.
+    static REPORT: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 fn game_dir() -> PathBuf {
@@ -146,7 +148,16 @@ pub(super) fn shader_pack_command(words: &[&str], line: &str) -> Result<Option<V
         .iter()
         .map(|p| json!({ "name": p.name, "problem": p.problem }))
         .collect();
-    Ok(Some(json!({ "packs": list, "selected": chosen() })))
+    let selected = chosen();
+    let report = REPORT.with_borrow(|report| {
+        report
+            .as_ref()
+            .filter(|r| r["pack"].as_str() == selected.as_deref())
+            .cloned()
+    });
+    Ok(Some(
+        json!({ "packs": list, "selected": selected, "runtime": report }),
+    ))
 }
 
 impl Game<'_> {
@@ -204,7 +215,13 @@ impl Game<'_> {
                     let post = load_post(&pack, &folder, &properties, &macros, None);
                     if let Some((programs, notes)) = renderer.set_shader_pack(dimension, Some(post))
                     {
-                        for note in notes {
+                        REPORT.with_borrow_mut(|report| {
+                            *report = Some(json!({
+                                "pack": name, "dimension": dimension,
+                                "programs": programs, "notes": notes,
+                            }))
+                        });
+                        for note in &notes {
                             log::warn!("shader pack {name}: {note}");
                         }
                         log::info!(
@@ -217,6 +234,12 @@ impl Game<'_> {
                 }
                 Err(e) => {
                     log::warn!("shader pack {name}: {e}");
+                    REPORT.with_borrow_mut(|report| {
+                        *report = Some(json!({
+                            "pack": name, "dimension": dimension,
+                            "programs": [], "notes": [e.to_string()],
+                        }))
+                    });
                     renderer.set_shader_pack(dimension, None);
                 }
             }

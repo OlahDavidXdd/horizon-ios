@@ -133,7 +133,7 @@ impl StartupMenu {
     }
 
     fn shortcut(&mut self, event: &KeyEvent) -> Option<clipboard::EditShortcut> {
-        let edit = if cfg!(target_os = "macos") {
+        let edit = if cfg!(any(target_os = "macos", target_os = "ios")) {
             self.modifiers.super_key()
         } else {
             self.modifiers.control_key()
