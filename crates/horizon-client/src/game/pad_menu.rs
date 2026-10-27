@@ -80,6 +80,7 @@ pub(super) struct MenuCursor {
     stick: Option<Button>,
     /// A right stick click swapped modes for this screen.
     swapped: bool,
+    pub(super) keyboard_focus: bool,
     pending: Option<Pending>,
     /// The focused slider being nudged and where the pad put its handle.
     nudge: Option<(Rect, f32)>,
@@ -111,7 +112,46 @@ impl Game<'_> {
 
     /// Focus mode is on for the open screen.
     fn pad_focus_mode(&self) -> bool {
-        (self.settings.controller.menu_nav == MenuNav::Focus) != self.pad.menu.swapped
+        self.pad.menu.keyboard_focus
+            || ((self.settings.controller.menu_nav == MenuNav::Focus) != self.pad.menu.swapped)
+    }
+
+    /// iPad hardware keyboard navigation reuses the same registered targets as controllers.
+    #[cfg(target_os = "ios")]
+    pub(super) fn keyboard_menu_key(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        key: KeyCode,
+    ) -> Result<bool> {
+        if !self.pad_in_menu()
+            || self.field_focused()
+            || (self.screen == Screen::Options && self.options_waiting_for_key())
+        {
+            return Ok(false);
+        }
+        let button = match key {
+            KeyCode::ArrowUp => Button::DPadUp,
+            KeyCode::ArrowDown => Button::DPadDown,
+            KeyCode::ArrowLeft => Button::DPadLeft,
+            KeyCode::ArrowRight => Button::DPadRight,
+            KeyCode::Tab if self.has_shift_down() => Button::DPadUp,
+            KeyCode::Tab => Button::DPadDown,
+            KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => Button::South,
+            _ => return Ok(false),
+        };
+        self.pad.menu.keyboard_focus = true;
+        self.pad_take_pointer(event_loop);
+        if button == Button::South
+            && let Some(focus) = self.pad.menu.focus
+            && focus.kind == Kind::Field
+        {
+            self.pad_click_at(event_loop, focus.center(), false);
+            return Ok(true);
+        }
+        self.pad_menu_button(event_loop, button, true)?;
+        // Keyboard activation is a click; hardware held gameplay bindings stay independent.
+        self.pad_menu_button(event_loop, button, false)?;
+        Ok(true)
     }
 
     /// Where focus can land: buttons drawn last frame, every registered
@@ -641,6 +681,7 @@ impl Game<'_> {
             menu.held = [false; 2];
             menu.focus = None;
             menu.swapped = false;
+            menu.keyboard_focus = false;
             menu.pending = None;
             menu.nudge = None;
             menu.osk = None;
@@ -656,6 +697,7 @@ impl Game<'_> {
             self.pad.menu.pos = None;
             self.pad.menu.focus = None;
             self.pad.in_use = false;
+            self.pad.menu.keyboard_focus = false;
         }
         // Focus lands on the menu as it opens when the pad was in use.
         if self.pad.in_use && self.pad.menu.pos.is_none() && self.pad.menu.open_polls == 3 {

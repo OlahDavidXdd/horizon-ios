@@ -118,6 +118,7 @@ impl Game<'_> {
         let threshold = self.settings.controller.trigger_threshold;
         let edges = self.pad.edges.update(&state, threshold);
         if state.active(&self.settings.controller) {
+            self.pad.menu.keyboard_focus = false;
             self.last_input = Instant::now();
             self.pad.in_use = true;
         }

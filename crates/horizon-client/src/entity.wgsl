@@ -214,6 +214,13 @@ fn linear_fog(d: f32, start: f32, end: f32) -> f32 {
 }
 
 // RenderPipelines.WATER_MASK: depth only (the pipeline masks the colour off).
+// RenderType.outline: the shape cut by the texture's alpha, in the vertex colour (the team colour), opaque.
+@fragment fn fs_outline_shape(in: Out) -> @location(0) vec4<f32> {
+    if textureSample(atlas, atlas_sampler, in.uv).a < 0.1 {
+        discard;
+    }
+    return vec4(in.color.rgb, 1.0);
+}
 @fragment fn fs_water_mask() -> @location(0) vec4<f32> {
     return vec4(0.0);
 }

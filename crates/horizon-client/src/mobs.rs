@@ -1842,6 +1842,11 @@ impl Mob {
         }
         v
     }
+    /// Entity.isCurrentlyGlowing: the Glowing tag (or a server's glowing flag), or the Glowing effect (stored
+    /// with or without its namespace).
+    pub fn currently_glowing(&self) -> bool {
+        self.glowing || self.has_effect("minecraft:glowing") || self.has_effect("glowing")
+    }
     pub fn has_effect(&self, effect: &str) -> bool {
         self.extra.effects.iter().any(|e| e.0 == effect)
     }

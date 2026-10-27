@@ -57,7 +57,7 @@ jobs:
         if: steps.rust.outputs.required != 'false'
         with:
           shared-key: verify
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name == 'push' }}
       - name: Check formatting and lint
         if: steps.rust.outputs.required != 'false'
         run: |

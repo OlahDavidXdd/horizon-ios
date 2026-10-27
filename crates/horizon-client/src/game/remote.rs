@@ -161,6 +161,8 @@ pub(super) struct Remote {
     skin_textures: HashMap<u128, horizon_client::skins::Textures>,
     /// The skin texture each profile's players show, once its download is ready.
     skins: HashMap<u128, String>,
+    /// Skins from Ely.by for the players who came without one (`skins::ElySkins`).
+    ely_skins: horizon_client::skins::ElySkins,
     listed: std::collections::HashSet<u128>,
     /// `ClientboundLoginPacket.onlineMode`: the player list shows heads.
     online_mode: bool,
@@ -425,6 +427,7 @@ impl Game<'_> {
             tab_players: HashMap::new(),
             skin_textures: HashMap::new(),
             skins: HashMap::new(),
+            ely_skins: Default::default(),
             listed: Default::default(),
             online_mode: false,
             level_players: HashMap::new(),
@@ -616,6 +619,13 @@ impl Game<'_> {
             let value = match c {
                 // Read past, not decoded: the item keeps its prototype's value.
                 Component::Raw(_) => continue,
+                Component::Potion(id) => {
+                    let Some(potion) = r.builtin.get("minecraft:potion").and_then(|p| p.name(*id))
+                    else {
+                        continue;
+                    };
+                    Tag::compound([("potion", Tag::String(potion.into()))])
+                }
                 // Trim materials and patterns are synced registries, as enchantments are.
                 Component::Trim { material, pattern } => {
                     let (Some(material), Some(pattern)) = (
@@ -732,16 +742,25 @@ impl Game<'_> {
         }
         Some(Tag::compound(entries))
     }
+    /// The stack as the server reads it, with its components (the creative inventory's slots, picked blocks):
+    /// the same encoder a server uses, with this connection's registry ids. Only count and damage went before,
+    /// so a creative potion, enchanted book or named item reached the server as a plain one.
     fn to_network(&self, s: &Option<ItemStack>) -> Option<Stack> {
-        let s = s.as_ref()?;
-        let mut stack = Stack::new(self.item_id(&s.item), s.count as i32);
-        if s.damage > 0 {
-            stack.added.push((
-                horizon_protocol::item::component::DAMAGE,
-                horizon_protocol::item::Component::Int(s.damage as i32),
-            ));
-        }
-        Some(stack)
+        let r = self.remote.as_ref();
+        horizon_client::lan::guest::stack_to_network(
+            |item| self.item_id(item),
+            |registry, name| {
+                let r = r?;
+                if let Some(ids) = r.builtin.get(registry) {
+                    return ids.id(name);
+                }
+                (0..)
+                    .map_while(|i| r.registries.name(registry, i).map(|n| (i, n)))
+                    .find(|(_, n)| *n == name)
+                    .map(|(i, _)| i)
+            },
+            s,
+        )
     }
     /// A line in the connection's chat, with its styles, click and hover
     /// events (ChatComponent.addMessage).
@@ -866,7 +885,13 @@ impl Game<'_> {
                         remote.brand = brand;
                     }
                 }
-                Event::Reconfigured(registries) => self.set_registries(registries),
+                Event::Reconfigured(registries) => {
+                    // ClientPacketListener.handleConfigurationStart: clearClientLevel, whose
+                    // Gui.onDisconnected resets the boss bars. A proxy switching servers goes this way, and
+                    // the old server's bars must not stay up.
+                    self.boss_overlay.reset();
+                    self.set_registries(registries)
+                }
                 Event::PackPush(p) => self.handle_pack_push(p),
                 Event::PackPop(id) => self.handle_pack_pop(id),
                 Event::DecodeError(e) => {
@@ -1808,7 +1833,11 @@ impl Game<'_> {
                         .map(str::to_owned)
                 });
                 if named.as_deref() == Some(&**block) {
-                    self.block_entity_event(p.pos, i32::from(p.b0), i32::from(p.b1));
+                    if matches!(&**block, "minecraft:piston" | "minecraft:sticky_piston") {
+                        self.remote_piston_event(p.pos, i32::from(p.b0), i32::from(p.b1));
+                    } else {
+                        self.block_entity_event(p.pos, i32::from(p.b0), i32::from(p.b1));
+                    }
                 }
             }
             // ClientLevel.levelEvent: LevelEventHandler, as this client's own
@@ -2566,6 +2595,14 @@ impl Game<'_> {
                                         skins::unpack(&t.value, signature, &skins::TEXTURE_URIS);
                                     r.skin_textures.entry(e.uuid).or_insert(textures);
                                 }
+                                // No skin from the server (single player, LAN, offline mode): the one
+                                // the name wears on Ely.by.
+                                if r.skin_textures
+                                    .get(&e.uuid)
+                                    .is_none_or(|t| t.skin.is_none())
+                                {
+                                    r.ely_skins.ask(e.uuid, name);
+                                }
                             }
                         }
                     }
@@ -2877,9 +2914,19 @@ impl Game<'_> {
     /// never in the tab list: resolve each profile's textures and give the
     /// level's player models their skin.
     fn update_remote_skins(&mut self) {
-        let Some(r) = self.remote.as_ref() else {
+        let Some(r) = self.remote.as_mut() else {
             return;
         };
+        for (uuid, textures) in r.ely_skins.take() {
+            // Still listed, and still without a skin of the server's own.
+            if r.players.contains_key(&uuid) || r.tab_players.contains_key(&uuid) {
+                let entry = r.skin_textures.entry(uuid).or_default();
+                if entry.skin.is_none() {
+                    *entry = textures;
+                }
+            }
+        }
+        let r = &*r;
         let local = r.profile;
         let entries: Vec<(u128, horizon_client::skins::Textures)> = r
             .skin_textures
@@ -3175,6 +3222,7 @@ impl Game<'_> {
 
     fn tick_remote_level(&mut self) -> Result<()> {
         self.ticks += 1;
+        self.tick_remote_pistons();
         self.track_experience_display();
         // Options.broadcastOptions: a changed render distance is sent again.
         let view = client_view_distance(self.settings.render_distance);
@@ -3791,6 +3839,11 @@ impl Game<'_> {
             return;
         }
         if self.creative {
+            // MultiPlayerGameMode.startDestroyBlock: nothing is sent for a held item that can't break blocks in
+            // creative mode (a sword, the trident, the mace).
+            if !self.held_destroys_in_creative() {
+                return;
+            }
             let seq = self.next_sequence();
             self.predict_break(hit.pos, state, seq);
             self.send(S::PlayerAction(play::PlayerAction {

@@ -1231,6 +1231,11 @@ impl Game<'_> {
                 }
             }
         }
+        if let Some(Component::Potion(id)) = s.component(component::POTION_CONTENTS)
+            && let Some(potion) = host.hub.potion_name(*id)
+        {
+            out = out.with_potion(&potion);
+        }
         Some(out)
     }
 
@@ -1733,6 +1738,17 @@ impl Game<'_> {
                 // destroy delay, for as long as the player broke nothing else.
                 if digging.is_some()
                     && host.hub.guests[gi].creative()
+                    && let Some(play) = host.play.get_mut(&conn)
+                {
+                    play.digging = None;
+                }
+                // An instant break (a dead bush, a flower) leaves air where the dig was: the server destroys at
+                // START and records no dig, so nothing goes on being knocked there until the next START.
+                if let Some((pos, _)) = digging
+                    && self
+                        .res
+                        .facts()
+                        .is_air(self.world.block(pos[0], pos[1], pos[2]))
                     && let Some(play) = host.play.get_mut(&conn)
                 {
                     play.digging = None;

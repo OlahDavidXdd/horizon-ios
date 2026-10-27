@@ -68,6 +68,53 @@ impl Behaviours {
         *sim.random() = random;
         true
     }
+    /// `/place structure`: PlaceCommand.placeStructure's StructureStart.placeInChunk for each of `chunks` (`[x, z]`,
+    /// the chunks the start's box covers), each limited to its column, with the level's random. False without live
+    /// features.
+    pub fn place_structure<L: LevelAccess + ?Sized>(
+        &self,
+        level: &mut L,
+        ticks: &mut super::Ticks,
+        placed: &crate::worldgen::generator::PlacedStructure,
+        chunks: &[[i32; 2]],
+        min_y: i32,
+        max_y: i32,
+    ) -> bool {
+        let Some(features) = self.live_features() else {
+            return false;
+        };
+        let mut sim = self.sim(level, ticks);
+        let mut random = sim.random().clone();
+        {
+            let mut world = LevelFeatureWorld {
+                sim: &mut sim,
+                features,
+            };
+            for &[cx, cz] in chunks {
+                let chunk_box = crate::worldgen::structure::BoundingBox::new(
+                    [cx << 4, min_y, cz << 4],
+                    [(cx << 4) + 15, max_y, (cz << 4) + 15],
+                );
+                let mut place_feature =
+                    |w: &mut LevelFeatureWorld<'_, '_, L>,
+                     r: &mut horizon_core::random::LegacyRandom,
+                     name: &str,
+                     p: [i32; 3]| { Ok(features.place_placed(name, w, r, p)) };
+                if let Err(e) = crate::worldgen::structure::start::place_in_chunk(
+                    &placed.start,
+                    &mut world,
+                    &placed.resources,
+                    &mut random,
+                    chunk_box,
+                    &mut place_feature,
+                ) {
+                    eprintln!("Horizon: placing a structure failed in chunk {cx} {cz}: {e}");
+                }
+            }
+        }
+        *sim.random() = random;
+        true
+    }
 }
 
 /// The four (state, position) pairs of a 2x2 sapling square.

@@ -21,6 +21,8 @@ private func present(attempts: Int) {
         if attempts > 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { present(attempts: attempts - 1) }
         }
+        // Do not leave the resource worker waiting forever if UIKit could not present.
+        else { Task { _ = await Bridge.send("launcher-start") } }
         return
     }
     // Already up: a second request (Quit Game pressed twice) changes nothing.
@@ -35,6 +37,7 @@ private func present(attempts: Int) {
             host.dismiss(animated: true) {
                 // Back to the game's landscape (its own view controller allows nothing else).
                 turn(scene, to: .landscape)
+                Task { _ = await Bridge.send("launcher-visible false") }
             }
         })
         .preferredColorScheme(.dark)
@@ -42,7 +45,8 @@ private func present(attempts: Int) {
     host.modalPresentationStyle = .fullScreen
     host.modalTransitionStyle = .crossDissolve
     root.present(host, animated: false) {
-        turn(host.view.window?.windowScene, to: .portrait)
+        Task { _ = await Bridge.send("launcher-visible true") }
+        turn(host.view.window?.windowScene, to: UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait)
     }
 }
 
@@ -75,7 +79,9 @@ func gameViewController() -> UIViewController? {
 /// The launcher stands upright, as the design does; the game under it is held sideways by its own view
 /// controller, which the phone turns back to when Play dismisses this one. GameInfo.plist allows both.
 private final class LauncherHostingController: UIHostingController<AnyView> {
-    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+        UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait
+    }
     override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation { .portrait }
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 }

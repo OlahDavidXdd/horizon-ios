@@ -157,6 +157,8 @@ struct PackError: Error {
 final class PackChoices: ObservableObject {
     @Published private(set) var resourcePacks: [String] = []
     @Published private(set) var shaderPack: String?
+    @Published private(set) var shaderStatus: String?
+    @Published private(set) var shaderNotes: [String] = []
 
     func load() async {
         let options = await Bridge.send("options-get resourcePacks")
@@ -165,6 +167,18 @@ final class PackChoices: ObservableObject {
         }
         let shaders = await Bridge.send("shader-pack list")
         shaderPack = shaders["selected"] as? String
+        shaderNotes = []
+        shaderStatus = nil
+        if shaderPack != nil {
+            if let runtime = shaders["runtime"] as? [String: Any],
+               let programs = runtime["programs"] as? [String] {
+                shaderStatus = programs.isEmpty ? "No supported effects loaded. Normal rendering is active."
+                    : "Running \(programs.count) post-processing passes."
+                shaderNotes = runtime["notes"] as? [String] ?? []
+            } else {
+                shaderStatus = "Selected. Open a world to load this pack, then return here for its status."
+            }
+        }
     }
 
     func isOn(_ name: String, kind: PackKind) -> Bool {
@@ -212,12 +226,20 @@ struct PacksPage: View {
 
             installedSection
 
+            if kind == .shader, let status = choices.shaderStatus {
+                Text(status).font(Theme.sans(12)).foregroundStyle(Theme.text)
+                ForEach(Array(choices.shaderNotes.prefix(8).enumerated()), id: \.offset) { _, note in
+                    Text(note).font(Theme.sans(11)).foregroundStyle(Theme.warn)
+                        .textSelection(.enabled)
+                }
+            }
+
             SectionHeader(title: "Find on Modrinth")
             Field(title: "SEARCH", placeholder: kind == .resource ? "Faithful, Stay True…" : "Complementary, BSL…",
                   text: $query, keyboard: .default)
                 .onSubmit { Task { await store.search(kind, query: query) } }
             if kind == .shader {
-                Text("Shader packs are still being built into Horizon: their post effects run today, and more of each pack every update.")
+                Text("Partial compatibility: supported post-processing passes run. Pack terrain, water, and shadow rendering are not supported yet; Iris/OptiFine packs may look different or fail to load.")
                     .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
             }
             if let failed = store.failed {

@@ -65,6 +65,7 @@ mod growth;
 mod hand;
 mod import_screen;
 mod initial_spawn;
+mod input_mode;
 mod integrated;
 mod item_draw;
 mod item_particles;
@@ -1265,6 +1266,8 @@ struct Game<'a> {
     luminance: Option<horizon_client::dynamic_light::Luminance>,
     /// Name tags drawn over everything (`RenderPipelines.TEXT_SEE_THROUGH`).
     see_through_vertices: Vec<Vertex>,
+    /// The glowing entities' shapes in their outline colour (`OutlineBufferSource`), for the outline pass.
+    glowing_vertices: Vec<Vertex>,
     started: Instant,
     previous: Instant,
     /// FramerateLimitTracker.latestInputTime.
@@ -3262,6 +3265,14 @@ impl Game<'_> {
     /// mined the block `name`: an item with a `tool` component counts as used
     /// and loses its `damage_per_block` on a block that doesn't break
     /// instantly (`ShearsItem`: on any block but fire).
+    /// Item.canDestroyBlock for a creative player: whether the main hand's item lets them break blocks (its
+    /// `tool` component's `can_destroy_blocks_in_creative`; true for anything without one).
+    fn held_destroys_in_creative(&self) -> bool {
+        self.inventory[self.selected]
+            .as_ref()
+            .and_then(|stack| self.res.items().get(&stack.item))
+            .is_none_or(|info| info.creative_destroy)
+    }
     fn mine_block_with_held(&mut self, name: &str, hardness: f32) {
         let Some(stack) = self.inventory[self.selected].clone() else {
             return;
@@ -3885,6 +3896,11 @@ impl Game<'_> {
             return Ok(());
         }
         if self.creative {
+            // Item.canDestroyBlock: a creative player's sword, trident or mace breaks nothing.
+            if !self.held_destroys_in_creative() {
+                self.mining = None;
+                return Ok(());
+            }
             if self.destroy_delay == 0 {
                 self.break_block(hit.pos)?;
                 self.destroy_delay = 5;
@@ -3903,6 +3919,12 @@ impl Game<'_> {
             });
         }
         let state = self.world.block(hit.pos[0], hit.pos[1], hit.pos[2]);
+        // Nothing is dug out of air (MultiPlayerGameMode.startDestroyBlock, ServerPlayerGameMode's START): a block
+        // that broke at once leaves none, and digging on would knock air, which sounds like stone, every tick.
+        if self.res.facts().is_air(state) {
+            self.mining = None;
+            return Ok(());
+        }
         let facts = self.res.facts().get(state);
         if facts.hardness < 0.0 {
             return Ok(());
@@ -4662,6 +4684,11 @@ impl Game<'_> {
             return;
         }
         if !capture {
+            #[cfg(target_os = "ios")]
+            {
+                self.left = false;
+                self.right = false;
+            }
             self.stop_mining();
         }
         // The real pointer takes over from an agent's.
@@ -6852,8 +6879,11 @@ impl Game<'_> {
         // `VaultRenderer`.
         self.vault_geometry(camera, alpha, &mut out);
         self.ominous_item_spawner_geometry(camera, alpha, &mut out);
-        // Mobs and their projectiles.
-        self.mob_geometry(camera, alpha, &mut out);
+        // Mobs and their projectiles, and the glowing ones' outline shapes.
+        let mut glowing = std::mem::take(&mut self.glowing_vertices);
+        glowing.clear();
+        self.mob_geometry(camera, alpha, &mut out, &mut glowing);
+        self.glowing_vertices = glowing;
         self.player_model_geometry(camera, self.clock.camera_fraction(), &mut out);
         self.guest_model_geometry(camera, alpha, &mut out);
         self.fangs_geometry(camera, alpha, &mut out);
@@ -10162,6 +10192,7 @@ impl Game<'_> {
             .then(|| self.border_draw(camera.to_array(), alpha as f32))
             .flatten();
         let see_through = std::mem::take(&mut self.see_through_vertices);
+        let glowing = std::mem::take(&mut self.glowing_vertices);
         if title {
             self.dynamic_lights.clear();
         } else {
@@ -10246,6 +10277,7 @@ impl Game<'_> {
             },
             additive: &additive,
             see_through: &see_through,
+            glowing: if title { &[] } else { &glowing },
             celestial: if self.settings.horizon.sky || title {
                 &celestial
             } else {
@@ -10287,6 +10319,7 @@ impl Game<'_> {
         };
         // Restore storage even when rendering fails (for example, a lost surface).
         self.entity_vertices = entities;
+        self.glowing_vertices = glowing;
         self.see_through_vertices = see_through;
         result
     }
@@ -10883,10 +10916,23 @@ impl ApplicationHandler for Game<'_> {
         if self.window.as_ref().is_none_or(|w| w.id() != id) {
             return;
         }
+        if horizon_ios_launcher::covered()
+            && matches!(
+                &event,
+                WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::Touch(_)
+            )
+        {
+            return;
+        }
         if let WindowEvent::KeyboardInput { event, .. } = &event
             && let PhysicalKey::Code(key) = event.physical_key
         {
             if event.state == ElementState::Pressed {
+                self.touch_keyboard_used();
                 self.physical_keys.insert(key);
             } else {
                 self.physical_keys.remove(&key);
@@ -10894,6 +10940,7 @@ impl ApplicationHandler for Game<'_> {
         }
         if let WindowEvent::Focused(false) = &event {
             self.physical_keys.clear();
+            self.modifiers = winit::keyboard::ModifiersState::empty();
         }
         if let WindowEvent::ModifiersChanged(m) = &event {
             self.modifiers = m.state();
@@ -10990,6 +11037,29 @@ impl ApplicationHandler for Game<'_> {
             return;
         }
         let result: Result<()> = (|| {
+            #[cfg(target_os = "ios")]
+            if let WindowEvent::KeyboardInput { event, .. } = &event
+                && event.state == ElementState::Pressed
+                && let PhysicalKey::Code(key) = event.physical_key
+                && self.keyboard_menu_key(event_loop, key)?
+            {
+                return Ok(());
+            }
+            // A field or menu may have opened since key-down. Release the translated binding
+            // before that screen consumes it, including keys rebound to mouse actions.
+            #[cfg(target_os = "ios")]
+            if let WindowEvent::KeyboardInput { event, .. } = &event
+                && event.state == ElementState::Released
+                && let PhysicalKey::Code(key) = event.physical_key
+            {
+                self.extras_key(key, false, false);
+                match self.settings.keys.translate(key) {
+                    Some(Ok(key)) => self.mapped_key(key, false, false)?,
+                    Some(Err(button)) => self.play_mouse(button, false)?,
+                    None => {}
+                }
+                return Ok(());
+            }
             match event {
                 WindowEvent::CloseRequested => {
                     self.begin_closing_save(true)?;
@@ -11494,6 +11564,9 @@ impl ApplicationHandler for Game<'_> {
                     self.mapped_key(key, event.state == ElementState::Pressed, event.repeat)?;
                 }
                 WindowEvent::RedrawRequested => {
+                    if horizon_ios_launcher::covered() {
+                        return Ok(());
+                    }
                     self.observe_fullscreen();
                     let now = Instant::now();
                     let frame_cpu = self
@@ -11685,6 +11758,17 @@ impl ApplicationHandler for Game<'_> {
         }
     }
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if horizon_ios_launcher::covered() {
+            return;
+        }
+        if matches!(
+            &event,
+            DeviceEvent::MouseMotion { .. }
+                | DeviceEvent::Button { .. }
+                | DeviceEvent::MouseWheel { .. }
+        ) {
+            self.touch_mouse_used();
+        }
         if self.pending_save.is_none()
             && self.captured
             && self.focused
@@ -11726,6 +11810,29 @@ impl ApplicationHandler for Game<'_> {
         self.poll_launcher(event_loop);
         if self.pending_save.is_some() {
             return;
+        }
+        if horizon_ios_launcher::covered() {
+            self.capture(false);
+            self.previous = Instant::now();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(33),
+            ));
+            return;
+        }
+        #[cfg(target_os = "ios")]
+        {
+            // UIKit pointer lock is a gameplay request; every overlay/text field releases it.
+            let want = self.focused
+                && self.title.is_none()
+                && self.screen == Screen::Playing
+                && self.player.is_some()
+                && self.sign_edit.is_none()
+                && self.book.is_none()
+                && self.server_packs.prompt.is_none()
+                && !self.pause;
+            if self.captured != want {
+                self.capture(want);
+            }
         }
         self.poll_pads(event_loop);
         self.sync_system_keyboard();
@@ -11891,6 +11998,7 @@ impl<'a> Game<'a> {
             dynamic_lights: Vec::new(),
             luminance: None,
             see_through_vertices: Vec::new(),
+            glowing_vertices: Vec::new(),
             health_hud: hud_layout::HealthHud::default(),
             started: now,
             previous: now,
@@ -12828,6 +12936,7 @@ fn loading_frame(hud: &HudBatch) -> Frame<'_> {
         lightning: Default::default(),
         additive: &[],
         see_through: &[],
+        glowing: &[],
         celestial: &[],
         stars: None,
         hand: &[],
@@ -13165,6 +13274,12 @@ impl Loading {
             event_loop.exit();
             return;
         }
+        if horizon_ios_launcher::covered() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(33),
+            ));
+            return;
+        }
         if let Some(w) = &self.window {
             if self.options.as_ref().is_some_and(|o| o.offscreen) {
                 self.draw();
@@ -13175,6 +13290,9 @@ impl Loading {
         event_loop.set_control_flow(ControlFlow::Poll);
     }
     fn draw(&mut self) {
+        if horizon_ios_launcher::covered() {
+            return;
+        }
         let Some(size) = self
             .renderer
             .as_ref()

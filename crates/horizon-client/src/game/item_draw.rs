@@ -22,6 +22,15 @@ pub(super) struct Env<'a, 'g> {
     game: &'a Game<'g>,
 }
 impl ItemEnv for Env<'_, '_> {
+    fn component_matches(&self, stack: &StackView, predicate: &Value) -> bool {
+        let Some(pattern) = predicate.get("minecraft:custom_data") else {
+            return false;
+        };
+        let components = self.game.pack.item_renderer.models.components(stack);
+        components
+            .get("minecraft:custom_data")
+            .is_some_and(|actual| item_render::custom_data_matches(actual, pattern))
+    }
     fn potion_effect_color(&self, contents: &Value) -> Option<i32> {
         // `PotionContents.getColorOr`: the effect mix when any effect is visible.
         let id = contents["potion"].as_str();

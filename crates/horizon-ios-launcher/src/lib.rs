@@ -52,10 +52,20 @@ impl Drop for Request {
 
 static QUEUE: Mutex<VecDeque<Request>> = Mutex::new(VecDeque::new());
 
-/// The launcher, switched off for now: the game starts at its title screen as it did before the launcher, loads
-/// at once, and Quit Game quits. True brings it back.
+/// Bundled iOS builds expose accounts and game management before Play.
 #[cfg(target_os = "ios")]
-const ENABLED: bool = false;
+const ENABLED: bool = true;
+
+/// The native launcher fully covers the game's surface. Its bridge still needs polling.
+static COVERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_covered(covered: bool) {
+    COVERED.store(covered, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn covered() -> bool {
+    COVERED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Queue a request for the game's next frame.
 pub fn push(request: Request) {

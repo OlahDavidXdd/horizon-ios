@@ -71,6 +71,9 @@ pub struct ItemInfo {
     /// The `tool` component's `damage_per_block`, when the item has the
     /// component (a mace or trident has one without rules).
     pub tool_damage_per_block: Option<u32>,
+    /// The `tool` component's `can_destroy_blocks_in_creative` (Item.canDestroyBlock): false for swords, the
+    /// trident and the mace, which break nothing in creative mode. True without the component.
+    pub creative_destroy: bool,
     pub food: Option<(u32, f32)>,
     pub can_always_eat: bool,
     /// `consumable`: its timing, sound, particles and `on_consume_effects`.
@@ -550,6 +553,9 @@ impl Items {
                     tool_damage_per_block: c
                         .get("minecraft:tool")
                         .map(|t| t["damage_per_block"].as_u64().unwrap_or(1) as u32),
+                    creative_destroy: c["minecraft:tool"]["can_destroy_blocks_in_creative"]
+                        .as_bool()
+                        .unwrap_or(true),
                     food,
                     can_always_eat,
                     // Consumable.CODEC's defaults.

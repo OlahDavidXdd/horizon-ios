@@ -1,5 +1,11 @@
 # Third-party notices
 
+## winit
+
+`third_party/winit` is [winit](https://github.com/rust-windowing/winit) 0.30.13 with a local
+UIKit keyboard and mouse input patch. It is licensed under Apache-2.0 (`third_party/winit/LICENSE`).
+Provenance and changes are listed in `third_party/winit/HORIZON.md`.
+
 ## wgpu-hal
 
 `third_party/wgpu-hal` is [wgpu-hal](https://github.com/gfx-rs/wgpu) 30.0.1 by the gfx-rs

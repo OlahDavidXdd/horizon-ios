@@ -19,7 +19,11 @@ fn apply(m: &mut Mob, values: &[(u8, i32, Value)], builtin: &Builtin) {
             // Entity.DATA_SHARED_FLAGS_ID's FLAG_ONFIRE: Entity.isOnFire on a
             // client, which draws the flames. A client doesn't count the
             // fire down: the flag goes off when the server's fire is out.
-            (0, Value::Byte(flags)) => m.fire_ticks = i32::from(flags & 1),
+            // FLAG_GLOWING (0x40): Entity.isCurrentlyGlowing, which draws the outline.
+            (0, Value::Byte(flags)) => {
+                m.fire_ticks = i32::from(flags & 1);
+                m.glowing = flags & 0x40 != 0;
+            }
             // LivingEntity.DATA_HEALTH_ID: the boss bars and the death
             // animation follow it.
             (9, Value::Float(health)) => m.health = *health,

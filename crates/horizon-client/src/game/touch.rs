@@ -27,6 +27,8 @@ pub(super) struct TouchInput {
     fingers: Touches,
     /// A touch has been seen: the controls are drawn (from the start on iPhone and iPad).
     seen: bool,
+    /// The last input device controls only the visibility of touch overlays.
+    hardware: super::input_mode::InputMode,
     /// The finger that is the pointer over a menu.
     menu: Option<MenuFinger>,
     /// Clicks to release once a tick has passed: vanilla samples buttons once a tick, so a tap released in
@@ -95,6 +97,24 @@ impl Game<'_> {
 
     /// The controls are on screen: after a touch, from the start on iPhone and iPad, or with `HORIZON_TOUCH=1`
     /// (laying them out on a computer).
+    /// Hide only touch overlays, and only while the last-used hardware is still connected.
+    fn hardware_hides_touch(&self) -> bool {
+        self.touch.hardware.hides_touch(
+            horizon_gamecontroller::keyboard_connected(),
+            horizon_gamecontroller::mouse_connected(),
+        )
+    }
+
+    pub(super) fn touch_keyboard_used(&mut self) {
+        if horizon_gamecontroller::keyboard_connected() {
+            self.touch.hardware.keyboard();
+        }
+    }
+
+    pub(super) fn touch_mouse_used(&mut self) {
+        self.touch.hardware.mouse();
+    }
+
     fn touch_shown(&self) -> bool {
         self.touch.seen
             || cfg!(target_os = "ios")
@@ -104,6 +124,7 @@ impl Game<'_> {
     /// winit's `WindowEvent::Touch`.
     pub(super) fn touch_event(&mut self, event_loop: &ActiveEventLoop, touch: Touch) -> Result<()> {
         self.touch.seen = true;
+        self.touch.hardware.touch();
         self.last_input = Instant::now();
         let Some(batch) = self.touch_batch() else {
             return Ok(());
@@ -131,6 +152,10 @@ impl Game<'_> {
     /// Once a frame: a held finger starts mining, held-back clicks release, and a screen that opened over the
     /// game lets go of every finger on it.
     pub(super) fn touch_frame(&mut self, event_loop: &ActiveEventLoop) {
+        self.touch.hardware.refresh(
+            horizon_gamecontroller::keyboard_connected(),
+            horizon_gamecontroller::mouse_connected(),
+        );
         if !self.touch_shown() {
             return;
         }
@@ -417,7 +442,7 @@ impl Game<'_> {
     /// The buttons over the HUD while playing: vanilla's button, a little see-through as Pocket Edition's
     /// were, lit while held, with white marks shadowed like Minecraft's text.
     pub(super) fn draw_touch_controls(&self, batch: &mut HudBatch) {
-        if !self.touch_shown() || !self.touch_playing() {
+        if !self.touch_shown() || self.hardware_hides_touch() || !self.touch_playing() {
             return;
         }
         let atlas = &self.gui.atlas;
@@ -435,6 +460,9 @@ impl Game<'_> {
     /// The buttons over a screen: ✕ where the screen has no way out of its own on a touch screen
     /// (`touch_close_shown`), and ⌨ beside it while a text field has focus.
     pub(super) fn draw_touch_close(&mut self, batch: &mut HudBatch) {
+        if self.hardware_hides_touch() {
+            return;
+        }
         let held = self.touch.menu.as_ref().is_some_and(|f| f.closed);
         let keyboard = self.touch_shown() && self.field_focused();
         let atlas = &self.gui.atlas;

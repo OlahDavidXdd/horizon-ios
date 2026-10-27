@@ -653,6 +653,13 @@ impl ConditionProperty {
             "minecraft:view_entity" => Self::ViewEntity,
             "minecraft:component" => {
                 let predicate = required(m, "predicate")?;
+                if predicate.is_string() {
+                    let name = ident(predicate)?;
+                    let value = required(m, "value")?.clone();
+                    return Ok(Self::Component(Value::Object(Map::from_iter([(
+                        name, value,
+                    )]))));
+                }
                 if object(predicate)?.len() != 1 {
                     return Err(err("a single component predicate is expected"));
                 }

@@ -53,10 +53,14 @@ impl Loading {
         // Download them first; the Wi-Fi and cable doors open only if that fails. Once a run: files that
         // downloaded and still don't load would otherwise be downloaded again and again.
         let url = horizon_client::import::download::url(horizon_core::VANILLA_VERSION);
+        let mut error = None;
         let download = if DOWNLOADED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             log::warn!(
                 "Horizon: the downloaded game files did not load ({reason}); not downloading again"
             );
+            error = Some(format!(
+                "The game files downloaded but did not load: {reason}"
+            ));
             None
         } else {
             match horizon_client::import::download::Download::start(url.clone(), home.clone()) {
@@ -86,7 +90,7 @@ impl Loading {
             atlas,
             home,
             reason,
-            error: None,
+            error,
             received: 0,
             total: 0,
             download,
@@ -198,7 +202,10 @@ impl Loading {
                 "version": horizon_core::VANILLA_VERSION,
             }),
             Some(Stage::Installing) => serde_json::json!({ "phase": "installing" }),
-            None => serde_json::json!({ "phase": "failed", "error": import.error }),
+            None => serde_json::json!({
+                "phase": "failed",
+                "error": import.error.as_deref().unwrap_or(&import.reason),
+            }),
         }
     }
 

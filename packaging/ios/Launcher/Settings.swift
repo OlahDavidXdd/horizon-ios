@@ -251,7 +251,9 @@ private struct About: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            line("Horizon for iPhone", Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+            line("Horizon for iPhone and iPad", Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+            line("Build", Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "")
+            line("Input", "iPad keyboard + pointer lock")
             line("Minecraft: Java Edition", version)
             line("Game files", GameFolder.hasGameFiles ? "Installed" : "Not installed")
             Link(destination: URL(string: "https://github.com/heyskylo/horizon-ios")!) {

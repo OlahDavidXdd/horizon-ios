@@ -330,6 +330,7 @@ impl PackPost {
             |flips: &[(u32, bool)]| flips.iter().filter(|f| f.1).fold(0u16, |m, f| m | 1 << f.0);
         let mut used = 1u16;
         let mut passes = Vec::new();
+        let mut complete = true;
         for p in post.programs {
             let interface = &p.program.interface;
             let mut entries = vec![entry(
@@ -356,6 +357,13 @@ impl PackPost {
                 if s.ty == "sampler2DShadow" {
                     (src, sample_type) = (Source::Shadow, wgpu::TextureSampleType::Depth);
                 }
+                if matches!(src, Source::Dummy | Source::Shadow) {
+                    complete = false;
+                    notes.push(format!(
+                        "{}: sampler `{}` requires an unavailable texture; pack disabled",
+                        p.name, s.name
+                    ));
+                }
                 let wanted = match s.ty.as_str() {
                     "sampler2DShadow" => true,
                     "sampler2D" => !int,
@@ -364,6 +372,7 @@ impl PackPost {
                     _ => false,
                 };
                 if !wanted {
+                    complete = false;
                     notes.push(format!(
                         "{}: `{} {}` is not provided yet",
                         p.name, s.ty, s.name
@@ -409,6 +418,7 @@ impl PackPost {
                 }
             }
             if !final_pass && writes.is_empty() {
+                complete = false;
                 notes.push(format!("{}: writes no buffer; skipped", p.name));
                 continue;
             }
@@ -466,6 +476,7 @@ impl PackPost {
             let pipeline = match created {
                 Ok(p) => p,
                 Err(e) => {
+                    complete = false;
                     notes.push(format!("{}: skipped: {e}", p.name));
                     continue;
                 }
@@ -495,6 +506,12 @@ impl PackPost {
                 written,
                 groups: HashMap::new(),
             });
+        }
+        // A final pass may depend on every earlier stage. Never run a broken subset
+        // with cleared or dummy inputs: it can hide the entire world behind black.
+        if !complete {
+            passes.clear();
+            notes.push("Pack disabled because its complete pipeline could not be built.".into());
         }
         // A clear only matters when a program reads the buffer before one writes all of it
         // (composite passes cover their whole target); the others are skipped.

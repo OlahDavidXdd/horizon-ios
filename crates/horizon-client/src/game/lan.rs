@@ -149,9 +149,13 @@ fn mob_meta(
     defaults: &mut Vec<(u8, i32, Value)>,
 ) {
     let kind = m.kind.id.as_str();
-    if m.fire_ticks > 0 {
-        meta.push((0, serializer::BYTE, Value::Byte(1)));
+    // Entity.DATA_SHARED_FLAGS_ID: on fire 1, glowing 0x40 (the Glowing tag or effect,
+    // LivingEntity.updateGlowingStatus).
+    let shared = i8::from(m.fire_ticks > 0) | i8::from(m.currently_glowing()) << 6;
+    if shared != 0 {
+        meta.push((0, serializer::BYTE, Value::Byte(shared)));
     }
+    defaults.push((0, serializer::BYTE, Value::Byte(0)));
     if let Some(name) = &m.custom_name {
         meta.push((
             2,

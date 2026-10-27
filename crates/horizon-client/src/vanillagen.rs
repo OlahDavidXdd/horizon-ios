@@ -268,6 +268,16 @@ impl VanillaTerrain {
         let worker = worker.get_or_insert_with(|| self.generator.worker());
         worker.jigsaw_pieces(query)
     }
+    /// `/place structure`: Structure.generate for `name` at `chunk`, in any biome.
+    pub fn structure_start(
+        &self,
+        name: &str,
+        chunk: ChunkPos,
+    ) -> Option<horizon_world::worldgen::generator::PlacedStructure> {
+        let mut worker = self.query.lock().unwrap_or_else(|e| e.into_inner());
+        let worker = worker.get_or_insert_with(|| self.generator.worker());
+        worker.structure_start(name, chunk)
+    }
     /// NoiseBasedChunkGenerator.getOrigin: where the world spawn search starts.
     pub fn origin(&self) -> crate::Result<ChunkPos> {
         Ok(self.generator.origin()?)
