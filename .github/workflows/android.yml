@@ -1,0 +1,69 @@
+name: android
+
+# Builds Horizon's Android APK (docs/android.md). Runs on the `android-port` branch only.
+# Whatever happens, the tail of the build output and every rustc error are pushed to the
+# `build-logs` branch, which can be read without a token (git fetch), and the APK is uploaded
+# as the `Horizon-apk` artifact.
+on:
+  push:
+    branches: [android-port]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked 2>&1 | tee -a build.log
+
+      - name: Debug keystore
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -keystore ~/.android/debug.keystore -storepass android \
+              -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build APK
+        run: |
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
+          echo "NDK: $ANDROID_NDK_ROOT  SDK: $ANDROID_HOME"
+          cargo apk build --release -p horizon-android 2>&1 | tee -a build.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Horizon-apk
+          path: target/release/apk/*.apk
+
+      - name: Publish build log
+        if: always()
+        run: |
+          mkdir -p /tmp/log
+          touch build.log
+          {
+            echo "run: $GITHUB_RUN_ID  sha: $GITHUB_SHA  job: ${{ job.status }}"
+            echo "=== rustc and linker errors ==="
+            grep -n -B3 -A25 -E '^(error|warning: unused manifest|Error:)|linking with|ld: error|failed to run custom build' build.log | head -c 150000 || true
+            echo "=== last 150 lines ==="
+            tail -n 150 build.log
+          } > /tmp/log/errors.txt
+          cd /tmp/log
+          git init -q -b build-logs
+          git add errors.txt
+          git -c user.name=github-actions -c user.email=actions@github.com commit -q -m "build log for $GITHUB_SHA"
+          git push -q --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" build-logs

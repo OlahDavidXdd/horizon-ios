@@ -1,0 +1,54 @@
+[package]
+name = "horizon-android"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version = "1.90"
+description = "Horizon on Android: the library NativeActivity loads (docs/android.md)"
+
+[lints]
+workspace = true
+
+# The whole crate is empty off Android (src/lib.rs), so a desktop `cargo build --workspace` still works.
+[lib]
+name = "horizon_android"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+# No `controllers`: gilrs has no Android backend and the DualSense output pulls in hidapi.
+horizon-client = { path = "../horizon-client", default-features = false, features = ["audio"] }
+# The same winit (the vendored copy, through the root patch) the client is built on, so there is one
+# android-activity in the link and not two competing `ANativeActivity_onCreate`s.
+winit = { version = "0.30.13", features = ["android-native-activity"] }
+log = "0.4"
+
+# `cargo apk build --release -p horizon-android` (docs/android.md). Keys are cargo-apk's.
+[package.metadata.android]
+package = "dev.horizon.android"
+apk_name = "Horizon"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+# cpal's Android backend is AAudio, which needs API 26; 28 keeps Vulkan 1.1 a safe bet.
+min_sdk_version = 28
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "Horizon"
+
+[package.metadata.android.application.activity]
+orientation = "landscape"
+
+# Vulkan is the only graphics API the Android build has.
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.vulkan.level"
+required = true
+version = 1
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+# A release APK needs a key; the debug one Android Studio makes is enough to install on your own phone.
+[package.metadata.android.signing.release]
+path = "$HOME/.android/debug.keystore"
+keystore_password = "android"

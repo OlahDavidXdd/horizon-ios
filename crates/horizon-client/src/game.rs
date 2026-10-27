@@ -327,7 +327,7 @@ impl Options {
         // On a phone, the folder an import unpacked into `Documents` is the one a player can reach. On
         // Linux, the game files a start downloaded live in the game's home (`import::home`). A desktop
         // without them gives the answer it has always given.
-        let sandbox = if cfg!(target_os = "ios") {
+        let sandbox = if cfg!(any(target_os = "ios", target_os = "android")) {
             std::env::current_dir().ok()
         } else if cfg!(target_os = "linux") {
             Some(horizon_client::import::home())
@@ -4684,7 +4684,7 @@ impl Game<'_> {
             return;
         }
         if !capture {
-            #[cfg(target_os = "ios")]
+            #[cfg(any(target_os = "ios", target_os = "android"))]
             {
                 self.left = false;
                 self.right = false;
@@ -10856,6 +10856,15 @@ impl Game<'_> {
 impl ApplicationHandler for Game<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
+            // Android took the native window away on `suspended` and has given a new one back to the
+            // same winit `Window`: put a swapchain on it.
+            #[cfg(target_os = "android")]
+            if let Some(renderer) = &mut self.renderer
+                && let Err(error) = renderer.recreate_surface()
+            {
+                self.error = Some(error.into());
+                event_loop.exit();
+            }
             return;
         }
         // The Window constructor: created fullscreen when options.txt says so.
@@ -10911,6 +10920,14 @@ impl ApplicationHandler for Game<'_> {
         self.window = Some(window);
         self.apply_settings();
         self.previous = Instant::now();
+    }
+    /// Android destroys the native window when the app goes to the background, and the swapchain on
+    /// it dies with it. Drop the surface now; `resumed` makes a new one.
+    #[cfg(target_os = "android")]
+    fn suspended(&mut self, _: &ActiveEventLoop) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.release_surface();
+        }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if self.window.as_ref().is_none_or(|w| w.id() != id) {
@@ -13113,8 +13130,36 @@ fn write_report(game: &Game<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The activity winit builds its loop on. winit cannot make an Android loop without it, and the
+/// only code that is handed it is `android_main` (`crates/horizon-android`).
+#[cfg(target_os = "android")]
+static ANDROID_APP: std::sync::OnceLock<winit::platform::android::activity::AndroidApp> =
+    std::sync::OnceLock::new();
+
+/// The game's entry on Android: remember the activity, then run as everywhere else.
+#[cfg(target_os = "android")]
+pub fn run_android(app: winit::platform::android::activity::AndroidApp) -> Result<()> {
+    let _ = ANDROID_APP.set(app);
+    run()
+}
+
+#[cfg(not(target_os = "android"))]
+fn event_loop() -> Result<EventLoop<()>> {
+    Ok(EventLoop::new()?)
+}
+
+#[cfg(target_os = "android")]
+fn event_loop() -> Result<EventLoop<()>> {
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+    let app = ANDROID_APP
+        .get()
+        .cloned()
+        .ok_or("the Android activity was never handed to the game")?;
+    Ok(EventLoop::builder().with_android_app(app).build()?)
+}
+
 fn run_event_loop(mut game: Game<'_>) -> Result<()> {
-    EventLoop::new()?.run_app(&mut game)?;
+    event_loop()?.run_app(&mut game)?;
     horizon_client::discord_presence::stop();
     write_report(&game)?;
     if let Some(e) = game.error.take() {
@@ -13150,6 +13195,15 @@ struct Loading {
 impl Loading {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
+            // Android took the native window away on `suspended` and has given a new one back to the
+            // same winit `Window`: put a swapchain on it.
+            #[cfg(target_os = "android")]
+            if let Some(renderer) = &mut self.renderer
+                && let Err(error) = renderer.recreate_surface()
+            {
+                self.error = Some(error.into());
+                event_loop.exit();
+            }
             return;
         }
         // The Window constructor: created fullscreen when options.txt says so.
@@ -13218,6 +13272,14 @@ impl Loading {
         }
         horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
         self.window = Some(window);
+    }
+    /// Android destroys the native window when the app goes to the background, and the swapchain on
+    /// it dies with it. Drop the surface now; `resumed` makes a new one.
+    #[cfg(target_os = "android")]
+    fn suspended(&mut self, _: &ActiveEventLoop) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.release_surface();
+        }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if self.window.as_ref().is_none_or(|w| w.id() != id) {
@@ -13421,6 +13483,13 @@ impl ApplicationHandler for App {
             App::Ready(game) => game.resumed(event_loop),
         }
     }
+    #[cfg(target_os = "android")]
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        match self {
+            App::Loading(loading) => loading.suspended(event_loop),
+            App::Ready(game) => game.suspended(event_loop),
+        }
+    }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         match self {
             App::Loading(loading) => loading.window_event(event_loop, id, event),
@@ -13527,7 +13596,7 @@ fn run_loading(
         error: None,
     };
     let mut app = App::Loading(Box::new(loading));
-    EventLoop::new()?.run_app(&mut app)?;
+    event_loop()?.run_app(&mut app)?;
     horizon_client::discord_presence::stop();
     match app {
         App::Ready(mut game) => {

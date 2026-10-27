@@ -972,7 +972,7 @@ impl Game<'_> {
             // The next field to take the focus asks for the keyboard again.
             self.pad.menu.system_keyboard_hidden = false;
         }
-        let want = cfg!(target_os = "ios")
+        let want = cfg!(any(target_os = "ios", target_os = "android"))
             && focused
             && self.pad.menu.osk.is_none()
             && !self.pad.menu.system_keyboard_hidden;

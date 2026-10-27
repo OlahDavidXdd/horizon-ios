@@ -3126,6 +3126,12 @@ impl Renderer {
         if self.suspended {
             return Ok(false);
         }
+        // A backgrounded Android app has no native window, so no surface: nothing to draw on until
+        // `resumed` gives one back.
+        #[cfg(target_os = "android")]
+        if self.surface.is_none() && self.offscreen.is_none() {
+            return Ok(false);
+        }
         let started = Instant::now();
         if self.first_frame == FirstFrame::Acquire {
             // Once: a minimized window acquires nothing for a while.

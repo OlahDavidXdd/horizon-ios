@@ -117,7 +117,7 @@ impl Game<'_> {
 
     fn touch_shown(&self) -> bool {
         self.touch.seen
-            || cfg!(target_os = "ios")
+            || cfg!(any(target_os = "ios", target_os = "android"))
             || std::env::var_os("HORIZON_TOUCH").is_some_and(|v| v == "1")
     }
 

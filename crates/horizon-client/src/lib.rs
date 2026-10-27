@@ -1,6 +1,9 @@
 //! Horizon native client: resources, world streaming, rendering and the
 //! bindings between the validated simulation pieces and the game loop.
 #![forbid(unsafe_code)]
+// `game.rs` names this crate by its own name, as it does as the `horizon-client` binary's module.
+#[cfg(target_os = "android")]
+extern crate self as horizon_client;
 pub mod advancements;
 pub mod ambience;
 pub mod animate_tick;
@@ -74,6 +77,10 @@ pub mod flatgen;
 pub mod fog;
 pub mod font;
 pub mod friends_screen;
+/// The game loop. A binary on every other target; on Android there is no `main` to call, so the
+/// library carries it for `horizon-android`'s `android_main`.
+#[cfg(target_os = "android")]
+pub mod game;
 pub mod game_mode_switcher;
 pub mod gamepad;
 pub mod gamerules;
