@@ -1261,6 +1261,21 @@ impl Screen {
             scroll.release();
         }
     }
+    /// The focused text box on screen (GUI pixels): the field a phone's keyboard belongs to, so a touch
+    /// outside it can put the keyboard away. `Direct` has one box and it always has the focus.
+    pub fn focused_rect(&self, (w, _h): (f32, f32)) -> Option<[f32; 4]> {
+        let x = (w.ceil() / 2.0).floor() - 100.0;
+        match self {
+            Self::Edit { focus, .. } => {
+                Some([x, if *focus == 0 { 66.0 } else { 106.0 }, 200.0, 20.0])
+            }
+            Self::Direct { .. } => Some([x, 116.0, 200.0, 20.0]),
+            Self::Friend { focus, .. } => {
+                Some([x, if *focus == 0 { 64.0 } else { 105.0 }, 200.0, 20.0])
+            }
+            _ => None,
+        }
+    }
     fn focused_field(&mut self) -> Option<&mut String> {
         match self {
             Self::Edit {
