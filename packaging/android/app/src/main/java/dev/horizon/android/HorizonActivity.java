@@ -62,6 +62,7 @@ public final class HorizonActivity extends NativeActivity {
     private long setupReceived, setupTotal;
     private volatile int setupAttempt;
     private volatile java.net.HttpURLConnection activeDownload;
+    private volatile PreparedResources resourceArchive;
     private volatile boolean destroyed;
     private boolean launching, visible = true;
     private String tab = "play", importKind = "resources", phase = "unknown";
@@ -94,7 +95,7 @@ public final class HorizonActivity extends NativeActivity {
                         && !state.optBoolean("importing") && state.optJSONObject("import") == null
                         && "waiting".equals(phase)) {
                     automaticSetupAttempted = true;
-                    setupMessage = t("private_download_help"); render();
+                    setupMessage = resourceSetupExplanation(); render();
                 }
             });
             ui.postDelayed(this, 1000);
@@ -575,6 +576,7 @@ public final class HorizonActivity extends NativeActivity {
                     }
                 }
                 File staged = destination;
+                if(resources) { installResourceArchive(staged,attempt); return; }
                 ui.post(() -> {
                     if(destroyed) { staged.delete(); return; }
                     if (kind.equals("shader")) { render(); return; }
@@ -620,7 +622,7 @@ public final class HorizonActivity extends NativeActivity {
         transparency.setChecked(getPreferences(0).getBoolean("reduce_transparency",false));
         transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); refreshNavigation(); });
         page.addView(transparency);
-        page.addView(label("Horizon · 0.2.96-android · ARM64",14));
+        page.addView(label("Horizon · 0.2.97-android · ARM64",14));
     }
     static byte[] readBytes(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -628,10 +630,11 @@ public final class HorizonActivity extends NativeActivity {
         while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
         return out.toByteArray();
     }
-    private boolean hasGameFiles() { return new File(homeDir(), "resources/horizon-resources.json").isFile(); }
+    private boolean hasGameFiles() { return PreparedResources.complete(new File(homeDir(),"resources")); }
+    private String resourceSetupExplanation() { return t(new File(homeDir(),"resources/horizon-resources.json").isFile() ? "incomplete_resources" : "private_download_help"); }
     private void showResourceSetup() {
         needsResources = true; tab = "play"; render();
-        if (!automaticSetupAttempted && !setupBusy) { automaticSetupAttempted = true; setupMessage = t("private_download_help"); render(); }
+        if (!automaticSetupAttempted && !setupBusy) { automaticSetupAttempted = true; setupMessage = resourceSetupExplanation(); render(); }
     }
     private void resourceSetupCard() {
         LinearLayout box = card();
@@ -684,7 +687,8 @@ public final class HorizonActivity extends NativeActivity {
             android.util.Log.w("HorizonSetup", "Game-files setup failed: " + failure);
             needsResources = true;
             String reason = failure == null ? "" : failure.toLowerCase(java.util.Locale.ROOT);
-            String key = reason.contains("http ") ? "download_server_error"
+            String key = reason.contains("incomplete resource") ? "incomplete_resources"
+                : reason.contains("http ") ? "download_server_error"
                 : reason.contains("html") ? "download_sign_in"
                 : reason.contains("space") || reason.contains("enospc") ? "download_no_space"
                 : reason.contains("timeout") || reason.contains("unknownhost") || reason.contains("connect") ? "download_connection_error"
@@ -753,14 +757,37 @@ public final class HorizonActivity extends NativeActivity {
                     }
                     if(expected >= 0 && count != expected) throw new IOException("Incomplete download");
                 }
-                ui.post(() -> {
-                    if(attempt != setupAttempt || destroyed) { zip.delete(); return; }
-                    installingResources = true; render();
-                    request("import-game-files " + zip.getAbsolutePath(), v -> { zip.delete(); finishSetup(attempt, null); }, failure -> { zip.delete(); finishSetup(attempt, failure); });
-                });
+                installResourceArchive(zip,attempt);
             } catch(Exception e) { zip.delete(); ui.post(() -> finishSetup(attempt, e.toString())); }
             finally { if(connection != null) { connection.disconnect(); if(activeDownload == connection) activeDownload = null; } }
         });
+    }
+    /** Called on a worker; keep the source handle alive even when native import unlinks it. */
+    private void installResourceArchive(File zip, int attempt) {
+        final PreparedResources source;
+        try { source = new PreparedResources(zip); }
+        catch(Exception failure) { zip.delete(); ui.post(() -> finishSetup(attempt,failure.toString())); return; }
+        resourceArchive = source;
+        if(destroyed) { closeResourceArchive(source,zip); return; }
+        ui.post(() -> {
+            if(destroyed || attempt != setupAttempt) { closeResourceArchive(source,zip); return; }
+            installingResources = true; render();
+            request("import-game-files " + zip.getAbsolutePath(), result -> workers.execute(() -> {
+                String failure = null;
+                try {
+                    int repaired = source.restoreMissing(new File(homeDir(),"resources"));
+                    getPreferences(0).edit().putInt("resource_repairs",repaired).apply();
+                } catch(Exception error) { failure = error.toString(); }
+                finally { closeResourceArchive(source,zip); }
+                String outcome = failure;
+                ui.post(() -> finishSetup(attempt,outcome));
+            }), failure -> { closeResourceArchive(source,zip); finishSetup(attempt,failure); });
+        });
+    }
+    private void closeResourceArchive(PreparedResources source, File zip) {
+        try { source.close(); } catch(IOException ignored) { /* Read-only source handle. */ }
+        if(resourceArchive == source) resourceArchive = null;
+        zip.delete();
     }
     private void openPrivateDownload() {
         automaticSetupAttempted = true;
@@ -928,6 +955,7 @@ public final class HorizonActivity extends NativeActivity {
                 android.content.pm.PackageInfo web = android.webkit.WebView.getCurrentWebViewPackage();
                 report.append("WebView: ").append(web == null ? "unavailable" : web.packageName + " " + web.versionName).append('\n');
                 report.append("Free bytes: ").append(homeDir().getUsableSpace()).append('\n');
+                report.append("Files restored after last import: ").append(getPreferences(0).getInt("resource_repairs",-1)).append('\n');
                 Properties checks = new Properties();
                 try(InputStream in = getAssets().open("resource-checks.properties")) { checks.load(in); }
                 report.append("\nBase resource checks (custom packs can override these files):\n");
@@ -993,5 +1021,5 @@ public final class HorizonActivity extends NativeActivity {
     private void cancelGlassGesture() {
         if(glassNavigation != null && glassNavigationReady) glassNavigation.evaluateJavascript("window.horizonNav && window.horizonNav.suspend()",null);
     }
-    @Override protected void onDestroy() { destroyed = true; if(glassNavigation != null) { glassNavigation.removeJavascriptInterface("HorizonNav"); navigationDock.removeView(glassNavigation); glassNavigation.destroy(); glassNavigation=null; } if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { destroyed = true; if(resourceArchive != null) { try { resourceArchive.close(); } catch(IOException ignored) { /* Already closing. */ } resourceArchive=null; } if(glassNavigation != null) { glassNavigation.removeJavascriptInterface("HorizonNav"); navigationDock.removeView(glassNavigation); glassNavigation.destroy(); glassNavigation=null; } if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
 }

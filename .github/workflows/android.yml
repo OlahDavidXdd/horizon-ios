@@ -35,6 +35,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - name: Test resource import recovery
+        run: |
+          mkdir -p "$RUNNER_TEMP/resource-tests"
+          javac -d "$RUNNER_TEMP/resource-tests" packaging/android/app/src/main/java/dev/horizon/android/PreparedResources.java packaging/android/tests/PreparedResourcesTest.java
+          java -cp "$RUNNER_TEMP/resource-tests" dev.horizon.android.PreparedResourcesTest
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
@@ -158,13 +163,13 @@ jobs:
           set -euo pipefail
           test "$(cat source-commit.txt)" = "$GITHUB_SHA"
           sha256sum --check Horizon-Android.apk.sha256
-          tag="android-v0.2.96-build-${GITHUB_RUN_NUMBER}"
+          tag="android-v0.2.97-build-${GITHUB_RUN_NUMBER}"
           cat > notes.md <<'NOTES'
-          Recovers the Liquid-Glass navigation lens after an interrupted drag, activity pause/resume, or lost pointer capture. Captures the pointer at press time so a held lens continues receiving movement outside the original button. Keeps the requested zakisheriff component and native navigation bridge.
+          Repairs incomplete game-file imports where PNG textures exist but font, atlas, block-state and model definitions are missing. The launcher validates the source ZIP before import, keeps it open while native import runs, then checks the published folder and restores missing or truncated entries with CRC verification. Play stays disabled until verification completes.
 
-          Share Logs now creates a diagnostic report with Android/WebView versions, SHA-256 checks for font/atlas/model/block texture files, selected rendering options, and the engine startup and recent log. No game assets or account files are included in the report. This release adds diagnostics for missing in-game text and textures; it does not claim a renderer fix without device evidence.
+          Existing incomplete installations must reimport the original Horizon-26.3.zip from Downloads. The ZIP does not need to be downloaded again. Malformed or incomplete archives are rejected before replacing existing game files. The launcher now checks the core font/model files instead of relying only on horizon-resources.json.
 
-          Retains the private browser download and ZIP import flow. Prepared game files are separate from this public APK.
+          Retains the interrupted glass-drag recovery from 0.2.96. Share Logs reports how many files were restored. Game assets are not bundled in the public APK.
 
           Builds without repository signing secrets use a development key: back up saves before replacing an existing installation.
 
@@ -174,6 +179,6 @@ jobs:
 
           Includes worlds, servers, game-file import/download, resource and shader packs, content mods, settings, screenshots/log sharing, touch-layout editing, a native software-keyboard bridge, Android gamepad input, system clipboard access, and Microsoft device-code sign-in. Online sign-in requires Microsoft/Mojang application approval. This is a prerelease; physical-device gameplay and complete iOS feature parity are still being validated.
           NOTES
-          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.96 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
+          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.97 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
           gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt native-source-commit.txt
           gh release edit "$tag" --draft=false

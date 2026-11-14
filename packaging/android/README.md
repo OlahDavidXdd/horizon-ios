@@ -75,3 +75,5 @@ Saves and imports live in that app-specific files directory. The game log is
 the port releases it and creates a new surface when the activity resumes.
 
 Share Logs includes file fingerprints for the prepared fonts and representative block resources, selected rendering options, Android/WebView versions and the start and last 256 KiB of the engine log. It does not attach game assets, saves or account files. Base-file mismatches are diagnostic evidence; custom packs can override the checked resources.
+
+Resource imports are preflighted for the core font, atlas, block-state and model files. The Java launcher retains a ZipFile handle across native import (which unlinks its input), then restores any missing/truncated entries in the published resources tree with CRC-32 verification. Play remains disabled throughout. No additional copy of the source ZIP is needed. Share Logs records the repair count. Host regression tests cover the PNG-only failure, source unlink, incomplete archives and path traversal.
