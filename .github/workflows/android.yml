@@ -158,13 +158,13 @@ jobs:
           set -euo pipefail
           test "$(cat source-commit.txt)" = "$GITHUB_SHA"
           sha256sum --check Horizon-Android.apk.sha256
-          tag="android-v0.2.94-build-${GITHUB_RUN_NUMBER}"
+          tag="android-v0.2.95-build-${GITHUB_RUN_NUMBER}"
           cat > notes.md <<'NOTES'
-          Replaces the bottom navigation effect with the actual MIT-licensed GlassNav from zakisheriff/Liquid-Glass 4.0.0, bundled locally with React. Tapping and dragging the lens select native launcher pages; the bar samples the native dock background and respects Reduce Transparency. No navigation code is fetched remotely.
+          Fixes Android long-press/drag handling for the bundled zakisheriff Liquid-Glass lens. Prevents native context menus and parent gesture interception from canceling the drag.
 
-          Retains the first-run setup fixes: game-file setup stays in the launcher, with automatic download, progress, cancel/retry, ZIP import and an alternate HTTPS link. Missing resources no longer produce the raw filesystem error shown in build 9.
+          Replaces the unavailable default game-file download with an owner-private browser download page. Sign in to your ChatGPT account, download Horizon-26.3.zip, then use Import Game Files ZIP. The system picker grants file access without a storage permission prompt. Retry remembers custom HTTPS links; setup now explains server, connection, sign-in and storage failures.
 
-          Refines the launcher with rounded controls, a selected navigation pill, icons, calmer colors, clearer typography and a readable dialog theme. Includes the upstream Liquid-Glass and React licenses.
+          Game files are hosted separately with owner-only access and are not included in this APK or public release. The private download requires the owner's ChatGPT account.
 
           Builds without repository signing secrets use a development key: back up saves before replacing an existing installation.
 
@@ -174,6 +174,6 @@ jobs:
 
           Includes worlds, servers, game-file import/download, resource and shader packs, content mods, settings, screenshots/log sharing, touch-layout editing, a native software-keyboard bridge, Android gamepad input, system clipboard access, and Microsoft device-code sign-in. Online sign-in requires Microsoft/Mojang application approval. This is a prerelease; physical-device gameplay and complete iOS feature parity are still being validated.
           NOTES
-          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.94 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
+          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.95 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
           gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt native-source-commit.txt
           gh release edit "$tag" --draft=false

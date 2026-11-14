@@ -94,7 +94,7 @@ public final class HorizonActivity extends NativeActivity {
                         && !state.optBoolean("importing") && state.optJSONObject("import") == null
                         && "waiting".equals(phase)) {
                     automaticSetupAttempted = true;
-                    requestDownloadSource();
+                    setupMessage = t("private_download_help"); render();
                 }
             });
             ui.postDelayed(this, 1000);
@@ -199,6 +199,14 @@ public final class HorizonActivity extends NativeActivity {
             web.setBackgroundColor(Color.TRANSPARENT); web.setVisibility(View.INVISIBLE);
             web.setVerticalScrollBarEnabled(false); web.setHorizontalScrollBarEnabled(false);
             web.setOverScrollMode(View.OVER_SCROLL_NEVER); web.setContentDescription(t("navigation"));
+            web.setOnLongClickListener(view -> true);
+            web.setLongClickable(false);
+            web.setOnTouchListener((view, event) -> {
+                int action = event.getActionMasked();
+                android.view.ViewParent parent = view.getParent();
+                if(parent != null) parent.requestDisallowInterceptTouchEvent(action != MotionEvent.ACTION_UP && action != MotionEvent.ACTION_CANCEL);
+                return false; // Keep delivering the complete gesture to GlassNav.
+            });
             android.webkit.WebSettings settings = web.getSettings();
             settings.setJavaScriptEnabled(true); // Trusted bundled code only; all network/file access is blocked.
             settings.setBlockNetworkLoads(true); settings.setAllowFileAccess(false); settings.setAllowContentAccess(false);
@@ -611,7 +619,7 @@ public final class HorizonActivity extends NativeActivity {
         transparency.setChecked(getPreferences(0).getBoolean("reduce_transparency",false));
         transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); refreshNavigation(); });
         page.addView(transparency);
-        page.addView(label("Horizon · 0.2.94-android · ARM64",14));
+        page.addView(label("Horizon · 0.2.95-android · ARM64",14));
     }
     static byte[] readBytes(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -622,7 +630,7 @@ public final class HorizonActivity extends NativeActivity {
     private boolean hasGameFiles() { return new File(homeDir(), "resources/horizon-resources.json").isFile(); }
     private void showResourceSetup() {
         needsResources = true; tab = "play"; render();
-        if (!automaticSetupAttempted && !setupBusy) { automaticSetupAttempted = true; requestDownloadSource(); }
+        if (!automaticSetupAttempted && !setupBusy) { automaticSetupAttempted = true; setupMessage = t("private_download_help"); render(); }
     }
     private void resourceSetupCard() {
         LinearLayout box = card();
@@ -635,8 +643,10 @@ public final class HorizonActivity extends NativeActivity {
         if (setupBusy) {
             if(!installingResources) box.addView(button("cancel", this::cancelResourceDownload));
         } else {
-            Button download = button(setupMessage == null ? "download_files" : "retry_download", this::requestDownloadSource); primary(download);
-            box.addView(download, new LinearLayout.LayoutParams(-1, dp(49)));
+            Button download = button(setupMessage == null ? "download_files" : "retry_download", this::requestDownloadSource);
+            Button privateDownload = button("private_download", this::openPrivateDownload); primary(privateDownload);
+            box.addView(privateDownload, new LinearLayout.LayoutParams(-1, dp(49)));
+            if(!getPreferences(0).getString("resource_link", "").isEmpty()) box.addView(download, new LinearLayout.LayoutParams(-1, dp(49)));
             Button choose = button("import_resources", () -> pick("resources"));
             LinearLayout.LayoutParams bounds = new LinearLayout.LayoutParams(-1, -2); bounds.setMargins(0, dp(9), 0, 0); box.addView(choose, bounds);
             box.addView(button("use_download_link", this::customResourceLink));
@@ -671,7 +681,14 @@ public final class HorizonActivity extends NativeActivity {
         setupBusy = false; installingResources = false;
         if(failure != null || !hasGameFiles()) {
             android.util.Log.w("HorizonSetup", "Game-files setup failed: " + failure);
-            needsResources = true; setupMessage = t("setup_failed");
+            needsResources = true;
+            String reason = failure == null ? "" : failure.toLowerCase(java.util.Locale.ROOT);
+            String key = reason.contains("http ") ? "download_server_error"
+                : reason.contains("html") ? "download_sign_in"
+                : reason.contains("space") || reason.contains("enospc") ? "download_no_space"
+                : reason.contains("timeout") || reason.contains("unknownhost") || reason.contains("connect") ? "download_connection_error"
+                : "setup_failed";
+            setupMessage = t(key);
         } else { needsResources = false; setupMessage = null; status.setText(t("waiting")); }
         render();
     }
@@ -697,15 +714,11 @@ public final class HorizonActivity extends NativeActivity {
     private void requestDownloadSource() {
         if(setupBusy) return;
         automaticSetupAttempted = true;
-        int attempt = beginSetup(false);
-        request("game-files-source", source -> {
-            if(attempt != setupAttempt) return;
-            setupBusy = false;
-            String address = source.optString("url");
-            if(address.isEmpty()) { finishSetup(attempt, "missing resource URL"); return; }
-            download(address);
-        }, failure -> finishSetup(attempt, failure));
+        String saved = getPreferences(0).getString("resource_link", "");
+        if(!saved.isEmpty()) { download(saved); return; }
+        openPrivateDownload();
     }
+
     private void download(String address) {
         if(setupBusy) return;
         int attempt = beginSetup(false);
@@ -720,6 +733,9 @@ public final class HorizonActivity extends NativeActivity {
                 connection = (java.net.HttpURLConnection)url.openConnection(); activeDownload = connection;
                 connection.setConnectTimeout(30000); connection.setReadTimeout(30000);
                 if(connection.getResponseCode() != 200) throw new IOException("HTTP " + connection.getResponseCode());
+                if(!"https".equalsIgnoreCase(connection.getURL().getProtocol())) throw new IOException("HTTPS required");
+                String contentType = connection.getContentType();
+                if(contentType != null && contentType.toLowerCase(java.util.Locale.ROOT).contains("text/html")) throw new IOException("HTML sign-in page instead of ZIP");
                 long expected = connection.getContentLengthLong();
                 final long limit = 2L << 30;
                 if(expected > limit || (expected > 0 && expected > homeDir().getUsableSpace())) throw new IOException("Archive exceeds available space or size limit");
@@ -744,6 +760,13 @@ public final class HorizonActivity extends NativeActivity {
             } catch(Exception e) { zip.delete(); ui.post(() -> finishSetup(attempt, e.toString())); }
             finally { if(connection != null) { connection.disconnect(); if(activeDownload == connection) activeDownload = null; } }
         });
+    }
+    private void openPrivateDownload() {
+        automaticSetupAttempted = true;
+        setupMessage = t("private_download_help"); render();
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://horizon-phone-files-olah-26-3.olahdavid066.chatgpt.site")));
+        } catch(ActivityNotFoundException e) { error(t("browser_unavailable")); }
     }
     private float[] touchSnapshot() {
         float[] snapshot = new float[100];

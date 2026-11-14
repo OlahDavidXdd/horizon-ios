@@ -7,7 +7,7 @@ const html=await readFile(new URL('../../app/src/main/assets/glass-nav/index.htm
 test('bundled GlassNav selects native tabs, accepts native updates, and drags its lens',async()=>{
   const browser=await chromium.launch({executablePath:process.env.CHROMIUM_PATH||'/usr/bin/chromium',headless:true,args:['--no-sandbox']});
   try{
-    const page=await browser.newPage({viewport:{width:390,height:104},deviceScaleFactor:1});
+    const page=await browser.newPage({viewport:{width:390,height:104},deviceScaleFactor:1,hasTouch:true,isMobile:true});
     const network=[];page.on('request',r=>{if(/^https?:/.test(r.url()))network.push(r.url());});
     await page.addInitScript(()=>{window.events=[];window.HorizonNav={ready(){window.nativeReady=true;},select(index){window.events.push(index);}};});
     // setContent preserves the document, so install the stand-in native interface explicitly.
@@ -29,6 +29,25 @@ test('bundled GlassNav selects native tabs, accepts native updates, and drags it
     await page.waitForFunction(()=>document.querySelector('.lg-track').hasAttribute('data-lifted'));
     await page.mouse.move(to.x+to.width/2,to.y+to.height/2,{steps:12});await page.mouse.up();
     await page.waitForFunction(()=>window.events.includes(0));
+    // Real touch input: hold beyond Android's long-press delay, then drag before lifting.
+    const cdp=await page.context().newCDPSession(page);
+    await page.evaluate(()=>{window.events=[];window.touchCanceled=0;document.addEventListener('pointercancel',()=>window.touchCanceled++);});
+    const touch=async(type,x,y)=>cdp.send('Input.dispatchTouchEvent',{type,touchPoints:type==='touchEnd'||type==='touchCancel'?[]:[{x,y,id:1,radiusX:4,radiusY:4,force:1}]});
+    await touch('touchStart',to.x+to.width/2,to.y+to.height/2);
+    await page.waitForTimeout(800);
+    assert.equal(await page.locator('#root > .lg-track').evaluate(el=>el.hasAttribute('data-lifted')),true);
+    const lens=page.locator('#root > .lg-track > .lg-track__lens');
+    const startX=(await lens.boundingBox()).x;
+    for(let i=1;i<=12;i++) await touch('touchMove',to.x+to.width/2+(from.x-to.x)*i/12,to.y+to.height/2);
+    await page.waitForTimeout(200);
+    assert.ok((await lens.boundingBox()).x>startX+100,'held lens follows the finger before release');
+    await touch('touchEnd');
+    await page.waitForFunction(()=>window.events.includes(2));
+    assert.equal(await page.evaluate(()=>window.touchCanceled),0,'long press must not cancel touch');
+    await touch('touchStart',from.x+from.width/2,from.y+from.height/2);
+    await touch('touchMove',to.x+to.width/2,to.y+to.height/2);
+    await touch('touchCancel');
+    assert.deepEqual(await page.evaluate(()=>window.events),[2],'canceled drag must not select a different page');
     await page.evaluate(()=>window.horizonNav.configure({index:1,labels:['Jouer','Packs','Réglages'],reduced:true}));
     await page.waitForFunction(()=>document.documentElement.classList.contains('reduced'));
     assert.equal(await page.getByRole('tab',{name:'Jouer',exact:true}).count(),1);

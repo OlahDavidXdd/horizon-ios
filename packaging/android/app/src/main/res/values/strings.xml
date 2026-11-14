@@ -140,4 +140,11 @@
     <string name="installing_files">Installing game files…</string>
     <string name="server_unreachable">Unavailable</string>
     <string name="navigation">Navigation</string>
+    <string name="private_download">Open Private Game Files Download</string>
+    <string name="private_download_help">Sign in to your ChatGPT account in the browser, download Horizon-26.3.zip, then return and choose Import Game Files ZIP. Keep at least 2 GB free. Android grants access when you select the ZIP; no storage permission prompt is needed.</string>
+    <string name="browser_unavailable">Install a browser to open the private download page.</string>
+    <string name="download_server_error">The download server is unavailable. Open the private download page in your browser, save the ZIP, then import it here. You can also use another HTTPS download link.</string>
+    <string name="download_sign_in">This link opens a sign-in page. Download the ZIP in your browser first, then choose Import Game Files ZIP.</string>
+    <string name="download_no_space">There is not enough free space for the game files. Free at least 2 GB, then retry or import your ZIP.</string>
+    <string name="download_connection_error">The download connection failed. Check your connection and retry, or download the ZIP in your browser and import it.</string>
 </resources>

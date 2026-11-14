@@ -22,7 +22,9 @@ connects tap/drag selection to the native pages. It samples only the native dock
 background; no account data enters the web content. The JavaScript bundle and
 licenses are embedded in the APK. See [glass-nav/README.md](glass-nav/README.md)
 for build instructions. Reduce Transparency applies immediately. If the web
-renderer fails, native navigation remains available.
+renderer fails, native navigation remains available. Long presses suppress Android context menus and retain the touch stream for lens dragging.
+
+Game-file setup opens an owner-private download page in the system browser. Sign in, save the prepared ZIP, and select it with Import Game Files ZIP. No broad storage permission is needed: downloads/import staging use app-private storage, and the system picker grants access to the chosen file. Custom HTTPS direct links still download inside the app; Retry reuses the saved link.
 
 This is a developing Android port, **not yet verified as a complete 1:1 replacement
 for the SwiftUI launcher**. iOS-specific features (AirPlay, UIKit gesture recognizers,

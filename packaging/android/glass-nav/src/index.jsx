@@ -44,3 +44,5 @@ function App() {
   />;
 }
 createRoot(document.getElementById('root')).render(<App/>);
+// Android's long-press context menu cancels the lens pointer gesture.
+document.addEventListener('contextmenu', event => event.preventDefault());
