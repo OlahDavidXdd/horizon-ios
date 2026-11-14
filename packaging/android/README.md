@@ -22,7 +22,7 @@ connects tap/drag selection to the native pages. It samples only the native dock
 background; no account data enters the web content. The JavaScript bundle and
 licenses are embedded in the APK. See [glass-nav/README.md](glass-nav/README.md)
 for build instructions. Reduce Transparency applies immediately. If the web
-renderer fails, native navigation remains available. Long presses suppress Android context menus and retain the touch stream for lens dragging.
+renderer fails, native navigation remains available. Interrupted gestures are canceled on activity pause/resume, launcher visibility changes, lost capture, and a fresh pointer-down. Long presses suppress Android context menus and retain the touch stream for lens dragging.
 
 Game-file setup opens an owner-private download page in the system browser. Sign in, save the prepared ZIP, and select it with Import Game Files ZIP. No broad storage permission is needed: downloads/import staging use app-private storage, and the system picker grants access to the chosen file. Custom HTTPS direct links still download inside the app; Retry reuses the saved link.
 
@@ -73,3 +73,5 @@ Saves and imports live in that app-specific files directory. The game log is
 `.local/share/horizon/logs/latest.log` below it. Panics also appear in
 `adb logcat -s RustStdoutStderr`. Suspending Android destroys the Vulkan surface;
 the port releases it and creates a new surface when the activity resumes.
+
+Share Logs includes file fingerprints for the prepared fonts and representative block resources, selected rendering options, Android/WebView versions and the start and last 256 KiB of the engine log. It does not attach game assets, saves or account files. Base-file mismatches are diagnostic evidence; custom packs can override the checked resources.

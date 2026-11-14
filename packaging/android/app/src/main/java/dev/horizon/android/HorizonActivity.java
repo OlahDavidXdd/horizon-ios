@@ -354,6 +354,7 @@ public final class HorizonActivity extends NativeActivity {
         return o;
     }
     void setLauncherVisible(boolean value) {
+        cancelGlassGesture();
         visible = value;
         setRequestedOrientation(value ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         if(value) {
@@ -608,7 +609,7 @@ public final class HorizonActivity extends NativeActivity {
         addButton("game_settings", this::gameSettings);
         addButton("touch_controls", this::touchControls);
         addButton("screenshots", this::gallery);
-        addButton("share_logs", () -> share(new File(homeDir(),".local/share/horizon/logs/latest.log"),"text/plain"));
+        addButton("share_logs", this::shareDiagnostics);
         addButton("updates", () -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/OlahDavidXdd/horizon-ios/releases"))));
         addButton("licenses", () -> {
             try (InputStream in = getAssets().open("glass-nav/Liquid-Glass-LICENSE.txt")) {
@@ -619,7 +620,7 @@ public final class HorizonActivity extends NativeActivity {
         transparency.setChecked(getPreferences(0).getBoolean("reduce_transparency",false));
         transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); refreshNavigation(); });
         page.addView(transparency);
-        page.addView(label("Horizon · 0.2.95-android · ARM64",14));
+        page.addView(label("Horizon · 0.2.96-android · ARM64",14));
     }
     static byte[] readBytes(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -918,6 +919,60 @@ public final class HorizonActivity extends NativeActivity {
         intent.setClipData(ClipData.newRawUri(file.getName(),uri));
         startActivity(Intent.createChooser(intent,t("share")));
     }
+    private void shareDiagnostics() {
+        workers.execute(() -> {
+            try {
+                StringBuilder report = new StringBuilder("Horizon Android diagnostics\n");
+                report.append("App: ").append(getPackageManager().getPackageInfo(getPackageName(),0).versionName).append('\n');
+                report.append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append(" API ").append(Build.VERSION.SDK_INT).append('\n');
+                android.content.pm.PackageInfo web = android.webkit.WebView.getCurrentWebViewPackage();
+                report.append("WebView: ").append(web == null ? "unavailable" : web.packageName + " " + web.versionName).append('\n');
+                report.append("Free bytes: ").append(homeDir().getUsableSpace()).append('\n');
+                Properties checks = new Properties();
+                try(InputStream in = getAssets().open("resource-checks.properties")) { checks.load(in); }
+                report.append("\nBase resource checks (custom packs can override these files):\n");
+                java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+                TreeSet<String> paths = new TreeSet<>(checks.stringPropertyNames());
+                for(String path : paths) {
+                    File file = new File(homeDir(),"resources/" + path);
+                    report.append(path).append(": ");
+                    if(!file.isFile()) { report.append("MISSING\n"); continue; }
+                    digest.reset();
+                    try(InputStream in = new FileInputStream(file)) {
+                        byte[] buffer = new byte[65536]; int count;
+                        while((count = in.read(buffer)) != -1) digest.update(buffer,0,count);
+                    }
+                    StringBuilder hash = new StringBuilder();
+                    for(byte value : digest.digest()) hash.append(String.format(java.util.Locale.ROOT,"%02x",value & 255));
+                    report.append(hash.toString().equals(checks.getProperty(path)) ? "OK" : "DIFFERENT").append(" bytes=").append(file.length()).append('\n');
+                }
+                File options = new File(homeDir(),"options.txt");
+                if(options.isFile()) try(BufferedReader reader = new BufferedReader(new FileReader(options))) {
+                    report.append("\nRendering options:\n"); String line;
+                    while((line = reader.readLine()) != null) if(line.startsWith("resourcePacks:") || line.startsWith("forceUnicodeFont:") || line.startsWith("japaneseGlyphVariants:") || line.startsWith("mipmapLevels:")) report.append(line).append('\n');
+                }
+                for(String path : new String[]{".local/share/horizon/logs/latest.log","logs/latest.log"}) {
+                    File log = new File(homeDir(),path);
+                    if(!log.isFile()) continue;
+                    report.append("\nEngine log:\n");
+                    try(RandomAccessFile in = new RandomAccessFile(log,"r")) {
+                        if(in.length() > 327680) {
+                            byte[] head = new byte[65536]; in.readFully(head);
+                            report.append(new String(head,java.nio.charset.StandardCharsets.UTF_8)).append("\n[... middle of log omitted ...]\n");
+                        }
+                        in.seek(Math.max(0,in.length()-262144)); byte[] tail = new byte[(int)(in.length()-in.getFilePointer())]; in.readFully(tail);
+                        report.append(new String(tail,java.nio.charset.StandardCharsets.UTF_8));
+                    }
+                    break;
+                }
+                File dir = new File(getCacheDir(),"diagnostics");
+                if(!dir.isDirectory() && !dir.mkdirs()) throw new IOException("Cannot create report folder");
+                File output = new File(dir,"horizon-diagnostics.txt");
+                try(OutputStream out = new FileOutputStream(output)) { out.write(report.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
+                ui.post(() -> { if(!destroyed) share(output,"text/plain"); });
+            } catch(Exception e) { ui.post(() -> { if(!destroyed) error(t("file_unavailable")); }); }
+        });
+    }
     @Override public void onBackPressed() {
         if (launching && launchOwner != null) {
             String owner = launchOwner; launchOwner = null;
@@ -927,12 +982,16 @@ public final class HorizonActivity extends NativeActivity {
     }
     @Override protected void onPause() {
         ui.removeCallbacks(watch);keyboardVisible=false;
+        cancelGlassGesture();
         if(glassNavigation != null) glassNavigation.onPause();
         for(int i=0;i<controllers.size();i++)controllerRemoved(controllers.keyAt(i));controllers.clear();
         super.onPause();
     }
     @Override protected void onResume() {
-        super.onResume();if(glassNavigation != null) glassNavigation.onResume();ui.removeCallbacks(watch);if(overlay!=null)ui.post(watch);
+        super.onResume();if(glassNavigation != null) glassNavigation.onResume();cancelGlassGesture();ui.removeCallbacks(watch);if(overlay!=null)ui.post(watch);
+    }
+    private void cancelGlassGesture() {
+        if(glassNavigation != null && glassNavigationReady) glassNavigation.evaluateJavascript("window.horizonNav && window.horizonNav.suspend()",null);
     }
     @Override protected void onDestroy() { destroyed = true; if(glassNavigation != null) { glassNavigation.removeJavascriptInterface("HorizonNav"); navigationDock.removeView(glassNavigation); glassNavigation.destroy(); glassNavigation=null; } if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
 }

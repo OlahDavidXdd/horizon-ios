@@ -48,6 +48,25 @@ test('bundled GlassNav selects native tabs, accepts native updates, and drags it
     await touch('touchMove',to.x+to.width/2,to.y+to.height/2);
     await touch('touchCancel');
     assert.deepEqual(await page.evaluate(()=>window.events),[2],'canceled drag must not select a different page');
+    // An Activity interruption can lose pointerup entirely. A fresh down must recover.
+    await page.evaluate(() => {
+      window.events=[];
+      document.querySelector('#root [data-lg-item="2"]').dispatchEvent(new PointerEvent('pointerdown', {
+        bubbles:true,pointerId:777,isPrimary:true,pointerType:'touch',button:0,clientX:320,clientY:50,
+      }));
+    });
+    await touch('touchStart',from.x+from.width/2,from.y+from.height/2);
+    await touch('touchMove',to.x+to.width/2,to.y+to.height/2);
+    await touch('touchEnd');
+    await page.waitForFunction(()=>window.events.includes(0));
+    // Suspending the Activity mid-drag must release the library's internal gesture too.
+    await touch('touchStart',to.x+to.width/2,to.y+to.height/2);
+    await page.evaluate(()=>window.horizonNav.suspend());
+    await touch('touchEnd');
+    await touch('touchStart',to.x+to.width/2,to.y+to.height/2);
+    await touch('touchMove',from.x+from.width/2,from.y+from.height/2);
+    await touch('touchEnd');
+    await page.waitForFunction(()=>window.events.includes(2));
     await page.evaluate(()=>window.horizonNav.configure({index:1,labels:['Jouer','Packs','Réglages'],reduced:true}));
     await page.waitForFunction(()=>document.documentElement.classList.contains('reduced'));
     assert.equal(await page.getByRole('tab',{name:'Jouer',exact:true}).count(),1);
