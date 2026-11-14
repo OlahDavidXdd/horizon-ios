@@ -34,7 +34,7 @@ public final class HorizonActivity extends NativeActivity {
         public void run() {
             if (destroyed) return;
             boolean covered = isCovered();
-            if (covered != visible) setVisible(covered);
+            if (covered != visible) setLauncherVisible(covered);
             if (visible) ask("launcher-state", state -> {
                 phase = state.optString("phase");
                 String message = t(phase);
@@ -58,13 +58,13 @@ public final class HorizonActivity extends NativeActivity {
         LinearLayout shell = new LinearLayout(this); shell.setOrientation(LinearLayout.VERTICAL);
         shell.setPadding(dp(24), dp(12), dp(24), dp(12));
         LinearLayout header = row();
-        TextView title = label(t("app_name"), 27); title.setTypeface(null, 1);
+        TextView title = label(t("app_name"), 27); title.setTypeface(null, android.graphics.Typeface.BOLD);
         header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
         header.addView(button("account", () -> accounts.show()));
         shell.addView(header);
         status = label(t("starting"), 13); shell.addView(status);
         ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true);
-        page = new LinearLayout(this); page.setOrientation(1); page.setPadding(0, dp(20), 0, dp(16));
+        page = new LinearLayout(this); page.setOrientation(LinearLayout.VERTICAL); page.setPadding(0, dp(20), 0, dp(16));
         scroll.addView(page); shell.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         navigation = row();
         for (String name : new String[]{"play", "packs", "settings"}) {
@@ -128,7 +128,7 @@ public final class HorizonActivity extends NativeActivity {
         catch (JSONException e) { throw new IllegalArgumentException(e); }
         return o;
     }
-    void setVisible(boolean value) {
+    void setLauncherVisible(boolean value) {
         visible = value; overlay.setVisibility(value ? View.VISIBLE : View.GONE);
         if (value) render();
     }
@@ -148,7 +148,7 @@ public final class HorizonActivity extends NativeActivity {
         actions.addView(button("import_world", () -> pick("world")));
         actions.addView(button("add_server", this::addServer)); page.addView(actions);
         heading("worlds");
-        LinearLayout worlds = new LinearLayout(this); worlds.setOrientation(1); page.addView(worlds);
+        LinearLayout worlds = new LinearLayout(this); worlds.setOrientation(LinearLayout.VERTICAL); page.addView(worlds);
         ask("worlds", result -> {
             JSONArray list = result.optJSONArray("worlds");
             if (list == null || list.length() == 0) worlds.addView(label(t("empty_worlds"), 16));
@@ -163,7 +163,7 @@ public final class HorizonActivity extends NativeActivity {
             }
         });
         heading("servers");
-        LinearLayout servers = new LinearLayout(this); servers.setOrientation(1); page.addView(servers);
+        LinearLayout servers = new LinearLayout(this); servers.setOrientation(LinearLayout.VERTICAL); page.addView(servers);
         ask("servers", result -> {
             JSONArray list = result.optJSONArray("servers");
             if (list == null || list.length() == 0) servers.addView(label(t("empty_servers"), 16));
@@ -192,7 +192,7 @@ public final class HorizonActivity extends NativeActivity {
                     if (p.equals("title") || p.equals("world")) {
                         Runnable finish = () -> ask("launcher-commit-start " + owner, commit -> {
                             if (!commit.optBoolean("ok")) { launching = false; return; }
-                            ask("launcher-visible false", v -> { launching = false; setVisible(false); });
+                            ask("launcher-visible false", v -> { launching = false; setLauncherVisible(false); });
                         });
                         if (command == null) finish.run(); else ask(command, v -> finish.run());
                     } else if (p.equals("needs_files")) {
@@ -376,7 +376,7 @@ public final class HorizonActivity extends NativeActivity {
         if (launching && launchOwner != null) {
             String owner = launchOwner; launchOwner = null;
             ask("launcher-cancel-start " + owner, v -> { launching = false; render(); });
-        } else if (!visible) ask("launcher-visible true", v -> setVisible(true));
+        } else if (!visible) ask("launcher-visible true", v -> setLauncherVisible(true));
         else { tab = "play"; render(); }
     }
     @Override protected void onDestroy() { destroyed = true; ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }

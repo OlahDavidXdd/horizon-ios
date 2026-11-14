@@ -34,6 +34,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
+          cache-read-only: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.ANDROID_TARGET }}
@@ -41,6 +42,7 @@ jobs:
         with:
           workspaces: crates/horizon-android
           shared-key: android-${{ env.ANDROID_TARGET }}
+          cache-on-failure: true
       - name: Build shared game and launcher bridge
         env:
           HORIZON_MSA_CLIENT_ID: 331e08f8-172d-43b9-835a-3108c2fcdbf3
@@ -114,7 +116,7 @@ jobs:
           sha256sum --check Horizon-Android.apk.sha256
           tag="android-v0.2.92-build-${GITHUB_RUN_NUMBER}"
           cat > notes.md <<'NOTES'
-          Android port of the modified Horizon iOS fork, with a native launcher and MIT-licensed AndroidLiquidGlassView 1.1.0.
+          Android port of the modified Horizon iOS fork, with a native launcher and MIT-licensed AndroidLiquidGlassView 1.0.0.
 
           Builds without repository signing secrets use a development key: back up saves before replacing an existing installation.
 
