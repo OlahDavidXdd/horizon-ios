@@ -129,7 +129,7 @@ final class Accounts {
             if(body!=null) {c.setRequestMethod("POST");c.setDoOutput(true);c.setRequestProperty("Content-Type",type);try(OutputStream out=c.getOutputStream()){out.write(body.getBytes(StandardCharsets.UTF_8));}}
             InputStream stream=c.getResponseCode()<400?c.getInputStream():c.getErrorStream();
             if(stream==null)throw new IOException();
-            try(InputStream in=stream) {return new JSONObject(new String(in.readAllBytes(),StandardCharsets.UTF_8));}
+            try(InputStream in=stream) {return new JSONObject(new String(HorizonActivity.readBytes(in),StandardCharsets.UTF_8));}
         } finally {c.disconnect();}
     }
     private SecretKey key()throws Exception {

@@ -118,6 +118,7 @@ public final class HorizonActivity extends NativeActivity {
         }});
     }
     void error(String message) {
+        launching = false;
         if (!destroyed) new AlertDialog.Builder(this).setTitle(t("error")).setMessage(message)
             .setPositiveButton(android.R.string.ok, null).show();
     }
@@ -217,7 +218,6 @@ public final class HorizonActivity extends NativeActivity {
             String[] modes = {t("survival"), t("creative"), t("hardcore")};
             new AlertDialog.Builder(this).setTitle(t("game_mode")).setItems(modes, (d, mode) -> {
                 JSONObject data = object("name", name, "mode", mode == 1 ? "creative" : mode == 2 ? "hardcore" : "survival");
-                try { data.put("hardcore", mode == 2); } catch (JSONException e) { throw new IllegalStateException(e); }
                 launch("world-create " + data);
             }).show();
         });
@@ -316,7 +316,7 @@ public final class HorizonActivity extends NativeActivity {
         addButton("updates", () -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/OlahDavidXdd/horizon-ios/releases"))));
         addButton("licenses", () -> {
             try (InputStream in = getAssets().open("AndroidLiquidGlassView-LICENSE.txt")) {
-                new AlertDialog.Builder(this).setTitle("AndroidLiquidGlassView · MIT").setMessage(new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8)).setPositiveButton(android.R.string.ok,null).show();
+                new AlertDialog.Builder(this).setTitle("AndroidLiquidGlassView · MIT").setMessage(new String(readBytes(in), java.nio.charset.StandardCharsets.UTF_8)).setPositiveButton(android.R.string.ok,null).show();
             } catch (IOException e) { error(e.getMessage()); }
         });
         CheckBox transparency = new CheckBox(this); transparency.setText(t("reduce_transparency")); transparency.setTextColor(Color.WHITE);
@@ -324,6 +324,12 @@ public final class HorizonActivity extends NativeActivity {
         transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); Toast.makeText(this, t("restart_required"), Toast.LENGTH_LONG).show(); });
         page.addView(transparency);
         page.addView(label("Horizon · 0.2.92-android · ARM64",14));
+    }
+    static byte[] readBytes(InputStream in) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192]; int n;
+        while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
+        return out.toByteArray();
     }
     private void download(String address) {
         workers.execute(() -> {

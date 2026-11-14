@@ -30,7 +30,7 @@ pub extern "system" fn Java_dev_horizon_android_HorizonActivity_submit(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(id, None);
-    super::push(super::Request::new(line.into(), move |answer| {
+    super::push(super::Request::new(line, move |answer| {
         if let Some(slot) = REPLIES
             .lock()
             .unwrap_or_else(|e| e.into_inner())

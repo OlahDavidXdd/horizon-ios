@@ -5467,6 +5467,27 @@ impl Renderer {
             view_formats: &config.view_formats,
         })
     }
+    /// Android destroys its native window before `suspended` returns. Do not keep
+    /// the old surface in the renderer-replacement slot across that boundary.
+    #[cfg(target_os = "android")]
+    pub fn suspend_android_surface(&mut self) {
+        self.frame_gen.stop();
+        self.queue.wait();
+        self.surface = None;
+        self.spare_surface
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.suspended = true;
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn resume_android_surface(&mut self) -> Result<()> {
+        self.recreate_surface()?;
+        self.suspended = false;
+        Ok(())
+    }
+
     /// Hand the window surface over to the renderer that replaces this one on
     /// the same device (it takes `spare_surface`).
     pub fn release_surface(&mut self) {
@@ -8233,7 +8254,9 @@ impl Renderer {
             Some(wgpu::CurrentSurfaceTexture::Suboptimal(f)) => (Some(f), true),
             Some(wgpu::CurrentSurfaceTexture::Timeout) => {
                 if surface_log_due("surface-timeout", std::time::Duration::from_secs(5)) {
-                    log::warn!("Horizon renderer: the window surface timed out; skipping this frame");
+                    log::warn!(
+                        "Horizon renderer: the window surface timed out; skipping this frame"
+                    );
                 }
                 return Ok(false);
             }

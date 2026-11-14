@@ -195,6 +195,14 @@ class PublicationTests(unittest.TestCase):
                      "tools/regex_reference/RecoveredGame.java"]:
             self.assertTrue(check_public_tree.prohibited(path), path)
 
+    def test_android_shell_allowlist_does_not_admit_game_java(self):
+        root = "packaging/android/app/src/main/java/dev/horizon/android/"
+        for name in ["HorizonActivity.java", "Accounts.java"]:
+            self.assertFalse(check_public_tree.prohibited(root + name))
+        for name in ["Minecraft.java", "Client.java", "RecoveredGame.java"]:
+            self.assertTrue(check_public_tree.prohibited(root + name))
+        self.assertTrue(check_public_tree.prohibited(".local/" + root + "Accounts.java"))
+
     def test_copied_data_fixer_tables_are_rejected_in_the_tree_only(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)

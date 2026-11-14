@@ -12,6 +12,9 @@ PRIVATE_EXTENSIONS = {".jar", ".class", ".jfr", ".hprof", ".java", ".ipa", ".p12
 ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}
 ORIGINAL_JDK_TOOLS = {
     "tools/JfrSummary.java", "tests/java/JfrFixture.java",
+    # Original Android app shell, not recovered game source.
+    "packaging/android/app/src/main/java/dev/horizon/android/HorizonActivity.java",
+    "packaging/android/app/src/main/java/dev/horizon/android/Accounts.java",
     "tools/regex_reference/JavaBlockRanges.java",
     "tools/regex_reference/JavaCaseMappings.java",
     "tools/regex_reference/JavaPropertyRanges.java",

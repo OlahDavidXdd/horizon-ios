@@ -345,8 +345,22 @@ impl Game<'_> {
 }
 
 impl ApplicationHandler for Game<'_> {
+    #[cfg(target_os = "android")]
+    fn suspended(&mut self, _: &ActiveEventLoop) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.suspend_android_surface();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
+            #[cfg(target_os = "android")]
+            if let Some(renderer) = &mut self.renderer
+                && let Err(error) = renderer.resume_android_surface()
+            {
+                self.error = Some(error.into());
+                event_loop.exit();
+            }
             return;
         }
         debug_keys::warm_debug_cpu();

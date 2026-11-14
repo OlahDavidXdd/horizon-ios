@@ -90,6 +90,13 @@ impl Loading {
     }
     pub(super) fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
+            #[cfg(target_os = "android")]
+            if let Some(renderer) = &mut self.renderer
+                && let Err(error) = renderer.resume_android_surface()
+            {
+                self.error = Some(error.into());
+                event_loop.exit();
+            }
             return;
         }
         // The Window constructor: created fullscreen when options.txt or --fullscreen says so.
@@ -542,6 +549,18 @@ pub(super) enum App {
     Ready(Box<split::Split<'static>>),
 }
 impl ApplicationHandler for App {
+    #[cfg(target_os = "android")]
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        match self {
+            App::Loading(loading) => {
+                if let Some(renderer) = &mut loading.renderer {
+                    renderer.suspend_android_surface();
+                }
+            }
+            App::Ready(split) => ApplicationHandler::suspended(&mut **split, event_loop),
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         deep(|| self.resumed_here(event_loop))
     }
