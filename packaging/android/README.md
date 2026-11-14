@@ -15,11 +15,14 @@ queue and start/cancel ownership protocol as the iOS launcher. Refresh tokens an
 Minecraft sessions are encrypted with a device-local Android Keystore AES-GCM key;
 app backups are disabled. The launcher never logs authentication responses.
 
-AndroidLiquidGlassView **1.0.0** is imported from Maven Central, under the MIT
-license, with attribution in the APK's Licenses screen. Refraction requires Android
-13 / API 33; older versions use an opaque material. Reduce Transparency selects the
-opaque material on the next start. Version 1.0.0 is pinned because newer published
-AARs require compile SDK 37, unavailable in the current build environment.
+The bottom bar uses the actual `GlassNav` from
+[zakisheriff/Liquid-Glass](https://github.com/zakisheriff/Liquid-Glass), pinned to
+npm 4.0.0 (MIT). A local, network-blocked WebView hosts the React component and
+connects tap/drag selection to the native pages. It samples only the native dock
+background; no account data enters the web content. The JavaScript bundle and
+licenses are embedded in the APK. See [glass-nav/README.md](glass-nav/README.md)
+for build instructions. Reduce Transparency applies immediately. If the web
+renderer fails, native navigation remains available.
 
 This is a developing Android port, **not yet verified as a complete 1:1 replacement
 for the SwiftUI launcher**. iOS-specific features (AirPlay, UIKit gesture recognizers,

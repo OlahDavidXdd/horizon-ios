@@ -66,3 +66,5 @@ packaging/android/local.properties
 packaging/android/app/src/main/jniLibs/
 *.jks
 *.keystore
+
+packaging/android/glass-nav/node_modules/

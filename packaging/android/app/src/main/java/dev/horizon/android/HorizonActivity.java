@@ -8,7 +8,6 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.view.*;
 import android.widget.*;
-import com.qmdeve.liquidglass.widget.LiquidGlassView;
 import org.json.*;
 import java.io.*;
 import java.util.*;
@@ -53,6 +52,9 @@ public final class HorizonActivity extends NativeActivity {
     private FrameLayout overlay, backdrop;
     private Dialog launcherWindow;
     private LinearLayout page, navigation;
+    private FrameLayout navigationDock;
+    private android.webkit.WebView glassNavigation;
+    private boolean glassNavigationReady;
     private TextView status, setupDescription;
     private ProgressBar setupProgress;
     private boolean needsResources = true, setupBusy, installingResources, automaticSetupAttempted;
@@ -140,16 +142,13 @@ public final class HorizonActivity extends NativeActivity {
             item.setMargins(dp(3), 0, dp(3), 0); navigation.addView(b, item);
         }
         navigation.setPadding(dp(5), dp(5), dp(5), dp(5));
-        FrameLayout glass = new FrameLayout(this);
-        if (Build.VERSION.SDK_INT >= 33 && !getPreferences(0).getBoolean("reduce_transparency", false)) {
-            LiquidGlassView material = new LiquidGlassView(this);
-            material.bind(backdrop); material.setCornerRadius(dp(30)); material.setBlurRadius(dp(12));
-            material.setTintAlpha(0.07f); material.setDispersion(0.25f);
-            glass.addView(material, new FrameLayout.LayoutParams(-1, -1));
-        } else glass.setBackground(rounded(0xff1b2d38, 0x267fa59f, 30));
-        glass.addView(navigation, new FrameLayout.LayoutParams(-1, -1));
-        LinearLayout.LayoutParams dock = new LinearLayout.LayoutParams(-1, dp(70));
-        dock.setMargins(0, dp(10), 0, 0); shell.addView(glass, dock);
+        navigationDock = new FrameLayout(this);
+        FrameLayout.LayoutParams fallbackBounds = new FrameLayout.LayoutParams(-1, dp(70));
+        fallbackBounds.gravity = Gravity.CENTER; navigationDock.addView(navigation, fallbackBounds);
+        navigation.setBackground(rounded(0xff1b2d38, 0x267fa59f, 30));
+        LinearLayout.LayoutParams dock = new LinearLayout.LayoutParams(-1, dp(104));
+        dock.setMargins(0, dp(2), 0, 0); shell.addView(navigationDock, dock);
+        installGlassNavigation();
         overlay.addView(shell, new FrameLayout.LayoutParams(-1, -1));
         // NativeActivity owns its main window surface for Vulkan. A separate
         // window lets Android render the launcher without sharing that producer.
@@ -192,6 +191,64 @@ public final class HorizonActivity extends NativeActivity {
         inputManager=(android.hardware.input.InputManager)getSystemService(INPUT_SERVICE);
         inputManager.registerInputDeviceListener(deviceListener,ui);
         render(); ui.post(watch);checkUpdates();
+    }
+    /** The requested React component is bundled locally; its bridge only selects a tab. */
+    private void installGlassNavigation() {
+        try {
+            android.webkit.WebView web = new android.webkit.WebView(this); glassNavigation = web;
+            web.setBackgroundColor(Color.TRANSPARENT); web.setVisibility(View.INVISIBLE);
+            web.setVerticalScrollBarEnabled(false); web.setHorizontalScrollBarEnabled(false);
+            web.setOverScrollMode(View.OVER_SCROLL_NEVER); web.setContentDescription(t("navigation"));
+            android.webkit.WebSettings settings = web.getSettings();
+            settings.setJavaScriptEnabled(true); // Trusted bundled code only; all network/file access is blocked.
+            settings.setBlockNetworkLoads(true); settings.setAllowFileAccess(false); settings.setAllowContentAccess(false);
+            settings.setDomStorageEnabled(false); settings.setMixedContentMode(android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+            web.addJavascriptInterface(new NavigationBridge(), "HorizonNav");
+            web.setWebViewClient(new android.webkit.WebViewClient() {
+                @Override public boolean shouldOverrideUrlLoading(android.webkit.WebView view, android.webkit.WebResourceRequest request) { return true; }
+                @Override public void onReceivedError(android.webkit.WebView view, android.webkit.WebResourceRequest request, android.webkit.WebResourceError error) {
+                    if(request.isForMainFrame()) nativeNavigationFallback(view);
+                }
+                @Override public boolean onRenderProcessGone(android.webkit.WebView view, android.webkit.RenderProcessGoneDetail detail) {
+                    nativeNavigationFallback(view); return true;
+                }
+            });
+            navigationDock.addView(web, new FrameLayout.LayoutParams(-1,-1));
+            navigationDock.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob) -> sampleNavigationBackdrop());
+            String html;
+            try(InputStream in = getAssets().open("glass-nav/index.html")) { html = new String(readBytes(in), java.nio.charset.StandardCharsets.UTF_8); }
+            web.loadDataWithBaseURL("https://horizon.invalid/", html, "text/html", "UTF-8", null);
+        } catch(RuntimeException | IOException failure) {
+            if(glassNavigation != null) nativeNavigationFallback(glassNavigation);
+        }
+    }
+    public final class NavigationBridge {
+        @android.webkit.JavascriptInterface public void ready() {
+            ui.post(() -> {
+                if(destroyed || glassNavigation == null) return;
+                glassNavigationReady = true; glassNavigation.setVisibility(View.VISIBLE); navigation.setVisibility(View.INVISIBLE);
+                refreshNavigation(); sampleNavigationBackdrop();
+            });
+        }
+        @android.webkit.JavascriptInterface public void select(int index) {
+            if(index < 0 || index > 2) return;
+            ui.post(() -> { if(!destroyed && glassNavigationReady) { tab = new String[]{"play","packs","settings"}[index]; render(); } });
+        }
+    }
+    private void nativeNavigationFallback(android.webkit.WebView view) {
+        glassNavigationReady = false; navigation.setVisibility(View.VISIBLE);
+        navigationDock.removeView(view); view.removeJavascriptInterface("HorizonNav"); view.destroy();
+        if(glassNavigation == view) glassNavigation = null;
+    }
+    private void sampleNavigationBackdrop() {
+        if(!glassNavigationReady || glassNavigation == null || navigationDock.getWidth() == 0 || navigationDock.getHeight() == 0) return;
+        android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(navigationDock.getWidth(), navigationDock.getHeight(), android.graphics.Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas canvas = new android.graphics.Canvas(bitmap);
+        int[] dock = new int[2], source = new int[2]; navigationDock.getLocationInWindow(dock); backdrop.getLocationInWindow(source);
+        canvas.translate(source[0]-dock[0], source[1]-dock[1]); backdrop.draw(canvas);
+        ByteArrayOutputStream out = new ByteArrayOutputStream(); bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG,100,out); bitmap.recycle();
+        String image = "data:image/png;base64," + android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP);
+        glassNavigation.evaluateJavascript("window.horizonNav && window.horizonNav.backdrop(" + JSONObject.quote(image) + ")",null);
     }
     private void addBackdropGlow(int color, int gravity) {
         View glow = new View(this);
@@ -244,6 +301,15 @@ public final class HorizonActivity extends NativeActivity {
         page.addView(box, bounds); return box;
     }
     private void refreshNavigation() {
+        if(glassNavigationReady && glassNavigation != null) {
+            JSONObject state = new JSONObject();
+            try {
+                state.put("index", tab.equals("play") ? 0 : tab.equals("packs") ? 1 : 2);
+                state.put("labels", new JSONArray(new String[]{t("play"),t("packs"),t("settings")}));
+                state.put("reduced",getPreferences(0).getBoolean("reduce_transparency",false));
+                glassNavigation.evaluateJavascript("window.horizonNav && window.horizonNav.configure(" + state + ")",null);
+            } catch(JSONException e) { throw new IllegalStateException(e); }
+        }
         for(int i=0;i<navigation.getChildCount();i++) {
             Button item = (Button)navigation.getChildAt(i); boolean selected = tab.equals(item.getTag());
             item.setBackground(rounded(selected ? 0x294b9b8c : Color.TRANSPARENT, selected ? 0x205fb7a6 : 0, 24));
@@ -537,15 +603,15 @@ public final class HorizonActivity extends NativeActivity {
         addButton("share_logs", () -> share(new File(homeDir(),".local/share/horizon/logs/latest.log"),"text/plain"));
         addButton("updates", () -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/OlahDavidXdd/horizon-ios/releases"))));
         addButton("licenses", () -> {
-            try (InputStream in = getAssets().open("AndroidLiquidGlassView-LICENSE.txt")) {
-                new AlertDialog.Builder(this).setTitle("AndroidLiquidGlassView · MIT").setMessage(new String(readBytes(in), java.nio.charset.StandardCharsets.UTF_8)).setPositiveButton(android.R.string.ok,null).show();
+            try (InputStream in = getAssets().open("glass-nav/Liquid-Glass-LICENSE.txt")) {
+                new AlertDialog.Builder(this).setTitle("Liquid-Glass · MIT").setMessage(new String(readBytes(in), java.nio.charset.StandardCharsets.UTF_8)).setPositiveButton(android.R.string.ok,null).show();
             } catch (IOException e) { error(e.getMessage()); }
         });
         CheckBox transparency = new CheckBox(this); transparency.setText(t("reduce_transparency")); transparency.setTextColor(Color.WHITE);
         transparency.setChecked(getPreferences(0).getBoolean("reduce_transparency",false));
-        transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); Toast.makeText(this, t("restart_required"), Toast.LENGTH_LONG).show(); });
+        transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); refreshNavigation(); });
         page.addView(transparency);
-        page.addView(label("Horizon · 0.2.93-android · ARM64",14));
+        page.addView(label("Horizon · 0.2.94-android · ARM64",14));
     }
     static byte[] readBytes(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -838,11 +904,12 @@ public final class HorizonActivity extends NativeActivity {
     }
     @Override protected void onPause() {
         ui.removeCallbacks(watch);keyboardVisible=false;
+        if(glassNavigation != null) glassNavigation.onPause();
         for(int i=0;i<controllers.size();i++)controllerRemoved(controllers.keyAt(i));controllers.clear();
         super.onPause();
     }
     @Override protected void onResume() {
-        super.onResume();ui.removeCallbacks(watch);if(overlay!=null)ui.post(watch);
+        super.onResume();if(glassNavigation != null) glassNavigation.onResume();ui.removeCallbacks(watch);if(overlay!=null)ui.post(watch);
     }
-    @Override protected void onDestroy() { destroyed = true; if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { destroyed = true; if(glassNavigation != null) { glassNavigation.removeJavascriptInterface("HorizonNav"); navigationDock.removeView(glassNavigation); glassNavigation.destroy(); glassNavigation=null; } if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
 }

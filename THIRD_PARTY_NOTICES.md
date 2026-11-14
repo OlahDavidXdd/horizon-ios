@@ -429,10 +429,10 @@ OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-## Android launcher: AndroidLiquidGlassView 1.0.0
+## Android navigation: Liquid-Glass 4.0.0 and React 19.2.0
 
-The Android launcher imports `com.qmdeve.liquidglass:core:1.0.0` from Maven Central.
-Source: https://github.com/QmDeve/AndroidLiquidGlassView/tree/v1.0.0.
-Copyright 2025-2026 Donny Yang. MIT license; the complete license is included in
-`packaging/android/app/src/main/assets/AndroidLiquidGlassView-LICENSE.txt` and
-available from the Android launcher's Open Source Licenses screen.
+The Android bottom bar bundles `@zakisheriff/liquid-glass` 4.0.0 from
+https://github.com/zakisheriff/Liquid-Glass (MIT, copyright 2026 Zaki Sheriff),
+with React and React DOM 19.2.0 (MIT, Meta Platforms). Full upstream notices and
+licenses are packaged in `assets/glass-nav/`. Source integration and build
+instructions are in `packaging/android/glass-nav/README.md`.

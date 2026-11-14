@@ -1,0 +1,10 @@
+import {build} from 'esbuild';
+import {readFile,mkdir,writeFile} from 'node:fs/promises';
+const result=await build({entryPoints:['src/index.jsx'],bundle:true,minify:true,write:false,outdir:'dist',target:['chrome100'],define:{'process.env.NODE_ENV':'"production"'},legalComments:'inline'});
+const js=result.outputFiles.find(f=>f.path.endsWith('.js')).text;
+const css=result.outputFiles.find(f=>f.path.endsWith('.css')).text;
+const out='../app/src/main/assets/glass-nav';await mkdir(out,{recursive:true});
+const html=`<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=3"><meta http-equiv="Content-Security-Policy" content="default-src 'none';script-src 'unsafe-inline';style-src 'unsafe-inline';img-src data: blob:;connect-src 'none';object-src 'none';base-uri 'none'"><style>${css}</style></head><body><div id="backdrop" aria-hidden="true"></div><div id="root"></div><script>${js.replace(/<\/script/gi,'<\\/script')}</script></body></html>`;
+await writeFile(out+'/index.html',html);
+for(const [source,name] of [['node_modules/@zakisheriff/liquid-glass/LICENSE','Liquid-Glass-LICENSE.txt'],['node_modules/@zakisheriff/liquid-glass/THIRD_PARTY_NOTICES.md','Liquid-Glass-THIRD-PARTY.txt'],['node_modules/react/LICENSE','React-LICENSE.txt']])await writeFile(out+'/'+name,(await readFile(source,'utf8')).replace(/\r\n/g,'\n').split('\n').map(line=>line.trimEnd()).join('\n'));
+console.log('Bundled local GlassNav:',html.length,'bytes');
