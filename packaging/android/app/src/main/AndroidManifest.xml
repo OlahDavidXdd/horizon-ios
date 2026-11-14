@@ -20,7 +20,7 @@
             android:exported="true"
             android:screenOrientation="fullSensor"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density"
-            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            android:theme="@style/HorizonTheme"
             android:launchMode="singleTask">
             <meta-data android:name="android.app.lib_name" android:value="horizon_android" />
             <intent-filter>

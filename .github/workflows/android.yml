@@ -114,9 +114,11 @@ jobs:
           set -euo pipefail
           test "$(cat source-commit.txt)" = "$GITHUB_SHA"
           sha256sum --check Horizon-Android.apk.sha256
-          tag="android-v0.2.92-build-${GITHUB_RUN_NUMBER}"
+          tag="android-v0.2.93-build-${GITHUB_RUN_NUMBER}"
           cat > notes.md <<'NOTES'
-          Android port of the modified Horizon iOS fork, with a native launcher and MIT-licensed AndroidLiquidGlassView 1.0.0.
+          Fixes the first-run Play error: game-file setup stays in the launcher, with automatic download, progress, cancel/retry, ZIP import and an alternate HTTPS link. Missing resources no longer produce the raw filesystem error shown in build 9.
+
+          Refines the launcher with rounded controls, a selected navigation pill, icons, calmer colors, clearer typography and a readable dialog theme. Includes MIT-licensed AndroidLiquidGlassView 1.0.0.
 
           Builds without repository signing secrets use a development key: back up saves before replacing an existing installation.
 
@@ -124,6 +126,6 @@ jobs:
 
           Includes worlds, servers, game-file import/download, resource and shader packs, content mods, settings, screenshots/log sharing, touch-layout editing, a native software-keyboard bridge, Android gamepad input, system clipboard access, and Microsoft device-code sign-in. Online sign-in requires Microsoft/Mojang application approval. This is a prerelease; physical-device gameplay and complete iOS feature parity are still being validated.
           NOTES
-          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.92 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
+          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.93 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
           gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt
           gh release edit "$tag" --draft=false

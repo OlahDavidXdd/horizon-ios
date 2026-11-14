@@ -1,0 +1,20 @@
+<resources>
+    <style name="HorizonTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowBackground">#0B141C</item>
+        <item name="android:colorAccent">#7CE0C8</item>
+        <item name="android:colorControlNormal">#ABC6CC</item>
+        <item name="android:textColorPrimary">#EAF2F4</item>
+        <item name="android:textColorSecondary">#A0B3BF</item>
+        <item name="android:navigationBarColor">#0C151E</item>
+        <item name="android:alertDialogTheme">@style/HorizonDialog</item>
+    </style>
+    <style name="HorizonDialog" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="android:colorAccent">#7CE0C8</item>
+        <item name="android:textColorPrimary">#EAF2F4</item>
+        <item name="android:textColorSecondary">#A0B3BF</item>
+        <item name="android:colorBackground">#1A2A35</item>
+    </style>
+</resources>

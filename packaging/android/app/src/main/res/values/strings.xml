@@ -8,7 +8,7 @@
     <string name="starting">Starting…</string>
     <string name="waiting">Ready to play</string>
     <string name="loading">Loading game…</string>
-    <string name="needs_files">Import game files to continue</string>
+    <string name="needs_files">Game files needed</string>
     <string name="title">Ready to play</string>
     <string name="world">Game running</string>
     <string name="unknown">Connecting to game…</string>
@@ -52,7 +52,7 @@
     <string name="updates">Check for Updates</string>
     <string name="licenses">Open Source Licenses</string>
     <string name="reduce_transparency">Reduce transparency (restart launcher)</string>
-    <string name="https_required">Game files must use an HTTPS download.</string>
+    <string name="https_required">Enter an HTTPS link to a prepared game-files ZIP.</string>
     <string name="downloading">Downloading…</string>
     <string name="offline">Use Offline Profile</string>
     <string name="sign_in">Sign in with Microsoft</string>
@@ -131,4 +131,12 @@
     <string name="invertYMouse">Invert Look</string>
     <string name="update_available">An Android update is available</string>
     <string name="view_release">View Release</string>
+    <string name="setup_game">Set Up Game Files</string>
+    <string name="setup_title">One step before you play</string>
+    <string name="setup_explanation">Horizon needs its prepared game files. Download them here, or import a resources ZIP prepared from your copy of Minecraft.</string>
+    <string name="setup_failed">Game files could not be installed. Retry the download, import a prepared resources ZIP, or try another HTTPS link.</string>
+    <string name="retry_download">Retry Download</string>
+    <string name="use_download_link">Use Another Download Link</string>
+    <string name="installing_files">Installing game files…</string>
+    <string name="server_unreachable">Unavailable</string>
 </resources>

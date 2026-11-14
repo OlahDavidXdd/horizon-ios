@@ -53,8 +53,15 @@ public final class HorizonActivity extends NativeActivity {
     private FrameLayout overlay, backdrop;
     private Dialog launcherWindow;
     private LinearLayout page, navigation;
-    private TextView status;
-    private boolean destroyed, launching, visible = true;
+    private TextView status, setupDescription;
+    private ProgressBar setupProgress;
+    private boolean needsResources = true, setupBusy, installingResources, automaticSetupAttempted;
+    private String setupMessage;
+    private long setupReceived, setupTotal;
+    private volatile int setupAttempt;
+    private volatile java.net.HttpURLConnection activeDownload;
+    private volatile boolean destroyed;
+    private boolean launching, visible = true;
     private String tab = "play", importKind = "resources", phase = "unknown";
     private String launchOwner;
     private Accounts accounts;
@@ -76,7 +83,17 @@ public final class HorizonActivity extends NativeActivity {
                 if (state.has("progress")) message += " " + Math.round(state.optDouble("progress") * 100) + "%";
                 JSONObject importing = state.optJSONObject("import");
                 if (importing != null) message = importing.optString("label") + " " + importing.optInt("files") + "/" + importing.optInt("total_files");
-                status.setText(message);
+                boolean missing = "needs_files".equals(phase) || !hasGameFiles();
+                boolean changed = missing != needsResources;
+                needsResources = missing;
+                status.setText(setupBusy ? t(installingResources ? "installing_files" : "downloading") : needsResources ? t("needs_files") : message);
+                if (changed && "play".equals(tab)) render();
+                if (needsResources && !setupBusy && !automaticSetupAttempted
+                        && !state.optBoolean("importing") && state.optJSONObject("import") == null
+                        && "waiting".equals(phase)) {
+                    automaticSetupAttempted = true;
+                    requestDownloadSource();
+                }
             });
             ui.postDelayed(this, 1000);
         }
@@ -85,17 +102,25 @@ public final class HorizonActivity extends NativeActivity {
         super.onCreate(state);
         current=new java.lang.ref.WeakReference<>(this);initPlatform();
         accounts = new Accounts(this);
+        needsResources = !hasGameFiles();
         applyTouchPreferences();
         overlay = new FrameLayout(this);
         backdrop = new FrameLayout(this);
         GradientDrawable sky = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-            new int[]{0xff102e39, 0xff183e48, 0xff10202b});
+            new int[]{0xff0b141c, 0xff14232d, 0xff0c151e});
         backdrop.setBackground(sky);
+        addBackdropGlow(0x304d839a, Gravity.BOTTOM | Gravity.RIGHT);
+        addBackdropGlow(0x1a58b29e, Gravity.TOP | Gravity.LEFT);
         overlay.addView(backdrop, new FrameLayout.LayoutParams(-1, -1));
         LinearLayout shell = new LinearLayout(this); shell.setOrientation(LinearLayout.VERTICAL);
-        shell.setPadding(dp(24), dp(12), dp(24), dp(12));
+        shell.setPadding(dp(20), dp(18), dp(20), dp(20));
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(overlay, (view, insets) -> {
+            androidx.core.graphics.Insets safe = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars() | androidx.core.view.WindowInsetsCompat.Type.displayCutout());
+            shell.setPadding(dp(20) + safe.left, dp(14) + safe.top, dp(20) + safe.right, dp(14) + safe.bottom);
+            return insets;
+        });
         LinearLayout header = row();
-        TextView title = label(t("app_name"), 27); title.setTypeface(null, android.graphics.Typeface.BOLD);
+        TextView title = label(t("app_name"), 25); title.setTypeface(null, android.graphics.Typeface.BOLD);
         header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
         header.addView(button("account", () -> accounts.show()));
         shell.addView(header);
@@ -106,21 +131,29 @@ public final class HorizonActivity extends NativeActivity {
         navigation = row();
         for (String name : new String[]{"play", "packs", "settings"}) {
             Button b = button(name, () -> { tab = name; render(); });
-            navigation.addView(b, new LinearLayout.LayoutParams(0, dp(54), 1));
+            b.setTag(name); b.setTextSize(11); b.setGravity(Gravity.CENTER);
+            b.setPadding(dp(8), dp(5), dp(8), dp(5));
+            int icon = getResources().getIdentifier("ic_" + name, "drawable", getPackageName());
+            if (icon != 0) b.setCompoundDrawablesRelativeWithIntrinsicBounds(null, getDrawable(icon), null, null);
+            b.setCompoundDrawablePadding(dp(3));
+            LinearLayout.LayoutParams item = new LinearLayout.LayoutParams(0, dp(60), 1);
+            item.setMargins(dp(3), 0, dp(3), 0); navigation.addView(b, item);
         }
+        navigation.setPadding(dp(5), dp(5), dp(5), dp(5));
         FrameLayout glass = new FrameLayout(this);
         if (Build.VERSION.SDK_INT >= 33 && !getPreferences(0).getBoolean("reduce_transparency", false)) {
             LiquidGlassView material = new LiquidGlassView(this);
-            material.bind(backdrop); material.setCornerRadius(dp(24)); material.setBlurRadius(dp(12));
-            material.setTintAlpha(0.12f);
+            material.bind(backdrop); material.setCornerRadius(dp(30)); material.setBlurRadius(dp(12));
+            material.setTintAlpha(0.07f); material.setDispersion(0.25f);
             glass.addView(material, new FrameLayout.LayoutParams(-1, -1));
-        } else glass.setBackgroundColor(0xff203d46);
+        } else glass.setBackground(rounded(0xff1b2d38, 0x267fa59f, 30));
         glass.addView(navigation, new FrameLayout.LayoutParams(-1, -1));
-        shell.addView(glass, new LinearLayout.LayoutParams(-1, dp(54)));
+        LinearLayout.LayoutParams dock = new LinearLayout.LayoutParams(-1, dp(70));
+        dock.setMargins(0, dp(10), 0, 0); shell.addView(glass, dock);
         overlay.addView(shell, new FrameLayout.LayoutParams(-1, -1));
         // NativeActivity owns its main window surface for Vulkan. A separate
         // window lets Android render the launcher without sharing that producer.
-        launcherWindow=new Dialog(this,android.R.style.Theme_Material_NoActionBar);
+        launcherWindow=new Dialog(this,R.style.HorizonTheme);
         launcherWindow.setContentView(overlay);launcherWindow.setCancelable(false);
         launcherWindow.setOnKeyListener((dialog,key,event) -> {
             if(key==android.view.KeyEvent.KEYCODE_BACK&&event.getAction()==android.view.KeyEvent.ACTION_UP){onBackPressed();return true;}
@@ -130,6 +163,7 @@ public final class HorizonActivity extends NativeActivity {
         launcherWindow.getWindow().setLayout(ViewGroup.LayoutParams.MATCH_PARENT,ViewGroup.LayoutParams.MATCH_PARENT);
         launcherWindow.getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
         launcherWindow.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+        androidx.core.view.ViewCompat.requestApplyInsets(overlay);
         inputBridge = new View(this) {
             @Override public boolean onCheckIsTextEditor() {return true;}
             @Override public android.view.inputmethod.InputConnection onCreateInputConnection(android.view.inputmethod.EditorInfo info) {
@@ -159,37 +193,79 @@ public final class HorizonActivity extends NativeActivity {
         inputManager.registerInputDeviceListener(deviceListener,ui);
         render(); ui.post(watch);checkUpdates();
     }
+    private void addBackdropGlow(int color, int gravity) {
+        View glow = new View(this);
+        GradientDrawable light = new GradientDrawable(); light.setShape(GradientDrawable.OVAL);
+        light.setGradientType(GradientDrawable.RADIAL_GRADIENT); light.setGradientRadius(dp(230));
+        light.setColors(new int[]{color, color & 0x00ffffff}); glow.setBackground(light);
+        FrameLayout.LayoutParams bounds = new FrameLayout.LayoutParams(dp(460), dp(460));
+        bounds.gravity = gravity; backdrop.addView(glow, bounds);
+    }
     int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
     String t(String key) {
         int id = getResources().getIdentifier(key, "string", getPackageName());
         return id == 0 ? key : getString(id);
     }
-    TextView label(String value, int size) {
-        TextView v = new TextView(this); v.setText(value); v.setTextSize(size); v.setTextColor(0xffeef9fa);
-        v.setPadding(dp(6), dp(6), dp(6), dp(6)); return v;
+    private GradientDrawable rounded(int fill, int stroke, int radius) {
+        GradientDrawable shape = new GradientDrawable(); shape.setColor(fill); shape.setCornerRadius(dp(radius));
+        if (stroke != 0) shape.setStroke(dp(1), stroke); return shape;
     }
+    TextView label(String value, int size) {
+        TextView v = new TextView(this); v.setText(value); v.setTextSize(size); v.setTextColor(0xffeaf2f4);
+        v.setLineSpacing(dp(2), 1f); v.setPadding(dp(2), dp(5), dp(2), dp(5)); return v;
+    }
+    private TextView detail(String value) { TextView v = label(value, 14); v.setTextColor(0xffa0b3bf); return v; }
     LinearLayout row() { LinearLayout r = new LinearLayout(this); r.setGravity(Gravity.CENTER_VERTICAL); return r; }
     Button button(String key, Runnable action) {
-        Button b = new Button(this); b.setText(t(key)); b.setAllCaps(false); b.setTextColor(0xffb9fff0);
-        b.setBackgroundTintList(android.content.res.ColorStateList.valueOf(0x252cf0cc));
-        b.setOnClickListener(v -> action.run()); return b;
+        Button b = new Button(this); b.setText(t(key)); b.setTextSize(14); b.setAllCaps(false);
+        b.setTextColor(0xffc7ede5); b.setMinHeight(dp(48)); b.setMinimumHeight(dp(48));
+        b.setPadding(dp(14), dp(10), dp(14), dp(10)); b.setBackgroundTintList(null);
+        android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
+            android.content.res.ColorStateList.valueOf(0x2675dbc6), rounded(0x152d716c, 0x205a9c94, 15), rounded(Color.WHITE, 0, 15));
+        b.setBackground(ripple); b.setOnClickListener(v -> action.run()); return b;
     }
-    void addButton(String key, Runnable action) { page.addView(button(key, action)); }
-    void heading(String key) { page.addView(label(t(key), 22)); }
+    private void primary(Button button) {
+        button.setTextColor(0xff092c29); button.setTypeface(null, android.graphics.Typeface.BOLD);
+        button.setBackground(new android.graphics.drawable.RippleDrawable(
+            android.content.res.ColorStateList.valueOf(0x3380ffff), rounded(0xff7ce0c8, 0, 17), rounded(Color.WHITE, 0, 17)));
+    }
+    void addButton(String key, Runnable action) {
+        Button b = button(key, action); LinearLayout.LayoutParams bounds = new LinearLayout.LayoutParams(-1, -2);
+        bounds.setMargins(0, dp(4), 0, dp(4)); page.addView(b, bounds);
+    }
+    void heading(String key) {
+        TextView heading = label(t(key), key.equals(tab) ? 28 : 20);
+        heading.setTypeface(null, android.graphics.Typeface.BOLD); heading.setPadding(dp(2), dp(19), dp(2), dp(10)); page.addView(heading);
+    }
+    private LinearLayout card() {
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(18), dp(14), dp(18), dp(14)); box.setBackground(rounded(0xc21a2a35, 0x225d7e8b, 21));
+        LinearLayout.LayoutParams bounds = new LinearLayout.LayoutParams(-1, -2); bounds.setMargins(0, dp(8), 0, dp(12));
+        page.addView(box, bounds); return box;
+    }
+    private void refreshNavigation() {
+        for(int i=0;i<navigation.getChildCount();i++) {
+            Button item = (Button)navigation.getChildAt(i); boolean selected = tab.equals(item.getTag());
+            item.setBackground(rounded(selected ? 0x294b9b8c : Color.TRANSPARENT, selected ? 0x205fb7a6 : 0, 24));
+            item.setTextColor(selected ? 0xffb3ffea : 0xffa1b6bf);
+            for(android.graphics.drawable.Drawable icon : item.getCompoundDrawablesRelative()) if(icon != null) icon.setTint(selected ? 0xffb3ffea : 0xffa1b6bf);
+        }
+    }
     interface Reply { void done(JSONObject value); }
-    void ask(String line, Reply reply) {
+    void ask(String line, Reply reply) { request(line, reply, this::error); }
+    private void request(String line, Reply reply, java.util.function.Consumer<String> failed) {
         long id = submit(line);
         final long deadline = SystemClock.uptimeMillis() + 120000;
         ui.post(new Runnable() { public void run() {
             if (destroyed) { abandon(id); return; }
             String result = poll(id);
             if (result == null && SystemClock.uptimeMillis() < deadline) { ui.postDelayed(this, 30); return; }
-            if (result == null) { abandon(id); launching = false; error(t("timeout")); return; }
+            if (result == null) { abandon(id); launching = false; failed.accept(t("timeout")); return; }
             try {
                 JSONObject answer = new JSONObject(result);
-                if (answer.has("error")) { launching = false; error(answer.optString("error")); return; }
+                if (answer.has("error")) { failed.accept(answer.optString("error")); return; }
                 reply.done(answer);
-            } catch (JSONException e) { error(t("bad_reply")); }
+            } catch (JSONException e) { failed.accept(t("bad_reply")); }
         }});
     }
     void error(String message) {
@@ -213,7 +289,8 @@ public final class HorizonActivity extends NativeActivity {
         } else launcherWindow.hide();
     }
     void render() {
-        page.removeAllViews(); heading(tab);
+        setupDescription = null; setupProgress = null;
+        page.removeAllViews(); refreshNavigation(); heading(tab);
         switch (tab) {
             case "play": home(); break;
             case "packs": packs(); break;
@@ -221,17 +298,23 @@ public final class HorizonActivity extends NativeActivity {
         }
     }
     private void home() {
-        page.addView(label(t("java_edition"), 13));
-        addButton("play", () -> launch(null));
+        TextView edition = detail(t("java_edition")); edition.setTextSize(11); edition.setLetterSpacing(0.15f); page.addView(edition);
+        if (needsResources || !hasGameFiles() || setupBusy || setupMessage != null) resourceSetupCard();
+        Button play = button(needsResources || !hasGameFiles() ? "setup_game" : "play", () -> launch(null)); primary(play);
+        play.setEnabled(!setupBusy); page.addView(play, new LinearLayout.LayoutParams(-1, dp(56)));
         LinearLayout actions = row();
-        actions.addView(button("new_world", this::newWorld));
-        actions.addView(button("import_world", () -> pick("world")));
-        actions.addView(button("add_server", this::addServer)); page.addView(actions);
+        String[] names = {"new_world", "import_world", "add_server"};
+        Runnable[] callbacks = {this::newWorld, () -> pick("world"), this::addServer};
+        for(int i=0;i<names.length;i++) {
+            Button action = button(names[i], callbacks[i]); action.setTextSize(12); action.setPadding(dp(7), dp(8), dp(7), dp(8));
+            LinearLayout.LayoutParams bounds = new LinearLayout.LayoutParams(0, -2, 1); bounds.setMargins(i==0 ? 0 : dp(5), dp(10), 0, 0);
+            actions.addView(action, bounds);
+        } page.addView(actions);
         heading("worlds");
         LinearLayout worlds = new LinearLayout(this); worlds.setOrientation(LinearLayout.VERTICAL); page.addView(worlds);
         ask("worlds", result -> {
             JSONArray list = result.optJSONArray("worlds");
-            if (list == null || list.length() == 0) worlds.addView(label(t("empty_worlds"), 16));
+            if (list == null || list.length() == 0) worlds.addView(detail(t("empty_worlds")));
             else for (int i = 0; i < list.length(); i++) {
                 JSONObject world = list.optJSONObject(i); if (world == null) continue;
                 LinearLayout card = row();
@@ -246,7 +329,7 @@ public final class HorizonActivity extends NativeActivity {
         LinearLayout servers = new LinearLayout(this); servers.setOrientation(LinearLayout.VERTICAL); page.addView(servers);
         ask("servers", result -> {
             JSONArray list = result.optJSONArray("servers");
-            if (list == null || list.length() == 0) servers.addView(label(t("empty_servers"), 16));
+            if (list == null || list.length() == 0) servers.addView(detail(t("empty_servers")));
             else for (int i = 0; i < list.length(); i++) {
                 JSONObject s = list.optJSONObject(i); if (s == null) continue;
                 int index = s.optInt("index", i); String address = s.optString("address");
@@ -255,12 +338,13 @@ public final class HorizonActivity extends NativeActivity {
                 r.addView(button("remove", () -> confirm("remove_server", () -> ask("server-remove " + index, v -> render()))));
                 servers.addView(r);
                 TextView ping = label(address, 12); servers.addView(ping);
-                ask("server-ping " + address, p -> ping.setText(address + " · " + p.optInt("online") + "/" + p.optInt("max") + " · " + p.optInt("ms") + " ms"));
+                request("server-ping " + address, p -> ping.setText(address + " · " + p.optInt("online") + "/" + p.optInt("max") + " · " + p.optInt("ms") + " ms"), failure -> ping.setText(address + " · " + t("server_unreachable")));
             }
         });
     }
     private void launch(String command) {
-        if (launching) return;
+        if (setupBusy || launching) return;
+        if (needsResources || !hasGameFiles()) { showResourceSetup(); return; }
         launching = true; launchOwner = UUID.randomUUID().toString();
         String owner = launchOwner;
         accounts.handOver(() -> ask("launcher-start " + owner, answer -> {
@@ -276,7 +360,8 @@ public final class HorizonActivity extends NativeActivity {
                         });
                         if (command == null) finish.run(); else ask(command, v -> finish.run());
                     } else if (p.equals("needs_files")) {
-                        launching = false; error(state.optString("reason", t("need_files")));
+                        launching = false; launchOwner = null; needsResources = true;
+                        request("launcher-cancel-start " + owner, v -> showResourceSetup(), failure -> showResourceSetup());
                     } else { status.setText(t("loading")); ui.postDelayed(this, 300); }
                 });
             }});
@@ -386,6 +471,7 @@ public final class HorizonActivity extends NativeActivity {
     }
     File homeDir() { File f = getExternalFilesDir(null); return f == null ? getFilesDir() : f; }
     private void pick(String kind) {
+        if (setupBusy) return;
         importKind = kind;
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE);
         startActivityForResult(intent, 10);
@@ -394,6 +480,9 @@ public final class HorizonActivity extends NativeActivity {
         super.onActivityResult(request, result, data);
         if (request != 10 || result != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData(); String kind = importKind;
+        if (setupBusy) return;
+        boolean resources = kind.equals("resources");
+        int attempt = resources ? beginSetup(true) : -1;
         workers.execute(() -> {
             try {
                 String name = "import-" + UUID.randomUUID() + (kind.equals("mod") ? ".hmod" : ".zip");
@@ -407,15 +496,22 @@ public final class HorizonActivity extends NativeActivity {
                 }
                 ui.post(() -> {
                     if (kind.equals("shader")) { render(); return; }
-                    String line = kind.equals("mod") ? "mods-install " + object("path", destination.getAbsolutePath()) : "import " + destination.getAbsolutePath();
-                    ask(line, v -> { destination.delete(); render(); });
+                    String line = kind.equals("mod") ? "mods-install " + object("path", destination.getAbsolutePath()) : (resources ? "import-game-files " : "import ") + destination.getAbsolutePath();
+                    request(line, v -> {
+                        destination.delete();
+                        if (resources) finishSetup(attempt, null); else render();
+                    }, failure -> {
+                        destination.delete();
+                        if (resources) finishSetup(attempt, failure); else error(failure);
+                    });
                 });
-            } catch (Exception e) { ui.post(() -> error(e.getLocalizedMessage())); }
+            } catch (Exception e) { ui.post(() -> { if(resources) finishSetup(attempt, e.toString()); else error(t("cannot_import")); }); }
         });
     }
     private void settings() {
         addButton("import_resources", () -> pick("resources"));
-        addButton("download_files", () -> ask("game-files-source", source -> confirm("download_files", () -> download(source.optString("url")))));
+        addButton("download_files", this::requestDownloadSource);
+        addButton("use_download_link", this::customResourceLink);
         addButton("offline_name", () -> prompt("offline_name", "", name -> {
             if(!name.matches("[!-~]{1,16}")) {error(t("invalid_name"));return;}
             try {
@@ -439,7 +535,7 @@ public final class HorizonActivity extends NativeActivity {
         transparency.setChecked(getPreferences(0).getBoolean("reduce_transparency",false));
         transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); Toast.makeText(this, t("restart_required"), Toast.LENGTH_LONG).show(); });
         page.addView(transparency);
-        page.addView(label("Horizon · 0.2.92-android · ARM64",14));
+        page.addView(label("Horizon · 0.2.93-android · ARM64",14));
     }
     static byte[] readBytes(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -447,24 +543,128 @@ public final class HorizonActivity extends NativeActivity {
         while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
         return out.toByteArray();
     }
+    private boolean hasGameFiles() { return new File(homeDir(), "resources/horizon-resources.json").isFile(); }
+    private void showResourceSetup() {
+        needsResources = true; tab = "play"; render();
+        if (!automaticSetupAttempted && !setupBusy) { automaticSetupAttempted = true; requestDownloadSource(); }
+    }
+    private void resourceSetupCard() {
+        LinearLayout box = card();
+        TextView title = label(t("setup_title"), 19); title.setTypeface(null, android.graphics.Typeface.BOLD); box.addView(title);
+        setupDescription = detail(""); box.addView(setupDescription);
+        setupProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        setupProgress.setProgressTintList(android.content.res.ColorStateList.valueOf(0xff7ce0c8));
+        LinearLayout.LayoutParams progressBounds = new LinearLayout.LayoutParams(-1, dp(6)); progressBounds.setMargins(0, dp(10), 0, dp(14));
+        box.addView(setupProgress, progressBounds);
+        if (setupBusy) {
+            if(!installingResources) box.addView(button("cancel", this::cancelResourceDownload));
+        } else {
+            Button download = button(setupMessage == null ? "download_files" : "retry_download", this::requestDownloadSource); primary(download);
+            box.addView(download, new LinearLayout.LayoutParams(-1, dp(49)));
+            Button choose = button("import_resources", () -> pick("resources"));
+            LinearLayout.LayoutParams bounds = new LinearLayout.LayoutParams(-1, -2); bounds.setMargins(0, dp(9), 0, 0); box.addView(choose, bounds);
+            box.addView(button("use_download_link", this::customResourceLink));
+        }
+        updateSetupProgress();
+    }
+    private void updateSetupProgress() {
+        if(setupDescription != null) {
+            String text = setupBusy ? t(installingResources ? "installing_files" : "downloading") : setupMessage == null ? t("setup_explanation") : setupMessage;
+            if(setupBusy && !installingResources && setupReceived > 0) {
+                text += "\n" + (setupReceived / 1048576) + " MB";
+                if(setupTotal > 0) text += " / " + (setupTotal / 1048576) + " MB";
+            }
+            setupDescription.setText(text);
+        }
+        if(setupProgress != null) {
+            setupProgress.setVisibility(setupBusy ? View.VISIBLE : View.GONE);
+            setupProgress.setIndeterminate(installingResources || setupTotal <= 0);
+            if(setupTotal > 0) { setupProgress.setMax(1000); setupProgress.setProgress((int)Math.min(1000, setupReceived * 1000 / setupTotal)); }
+        }
+        if(setupBusy) status.setText(t(installingResources ? "installing_files" : "downloading"));
+    }
+    private int beginSetup(boolean installing) {
+        launcherWindow.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        setupBusy = true; installingResources = installing; setupMessage = null; setupReceived = 0; setupTotal = 0;
+        int attempt = ++setupAttempt; render(); return attempt;
+    }
+    private void finishSetup(int attempt, String failure) {
+        if(attempt != setupAttempt || destroyed) return;
+        launcherWindow.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        setupBusy = false; installingResources = false;
+        if(failure != null || !hasGameFiles()) {
+            android.util.Log.w("HorizonSetup", "Game-files setup failed: " + failure);
+            needsResources = true; setupMessage = t("setup_failed");
+        } else { needsResources = false; setupMessage = null; status.setText(t("waiting")); }
+        render();
+    }
+    private void cancelResourceDownload() {
+        if(installingResources) return;
+        launcherWindow.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        ++setupAttempt; setupBusy = false; setupMessage = null;
+        java.net.HttpURLConnection connection = activeDownload;
+        activeDownload = null; if(connection != null) workers.execute(connection::disconnect);
+        render();
+    }
+    private void customResourceLink() {
+        if(setupBusy) return;
+        automaticSetupAttempted = true;
+        prompt("use_download_link", getPreferences(0).getString("resource_link", ""), value -> {
+            try {
+                java.net.URL url = new java.net.URL(value);
+                if(!"https".equalsIgnoreCase(url.getProtocol()) || url.getHost().isEmpty()) throw new IOException();
+                getPreferences(0).edit().putString("resource_link", value).apply(); download(value);
+            } catch(Exception e) { setupMessage = t("https_required"); tab = "play"; render(); }
+        });
+    }
+    private void requestDownloadSource() {
+        if(setupBusy) return;
+        automaticSetupAttempted = true;
+        int attempt = beginSetup(false);
+        request("game-files-source", source -> {
+            if(attempt != setupAttempt) return;
+            setupBusy = false;
+            String address = source.optString("url");
+            if(address.isEmpty()) { finishSetup(attempt, "missing resource URL"); return; }
+            download(address);
+        }, failure -> finishSetup(attempt, failure));
+    }
     private void download(String address) {
+        if(setupBusy) return;
+        int attempt = beginSetup(false);
         workers.execute(() -> {
             File zip = new File(homeDir(), ".horizon-import/download-" + UUID.randomUUID() + ".zip");
+            java.net.HttpURLConnection connection = null;
             try {
                 java.net.URL url = new java.net.URL(address);
-                if (!url.getProtocol().equals("https")) throw new IOException(t("https_required"));
-                zip.getParentFile().mkdirs();
-                java.net.HttpURLConnection connection = (java.net.HttpURLConnection)url.openConnection();
+                if (!"https".equalsIgnoreCase(url.getProtocol())) throw new IOException("HTTPS required");
+                if(!zip.getParentFile().isDirectory() && !zip.getParentFile().mkdirs()) throw new IOException("Cannot create import folder");
+                connection = (java.net.HttpURLConnection)url.openConnection(); activeDownload = connection;
                 connection.setConnectTimeout(30000); connection.setReadTimeout(30000);
-                if (connection.getResponseCode() != 200) throw new IOException("HTTP " + connection.getResponseCode());
+                if(connection.getResponseCode() != 200) throw new IOException("HTTP " + connection.getResponseCode());
+                long expected = connection.getContentLengthLong();
+                final long limit = 2L << 30;
+                if(expected > limit || (expected > 0 && expected > homeDir().getUsableSpace())) throw new IOException("Archive exceeds available space or size limit");
                 try (InputStream in = connection.getInputStream(); OutputStream out = new FileOutputStream(zip)) {
-                    byte[] buffer = new byte[65536]; int n; long count = 0;
-                    while ((n = in.read(buffer)) != -1) { out.write(buffer,0,n); count += n;
-                        long bytes = count; ui.post(() -> status.setText(t("downloading") + " " + bytes / 1048576 + " MB"));
+                    byte[] buffer = new byte[65536]; int n; long count = 0, lastUpdate = 0;
+                    while ((n = in.read(buffer)) != -1) {
+                        if(attempt != setupAttempt || destroyed) throw new java.io.InterruptedIOException();
+                        count += n; if(count > limit) throw new IOException("Archive too large"); out.write(buffer, 0, n);
+                        long now = SystemClock.uptimeMillis();
+                        if(now - lastUpdate >= 200) {
+                            lastUpdate = now; long received = count;
+                            ui.post(() -> { if(attempt == setupAttempt) { setupReceived = received; setupTotal = expected; updateSetupProgress(); } });
+                        }
                     }
-                } finally { connection.disconnect(); }
-                ui.post(() -> ask("import " + zip.getAbsolutePath(), v -> { zip.delete(); render(); }));
-            } catch (Exception e) { zip.delete(); ui.post(() -> error(e.getLocalizedMessage())); }
+                    if(expected >= 0 && count != expected) throw new IOException("Incomplete download");
+                }
+                ui.post(() -> {
+                    if(attempt != setupAttempt || destroyed) { zip.delete(); return; }
+                    installingResources = true; render();
+                    request("import-game-files " + zip.getAbsolutePath(), v -> { zip.delete(); finishSetup(attempt, null); }, failure -> { zip.delete(); finishSetup(attempt, failure); });
+                });
+            } catch(Exception e) { zip.delete(); ui.post(() -> finishSetup(attempt, e.toString())); }
+            finally { if(connection != null) { connection.disconnect(); if(activeDownload == connection) activeDownload = null; } }
         });
     }
     private float[] touchSnapshot() {
