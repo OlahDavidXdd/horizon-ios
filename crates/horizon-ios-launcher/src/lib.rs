@@ -20,6 +20,11 @@ use std::{
 #[cfg(target_os = "android")]
 mod android;
 
+#[cfg(target_os = "android")]
+pub fn set_android_keyboard(wanted: bool) {
+    android::KEYBOARD.store(wanted, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// One line from the launcher, and the way back to it.
 pub struct Request {
     pub line: String,
@@ -339,16 +344,21 @@ pub fn present_download() -> bool {
 /// disable mouse gestures=8, disable hotbar gestures=16.
 /// An older/missing launcher keeps the original layout and visibility.
 pub fn touch_preferences() -> ([f32; 100], u32) {
-    let positions = [f32::NAN; 100];
-    #[cfg(target_os = "ios")]
-    let (positions, hidden) = {
-        let mut positions = positions;
-        let hidden = ios::touch_preferences(&mut positions);
+    #[cfg(target_os = "android")]
+    return android::touch_preferences();
+    #[cfg(not(target_os = "android"))]
+    {
+        let positions = [f32::NAN; 100];
+        #[cfg(target_os = "ios")]
+        let (positions, hidden) = {
+            let mut positions = positions;
+            let hidden = ios::touch_preferences(&mut positions);
+            (positions, hidden)
+        };
+        #[cfg(not(target_os = "ios"))]
+        let hidden = 0;
         (positions, hidden)
-    };
-    #[cfg(not(target_os = "ios"))]
-    let hidden = 0;
-    (positions, hidden)
+    }
 }
 
 /// A UIKit-recognized gesture, delivered on the same main thread as the frame.

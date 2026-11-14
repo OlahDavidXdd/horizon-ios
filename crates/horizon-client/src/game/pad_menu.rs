@@ -2408,6 +2408,8 @@ impl Game<'_> {
         self.pad.menu.osk = None;
         self.pad.menu.system_keyboard = true;
         self.pad.menu.system_keyboard_hidden = false;
+        #[cfg(target_os = "android")]
+        horizon_ios_launcher::set_android_keyboard(true);
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
             window.set_ime_allowed(true);
@@ -2418,6 +2420,8 @@ impl Game<'_> {
     /// explicit hide preference; the focused field may reopen it afterwards.
     pub(super) fn suspend_system_keyboard(&mut self) {
         self.pad.menu.system_keyboard = false;
+        #[cfg(target_os = "android")]
+        horizon_ios_launcher::set_android_keyboard(false);
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
         }
@@ -2431,6 +2435,8 @@ impl Game<'_> {
         }
         self.pad.menu.system_keyboard = false;
         self.pad.menu.system_keyboard_hidden = true;
+        #[cfg(target_os = "android")]
+        horizon_ios_launcher::set_android_keyboard(false);
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
         }
@@ -2466,13 +2472,15 @@ impl Game<'_> {
             // The next field to take the focus asks for the keyboard again.
             self.pad.menu.system_keyboard_hidden = false;
         }
-        let want = cfg!(target_os = "ios")
+        let want = cfg!(any(target_os = "ios", target_os = "android"))
             && !self.menu_input_blocked()
             && focused
             && self.pad.menu.osk.is_none()
             && !self.pad.menu.system_keyboard_hidden;
         if want != self.pad.menu.system_keyboard {
             self.pad.menu.system_keyboard = want;
+            #[cfg(target_os = "android")]
+            horizon_ios_launcher::set_android_keyboard(want);
             if let Some(window) = &self.window {
                 window.set_ime_allowed(want);
             }

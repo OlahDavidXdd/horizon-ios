@@ -21,6 +21,10 @@ public final class HorizonActivity extends NativeActivity {
     private static native String poll(long id);
     private static native void abandon(long id);
     private static native boolean isCovered();
+    private static native boolean keyboardWanted();
+    private View inputBridge;
+    private boolean keyboardVisible;
+    private static native void setTouchPreferences(float[] values, int flags);
     private final Handler ui = new Handler(Looper.getMainLooper());
     final ExecutorService workers = Executors.newCachedThreadPool();
     private FrameLayout overlay, backdrop;
@@ -35,6 +39,13 @@ public final class HorizonActivity extends NativeActivity {
             if (destroyed) return;
             boolean covered = isCovered();
             if (covered != visible) setLauncherVisible(covered);
+            boolean wantKeyboard = !covered && keyboardWanted();
+            if(wantKeyboard != keyboardVisible) {
+                keyboardVisible = wantKeyboard;
+                android.view.inputmethod.InputMethodManager ime=(android.view.inputmethod.InputMethodManager)getSystemService(INPUT_METHOD_SERVICE);
+                if(wantKeyboard) {inputBridge.requestFocus();ime.showSoftInput(inputBridge,android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);}
+                else {ime.hideSoftInputFromWindow(inputBridge.getWindowToken(),0);inputBridge.clearFocus();}
+            }
             if (visible) ask("launcher-state", state -> {
                 phase = state.optString("phase");
                 String message = t(phase);
@@ -49,6 +60,7 @@ public final class HorizonActivity extends NativeActivity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         accounts = new Accounts(this);
+        applyTouchPreferences();
         overlay = new FrameLayout(this);
         backdrop = new FrameLayout(this);
         GradientDrawable sky = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
@@ -82,6 +94,31 @@ public final class HorizonActivity extends NativeActivity {
         shell.addView(glass, new LinearLayout.LayoutParams(-1, dp(54)));
         overlay.addView(shell, new FrameLayout.LayoutParams(-1, -1));
         addContentView(overlay, new ViewGroup.LayoutParams(-1, -1));
+        inputBridge = new View(this) {
+            @Override public boolean onCheckIsTextEditor() {return true;}
+            @Override public android.view.inputmethod.InputConnection onCreateInputConnection(android.view.inputmethod.EditorInfo info) {
+                info.inputType=android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE;
+                info.imeOptions=android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI;
+                return new android.view.inputmethod.BaseInputConnection(this,false) {
+                    String composing="";
+                    @Override public boolean setComposingText(CharSequence text,int cursor) {composing=text.toString();return true;}
+                    @Override public boolean finishComposingText() {if(!composing.isEmpty()){String text=composing;composing="";ask("type "+text,v -> {});}return true;}
+                    @Override public boolean commitText(CharSequence text,int cursor) {composing="";ask("type "+text,v -> {});return true;}
+                    @Override public boolean deleteSurroundingText(int before,int after) {
+                        if(!composing.isEmpty()) {composing=composing.substring(0,Math.max(0,composing.length()-before));return true;}
+                        for(int i=0;i<Math.min(before,100);i++)ask("type \\b",v -> {});return true;
+                    }
+                    @Override public boolean sendKeyEvent(android.view.KeyEvent event) {
+                        if(event.getAction()!=android.view.KeyEvent.ACTION_DOWN)return true;
+                        if(event.getKeyCode()==android.view.KeyEvent.KEYCODE_ENTER) {finishComposingText();ask("key Enter tap",v -> {});return true;}
+                        if(event.getKeyCode()==android.view.KeyEvent.KEYCODE_DEL)return deleteSurroundingText(1,0);
+                        int unicode=event.getUnicodeChar();if(unicode!=0)ask("type "+new String(Character.toChars(unicode)),v -> {});return true;
+                    }
+                };
+            }
+        };
+        inputBridge.setFocusable(true);inputBridge.setFocusableInTouchMode(true);
+        addContentView(inputBridge,new ViewGroup.LayoutParams(1,1));
         render(); ui.post(watch);
     }
     int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
@@ -213,14 +250,30 @@ public final class HorizonActivity extends NativeActivity {
             .setNegativeButton(android.R.string.cancel, null).show();
     }
     private void newWorld() {
-        prompt("world_name", "", name -> {
-            if (name.isEmpty()) return;
-            String[] modes = {t("survival"), t("creative"), t("hardcore")};
-            new AlertDialog.Builder(this).setTitle(t("game_mode")).setItems(modes, (d, mode) -> {
-                JSONObject data = object("name", name, "mode", mode == 1 ? "creative" : mode == 2 ? "hardcore" : "survival");
-                launch("world-create " + data);
-            }).show();
-        });
+        LinearLayout form = new LinearLayout(this); form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(20),0,dp(20),0);
+        EditText name = new EditText(this); name.setHint(t("world_name")); name.setSingleLine(true); form.addView(name);
+        EditText seed = new EditText(this); seed.setHint(t("seed")); seed.setSingleLine(true); form.addView(seed);
+        Spinner mode = new Spinner(this); mode.setAdapter(new ArrayAdapter<String>(this, android.R.layout.simple_spinner_dropdown_item,
+            new String[]{t("survival"),t("creative"),t("hardcore")})); form.addView(mode);
+        Spinner difficulty = new Spinner(this); difficulty.setAdapter(new ArrayAdapter<String>(this, android.R.layout.simple_spinner_dropdown_item,
+            new String[]{t("peaceful"),t("easy"),t("normal"),t("hard")})); difficulty.setSelection(2); form.addView(difficulty);
+        String[] flags = {"commands","flat","structures","bonus_chest"};
+        CheckBox[] toggles = new CheckBox[flags.length];
+        for(int i=0;i<flags.length;i++) {toggles[i]=new CheckBox(this);toggles[i].setText(t(flags[i]));toggles[i].setChecked(i==2);form.addView(toggles[i]);}
+        ScrollView scroll = new ScrollView(this);scroll.addView(form);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(t("new_world")).setView(scroll)
+            .setPositiveButton(t("create"),null).setNegativeButton(android.R.string.cancel,null).create();
+        dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            String title = name.getText().toString().trim();
+            if(title.isEmpty()) {name.setError(t("world_name"));return;}
+            JSONObject data = object("name",title,"seed",seed.getText().toString(),
+                "mode",new String[]{"survival","creative","hardcore"}[mode.getSelectedItemPosition()],
+                "difficulty",new String[]{"peaceful","easy","normal","hard"}[difficulty.getSelectedItemPosition()]);
+            try {for(int i=0;i<flags.length;i++)data.put(flags[i],toggles[i].isChecked());}
+            catch(JSONException e) {throw new IllegalStateException(e);}
+            dialog.dismiss();launch("world-create " + data);
+        }));dialog.show();
     }
     private void worldMenu(String folder, String name) {
         String[] labels = {t("rename"), t("backup"), t("delete")};
@@ -255,7 +308,16 @@ public final class HorizonActivity extends NativeActivity {
                 check.setOnCheckedChangeListener((b, on) -> {
                     if (on) active.add("file/" + file.getName()); else active.remove("file/" + file.getName());
                     ask("options-set resourcePacks " + new JSONArray(active), v -> {});
-                }); page.addView(check);
+                });
+                LinearLayout packRow=row();packRow.addView(check,new LinearLayout.LayoutParams(0,-2,1));
+                packRow.addView(button("move_up",() -> {
+                    String id="file/"+file.getName();List<String> order=new ArrayList<>(active);int index=order.indexOf(id);
+                    if(index>=0&&index<order.size()-1){Collections.swap(order,index,index+1);active.clear();active.addAll(order);ask("options-set resourcePacks "+new JSONArray(order),v -> render());}
+                }));
+                packRow.addView(button("move_down",() -> {
+                    String id="file/"+file.getName();List<String> order=new ArrayList<>(active);int index=order.indexOf(id);
+                    if(index>0){Collections.swap(order,index,index-1);active.clear();active.addAll(order);ask("options-set resourcePacks "+new JSONArray(order),v -> render());}
+                }));page.addView(packRow);
             }
         });
         heading("shader_packs");
@@ -311,8 +373,19 @@ public final class HorizonActivity extends NativeActivity {
     private void settings() {
         addButton("import_resources", () -> pick("resources"));
         addButton("download_files", () -> ask("game-files-source", source -> confirm("download_files", () -> download(source.optString("url")))));
+        addButton("offline_name", () -> prompt("offline_name", "", name -> {
+            if(!name.matches("[!-~]{1,16}")) {error(t("invalid_name"));return;}
+            try {
+                android.util.AtomicFile file = new android.util.AtomicFile(new File(homeDir(),"horizon-player.txt"));
+                FileOutputStream out = file.startWrite();
+                try {out.write(("name:"+name+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));file.finishWrite(out);}
+                catch(IOException e){file.failWrite(out);throw e;}
+            } catch(IOException e){error(e.getLocalizedMessage());}
+        }));
         addButton("game_settings", this::gameSettings);
+        addButton("touch_controls", this::touchControls);
         addButton("screenshots", this::gallery);
+        addButton("share_logs", () -> share(new File(homeDir(),".local/share/horizon/logs/latest.log"),"text/plain"));
         addButton("updates", () -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/OlahDavidXdd/horizon-ios/releases"))));
         addButton("licenses", () -> {
             try (InputStream in = getAssets().open("AndroidLiquidGlassView-LICENSE.txt")) {
@@ -351,6 +424,83 @@ public final class HorizonActivity extends NativeActivity {
             } catch (Exception e) { zip.delete(); ui.post(() -> error(e.getLocalizedMessage())); }
         });
     }
+    private float[] touchSnapshot() {
+        float[] snapshot = new float[100];
+        for(int i=0;i<snapshot.length;i++)snapshot[i]=getPreferences(0).getFloat("touch_"+i,Float.NaN);
+        return snapshot;
+    }
+    private void applyTouchPreferences() {
+        setTouchPreferences(touchSnapshot(),getPreferences(0).getInt("touch_flags",0));
+    }
+    private void touchControls() {
+        page.removeAllViews();heading("touch_controls");
+        String[] labels = {"hide_controls","virtual_mouse","joystick","disable_mouse_gestures","disable_hotbar_gestures","forward_lock"};
+        for(int i=0;i<labels.length;i++) {
+            int bit = 1<<i; CheckBox option = new CheckBox(this);option.setText(t(labels[i]));option.setTextColor(Color.WHITE);
+            option.setChecked((getPreferences(0).getInt("touch_flags",0)&bit)!=0);
+            option.setOnCheckedChangeListener((b,on) -> {
+                int flags=getPreferences(0).getInt("touch_flags",0);
+                getPreferences(0).edit().putInt("touch_flags",on?flags|bit:flags&~bit).apply();applyTouchPreferences();
+            });page.addView(option);
+        }
+        addButton("edit_layout",this::editTouchLayout);
+        addButton("reset_layout",() -> {
+            android.content.SharedPreferences.Editor edit=getPreferences(0).edit();
+            for(int i=0;i<100;i++)edit.remove("touch_"+i);edit.apply();applyTouchPreferences();
+        });
+    }
+    private void editTouchLayout() {
+        FrameLayout editor=new FrameLayout(this);editor.setBackgroundColor(0xff16313b);
+        overlay.addView(editor,new FrameLayout.LayoutParams(-1,-1));
+        String[] names={"forward","back","left","right","sneak","jump","perspective","chat","pause","inventory","left_click","right_click","joystick","sprint","middle_click","more","hide","runtime","debug","player_list"};
+        float[] values=touchSnapshot();
+        editor.post(() -> {
+            int width=editor.getWidth(),height=editor.getHeight();
+            for(int i=0;i<names.length;i++) {
+                final int id=i;
+                float x=Float.isNaN(values[i*2])?(0.10f+(i%5)*0.20f):values[i*2];
+                float y=Float.isNaN(values[i*2+1])?(0.25f+(i/5)*0.18f):values[i*2+1];
+                values[i*2]=x;values[i*2+1]=y;
+                Button control=button(names[i],() -> prompt("control_size", "0.08,0.10,0.8", text -> {
+                    try {
+                        String[] parts=text.split(",");float w=Float.parseFloat(parts[0]),h=Float.parseFloat(parts[1]),alpha=Float.parseFloat(parts[2]);
+                        if(w<=0||w>1||h<=0||h>1||alpha<0||alpha>1)throw new IllegalArgumentException();
+                        values[40+id*2]=w;values[41+id*2]=h;values[80+id]=alpha;
+                        controlSize(editor,id,values);
+                    } catch(RuntimeException e){error(t("invalid_control_size"));}
+                }));
+                control.setTag(i);editor.addView(control,new FrameLayout.LayoutParams(dp(90),dp(44)));
+                controlSize(editor,id,values);
+                control.setX(x*width-control.getLayoutParams().width/2f);control.setY(y*height-control.getLayoutParams().height/2f);
+                control.setOnTouchListener(new View.OnTouchListener(){float startX,startY,offsetX,offsetY;
+                    public boolean onTouch(View v,android.view.MotionEvent event){
+                        if(event.getAction()==android.view.MotionEvent.ACTION_DOWN){startX=event.getRawX();startY=event.getRawY();offsetX=v.getX();offsetY=v.getY();return true;}
+                        if(event.getAction()==android.view.MotionEvent.ACTION_MOVE){
+                            v.setX(Math.max(0,Math.min(width-v.getWidth(),offsetX+event.getRawX()-startX)));
+                            v.setY(Math.max(0,Math.min(height-v.getHeight(),offsetY+event.getRawY()-startY)));return true;
+                        }
+                        if(event.getAction()==android.view.MotionEvent.ACTION_UP){
+                            values[id*2]=(v.getX()+v.getWidth()/2f)/width;values[id*2+1]=(v.getY()+v.getHeight()/2f)/height;
+                            if(Math.abs(event.getRawX()-startX)+Math.abs(event.getRawY()-startY)<dp(8))v.performClick();return true;
+                        }return true;
+                    }
+                });
+            }
+            Button save=button("save_layout",() -> {
+                android.content.SharedPreferences.Editor edit=getPreferences(0).edit();
+                for(int i=0;i<values.length;i++)edit.putFloat("touch_"+i,values[i]);edit.apply();applyTouchPreferences();overlay.removeView(editor);
+            });FrameLayout.LayoutParams saveLayout=new FrameLayout.LayoutParams(-2,dp(48));saveLayout.gravity=Gravity.TOP|Gravity.RIGHT;editor.addView(save,saveLayout);
+            Button cancel=button("cancel",() -> overlay.removeView(editor));editor.addView(cancel,new FrameLayout.LayoutParams(-2,dp(48)));
+        });
+    }
+    private void controlSize(FrameLayout editor,int id,float[] values) {
+        View control=editor.findViewWithTag(id);if(control==null)return;
+        ViewGroup.LayoutParams size=control.getLayoutParams();
+        if(!Float.isNaN(values[40+id*2]))size.width=Math.max(dp(24),Math.round(values[40+id*2]*editor.getWidth()));
+        if(!Float.isNaN(values[41+id*2]))size.height=Math.max(dp(24),Math.round(values[41+id*2]*editor.getHeight()));
+        control.setLayoutParams(size);
+        if(!Float.isNaN(values[80+id]))control.setAlpha(values[80+id]);
+    }
     private void gameSettings() {
         page.removeAllViews(); heading("game_settings");
         String[] keys = {"renderDistance","simulationDistance","maxFps","fov","gamma","guiScale","particles","renderClouds","entityShadows","bobView","soundCategory_master","soundCategory_music","soundCategory_ambient","showSubtitles","mouseSensitivity","autoJump","invertYMouse"};
@@ -369,8 +519,17 @@ public final class HorizonActivity extends NativeActivity {
             ImageView thumbnail = new ImageView(this); thumbnail.setAdjustViewBounds(true);
             android.graphics.BitmapFactory.Options opts = new android.graphics.BitmapFactory.Options(); opts.inSampleSize = 4;
             thumbnail.setImageBitmap(android.graphics.BitmapFactory.decodeFile(image.getAbsolutePath(),opts));
+            thumbnail.setOnClickListener(v -> share(image,"image/png"));
             thumbnail.setContentDescription(image.getName()); page.addView(thumbnail,new LinearLayout.LayoutParams(-1,dp(180)));
         }
+    }
+    private void share(File file,String type) {
+        if(!file.isFile()){error(t("file_unavailable"));return;}
+        Uri uri=androidx.core.content.FileProvider.getUriForFile(this,getPackageName()+".files",file);
+        Intent intent=new Intent(Intent.ACTION_SEND).setType(type).putExtra(Intent.EXTRA_STREAM,uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.setClipData(ClipData.newRawUri(file.getName(),uri));
+        startActivity(Intent.createChooser(intent,t("share")));
     }
     @Override public void onBackPressed() {
         if (launching && launchOwner != null) {

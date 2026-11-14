@@ -1,7 +1,7 @@
 //! Nonblocking JNI transport. Only the game thread executes launcher commands.
 use jni::{
     JNIEnv,
-    objects::{JClass, JString},
+    objects::{JClass, JFloatArray, JString},
     sys::{jboolean, jlong, jstring},
 };
 use std::{
@@ -76,4 +76,46 @@ pub extern "system" fn Java_dev_horizon_android_HorizonActivity_isCovered(
     _: JClass,
 ) -> jboolean {
     u8::from(super::covered())
+}
+
+static TOUCH: Mutex<([f32; 100], u32)> = Mutex::new(([f32::NAN; 100], 0));
+
+pub(super) fn touch_preferences() -> ([f32; 100], u32) {
+    *TOUCH.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_horizon_android_HorizonActivity_setTouchPreferences(
+    env: JNIEnv,
+    _: JClass,
+    values: JFloatArray,
+    flags: jni::sys::jint,
+) {
+    if env.get_array_length(&values).ok() != Some(100) {
+        return;
+    }
+    let mut snapshot = [f32::NAN; 100];
+    if env
+        .get_float_array_region(&values, 0, &mut snapshot)
+        .is_err()
+    {
+        return;
+    }
+    for value in &mut snapshot {
+        if !value.is_nan() && (!value.is_finite() || !(0.0..=1.0).contains(value)) {
+            *value = f32::NAN;
+        }
+    }
+    *TOUCH.lock().unwrap_or_else(|e| e.into_inner()) = (snapshot, flags as u32 & 63);
+}
+
+pub(super) static KEYBOARD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_horizon_android_HorizonActivity_keyboardWanted(
+    _: JNIEnv,
+    _: JClass,
+) -> jboolean {
+    u8::from(KEYBOARD.load(Ordering::Relaxed))
 }

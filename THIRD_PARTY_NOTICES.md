@@ -428,3 +428,11 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FO
 OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
+
+## Android launcher: AndroidLiquidGlassView 1.0.0
+
+The Android launcher imports `com.qmdeve.liquidglass:core:1.0.0` from Maven Central.
+Source: https://github.com/QmDeve/AndroidLiquidGlassView/tree/v1.0.0.
+Copyright 2025-2026 Donny Yang. MIT license; the complete license is included in
+`packaging/android/app/src/main/assets/AndroidLiquidGlassView-LICENSE.txt` and
+available from the Android launcher's Open Source Licenses screen.
