@@ -1,379 +1,1103 @@
-//! Horizon mods in the game (`docs/mods.md`): loading the ones turned on,
-//! their tick, frame, chat and command hooks, their HUD panels and what
-//! they print. With no mod on, `horizon_mods::Mods` holds no engine and
-//! every hook here returns after one check.
-//!
-//! Code mods run only in builds with the `mods` feature (release builds):
-//! without it the game links no wasmtime, and every hook does nothing.
-//! Content mods (`content_root`) load in every build.
+//! Mods in the game (`docs/mods.md`): content mods' blocks, items, data and
+//! assets (`content_root`), and the Mods page's rows. Code mods are native
+//! (`native_hooks.rs`); WebAssembly code mods don't run any more.
 use super::Game;
 use horizon_client::{
-    command::{Dispatcher, vanilla},
-    extras_hud::Corners,
-    hud::HudBatch,
-    mod_list,
+    lang,
+    mod_list::{self, Installed},
+    text::Text,
 };
-use std::{path::PathBuf, time::Duration};
-#[cfg(feature = "mods")]
-use {
-    super::Screen,
-    horizon_client::{
-        extras::Corner,
-        extras_hud,
-        mod_list::Installed,
-        text::{self, Text},
-    },
-    horizon_mods::{Clock, Mods, Output, Player, Snapshot, Status},
-    std::time::Instant,
-};
+use std::{path::PathBuf, sync::Arc};
+pub(super) mod catalog;
+mod content;
+pub(crate) use catalog::PreparedContent;
+use catalog::{Catalog, Selection};
+type CatalogJob = super::mod_browser::OwnedJob<Result<Arc<Catalog>, String>>;
 
 #[derive(Default)]
 pub(super) struct ModsState {
-    #[cfg(feature = "mods")]
-    mods: Mods,
-    /// `--dev-mod PATH`: always on, reloaded when rebuilt.
+    /// `--dev-mod PATH`: always on.
     pub(super) dev: Vec<PathBuf>,
-    /// When dev mods were last checked for a rebuild.
-    #[cfg(feature = "mods")]
-    checked: Option<Instant>,
-    /// The chat's command tree while a running mod owns commands.
-    #[cfg(feature = "mods")]
-    tree: Option<Dispatcher>,
+    /// The WebAssembly mods found that no longer run, for the one-time notice.
+    stopped: Vec<String>,
+    /// Browse mods' worker (`mod_browser`).
+    pub(super) jobs: super::mod_browser::Jobs,
+    pub(super) content: Option<Arc<PreparedContent>>,
+    pub(super) transaction: Option<super::packs::transaction::Transaction>,
+    catalog: Option<Arc<Catalog>>,
+    catalog_job: Option<CatalogJob>,
+    refresh_again: bool,
+    pending: Option<Selection>,
+    live: Option<std::time::Instant>,
+    /// The server's data comes from a root a live switch built, not the one
+    /// `res` was loaded from: the world tables are built from it even with no
+    /// data pack (`build_world_tables`).
+    pub(super) data_switched: bool,
 }
+
 impl ModsState {
-    /// The chat's command tree: vanilla's, plus the running mods' commands.
-    pub(super) fn dispatcher(&self) -> &Dispatcher {
-        #[cfg(feature = "mods")]
-        if let Some(tree) = &self.tree {
-            return tree;
+    pub(super) fn with_content(content: Option<Arc<PreparedContent>>) -> Self {
+        let data_switched = content.as_ref().is_some_and(|content| content.data_changed);
+        let catalog = content.as_ref().map(|content| content.catalog.clone());
+        Self {
+            content,
+            catalog,
+            data_switched,
+            ..Self::default()
         }
-        vanilla::game_dispatcher()
-    }
-    /// Whether a mod runs: the chat keeps its lines for them.
-    pub(super) fn running(&self) -> bool {
-        #[cfg(feature = "mods")]
-        if self.mods.is_running() {
-            return true;
-        }
-        false
-    }
-    /// Whether a mod draws a HUD panel.
-    pub(super) fn has_panels(&self) -> bool {
-        #[cfg(feature = "mods")]
-        if self.mods.panels().next().is_some() {
-            return true;
-        }
-        false
     }
 }
-/// How often dev mods are checked for a rebuild.
-#[cfg(feature = "mods")]
-const RELOAD_CHECK: Duration = Duration::from_secs(1);
 
-/// A vanilla command name: mods may not take it.
-#[cfg(feature = "mods")]
-fn vanilla_command(name: &str) -> bool {
-    let d = vanilla::game_dispatcher();
-    d.nodes[0]
-        .children
-        .iter()
-        .any(|&c| d.nodes[c].name() == name)
+/// Resource loading may fall back to vanilla after a rejected pack. Record
+/// what actually loaded while retaining catalogue metadata for a later retry.
+pub(super) fn content_for_loaded_root(
+    root: &std::path::Path,
+    requested: Arc<PreparedContent>,
+) -> horizon_client::Result<Arc<PreparedContent>> {
+    if root == requested.root {
+        return Ok(requested);
+    }
+    let mut enabled = requested.selection.enabled.clone();
+    enabled.retain(|id| {
+        !requested.catalog.entries.contains_key(id) && !requested.catalog.invalid.contains(id)
+    });
+    Ok(Arc::new(PreparedContent {
+        root: root.to_owned(),
+        catalog: requested.catalog.clone(),
+        selection: Selection {
+            enabled,
+            ..Selection::default()
+        },
+        lease: horizon_assets::root_lease::RootLease::acquire(root)?,
+        data_changed: false,
+    }))
 }
 
-/// `root` with the content mods that are on layered over it
-/// (docs/modpacks.md): their blocks, items, data and assets. Read once at
-/// start, before the resources load; a mod whose content is refused is left
-/// out here and its row on the Mods page says why.
-pub(super) fn content_root(
+pub(super) fn prepare_content(
     root: &std::path::Path,
     enabled: &std::collections::BTreeSet<String>,
-    dev: &[std::path::PathBuf],
-) -> std::path::PathBuf {
-    use horizon_client::mod_content::{self, ContentMod};
-    use horizon_mods::{Capability, Content, Package};
-    let here = std::env::current_dir().unwrap_or_default();
-    let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
-    paths.retain(|p| !dev.contains(p));
-    paths.extend(dev.iter().cloned());
-    let mut mods: Vec<ContentMod> = Vec::new();
-    for path in &paths {
-        let Ok(package) = Package::read(path) else {
+    disabled: &std::collections::BTreeSet<String>,
+    dev: &[PathBuf],
+) -> horizon_client::Result<Arc<PreparedContent>> {
+    let home = Game::game_dir();
+    horizon_client::mod_registry::with_content_snapshot(&home, || {
+        let catalog = catalog::read(&home, dev, &Default::default())?;
+        let selected = Selection::wanted(&catalog.wanted_ids(enabled, disabled), &catalog);
+        content::build(root, &home, &selected, catalog, false).map_err(|error| error.to_string())
+    })?
+    .map_err(Into::into)
+}
+
+pub(super) fn rebuild_content(
+    root: &std::path::Path,
+    selection: &Selection,
+    catalog: Arc<Catalog>,
+) -> horizon_client::Result<Arc<PreparedContent>> {
+    content::build(root, &Game::game_dir(), selection, catalog, true)
+}
+
+/// Freeze native component IDs before reading content or opening a connection.
+/// With no mod registering any, nothing is installed, which every reader
+/// treats as no custom components, and `registries.json` isn't read.
+pub(super) fn register_components(root: &std::path::Path) -> horizon_client::Result<()> {
+    let mut names = Vec::new();
+    Game::native_component_types(&mut names);
+    if names.is_empty() {
+        return Ok(());
+    }
+    let path =
+        horizon_protocol::registry::Builtin::find(root).ok_or("registries.json not found")?;
+    let builtin = horizon_protocol::registry::Builtin::load(&path)?;
+    let types = builtin
+        .get("minecraft:data_component_type")
+        .ok_or("missing data component registry")?;
+    let first = i32::try_from(types.names.len())?;
+    horizon_protocol::item::custom::install(first, names)
+        .map_err(|error| format!("invalid native component registration: {error}"))?;
+    Ok(())
+}
+
+/// The blocks and items native mods declare in code (`native_blocks`,
+/// `native_items`): asked once, so every content root of this run, a pack
+/// reload's included, has the same ones.
+fn native_declared() -> &'static (
+    Vec<horizon_mods::content::Block>,
+    Vec<horizon_mods::content::Item>,
+) {
+    static DECLARED: std::sync::OnceLock<(
+        Vec<horizon_mods::content::Block>,
+        Vec<horizon_mods::content::Item>,
+    )> = std::sync::OnceLock::new();
+    DECLARED.get_or_init(|| {
+        let (mut blocks, mut items) = (Vec::new(), Vec::new());
+        Game::native_blocks(&mut blocks);
+        Game::native_items(&mut items);
+        (blocks, items)
+    })
+}
+/// The native mods' standalone models (`native_standalone_models`), set once
+/// before the resources first load.
+pub(super) fn register_standalone_models() {
+    let mut names = Vec::new();
+    Game::native_standalone_models(&mut names);
+    horizon_client::models::register_standalone(names);
+}
+/// The native mods' entity model layers (`native_layer_definitions`), kept
+/// once at start for `native_bake_layer`.
+pub(super) fn register_layer_definitions() {
+    let mut layers = Vec::new();
+    Game::native_layer_definitions(&mut layers);
+    horizon_client::mobs::model_layers::register(layers);
+}
+
+/// A loaded mod as a server tells joining clients (`horizon_protocol::mod_list`): its manifest's
+/// id, version and side, and the SHA-256 of its `.hmod` (none for a folder).
+fn announced_entry(
+    m: &horizon_mods::Manifest,
+    path: &std::path::Path,
+) -> horizon_protocol::mod_list::Entry {
+    use horizon_mods::Side;
+    use horizon_protocol::mod_list;
+    use sha2::{Digest, Sha256};
+    let sha256 = if path.is_file() {
+        std::fs::read(path)
+            .ok()
+            .map(|bytes| Sha256::digest(bytes).into())
+    } else {
+        None
+    };
+    mod_list::Entry {
+        id: m.id.clone(),
+        version: m.version.clone(),
+        sha256,
+        side: match m.side {
+            Side::Both => mod_list::Side::Both,
+            Side::Server => mod_list::Side::Server,
+            Side::Client => mod_list::Side::Client,
+        },
+    }
+}
+
+/// The mods' mob effects join vanilla's (`brewing::effect`), once the root
+/// holding their network ids is built. The startup root's effects, none
+/// included, stay until restart: a pack reload after a Mods switch builds a
+/// root with others.
+fn register_mob_effects(mods: &[horizon_client::mod_content::ContentMod]) {
+    use horizon_client::brewing::{self, Category};
+    use horizon_mods::content::EffectCategory;
+    let effects = horizon_client::mod_content::mob_effects(mods);
+    let ids: Vec<String> = effects.iter().map(|e| e.id.clone()).collect();
+    let set = brewing::register_mod_effects(effects.into_iter().map(|e| {
+        let category = match e.category {
+            EffectCategory::Beneficial => Category::Beneficial,
+            EffectCategory::Harmful => Category::Harmful,
+            EffectCategory::Neutral => Category::Neutral,
+        };
+        (e.id.clone(), e.color, category)
+    }));
+    if !set
+        && brewing::mod_effects()
+            .iter()
+            .map(|e| e.id)
+            .ne(ids.iter().map(String::as_str))
+    {
+        log::warn!("Horizon: the mods' mob effects changed; restart the game to use them");
+    }
+}
+
+/// the mods' thrown entity types, as their mob effects: set once, from the
+/// startup root. Living types are mobs, loaded with vanilla's from the
+/// content root's `entity-types.json`.
+fn register_entity_types(mods: &[horizon_client::mod_content::ContentMod]) {
+    use horizon_client::projectiles;
+    let mut types = horizon_client::mod_content::entity_types(mods);
+    types.retain(|t| t.item.is_some());
+    let set = projectiles::register_thrown_types(
+        types
+            .iter()
+            .filter_map(|t| Some((t.id.clone(), t.item.clone()?, t.damage))),
+    );
+    if !set
+        && projectiles::thrown_types()
+            .iter()
+            .map(|t| t.id)
+            .ne(types.iter().map(|t| t.id.as_str()))
+    {
+        log::warn!("Horizon: the mods' entity types changed; restart the game to use them");
+    }
+}
+
+/// the mods' menu types, as their entity types: set once, from the startup
+/// root.
+fn register_menu_types(mods: &[horizon_client::mod_content::ContentMod]) {
+    use horizon_client::containers;
+    let menus = horizon_client::mod_content::menu_types(mods);
+    let set = containers::register_mod_menu_types(menus.iter().map(|m| {
+        let results = m.results.iter().map(|&r| usize::from(r)).collect();
+        let crafting = m.crafting.map(|c| containers::ModCrafting {
+            grid: c.grid.into(),
+            size: c.size.into(),
+            result: c.result.into(),
+        });
+        let links = m.links.map(|l| containers::ModLinks {
+            from: l.from.into(),
+            count: l.count.into(),
+        });
+        (
+            m.id.clone(),
+            m.slots.into(),
+            m.data_slots.into(),
+            results,
+            crafting,
+            links,
+        )
+    }));
+    if !set
+        && containers::mod_menu_types()
+            .iter()
+            .map(|m| m.id)
+            .ne(menus.iter().map(|m| m.id.as_str()))
+    {
+        log::warn!("Horizon: the mods' menu types changed; restart the game to use them");
+    }
+}
+
+/// What the launcher writes beside a game it built with native mods: their ids under `mods`.
+const BUILD_INFO: &str = "native-mods.json";
+
+/// `native-mods.json`'s `mods` list is not empty: the game was built with mods.
+fn build_lists_mods(built: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(built)
+        .ok()
+        .and_then(|info| info["mods"].as_array().map(|mods| !mods.is_empty()))
+        .unwrap_or(false)
+}
+
+/// Whether the game playing was built with native mods: horizon-mixins applied bundles to its
+/// source (`HORIZON_MIXIN_MODS`, set by the build script from the record it leaves, as with a mod
+/// author's own build that has no [`BUILD_INFO`]), trait mods are installed, or the launcher wrote
+/// their ids into [`BUILD_INFO`] beside the executable. A release or Nightly has none of them.
+pub(super) fn built_with_native_mods() -> bool {
+    option_env!("HORIZON_MIXIN_MODS").is_some_and(|mods| !mods.is_empty())
+        || !crate::mod_api::mods().is_empty()
+        || std::env::current_exe()
+            .ok()
+            .and_then(|exe| std::fs::read_to_string(exe.with_file_name(BUILD_INFO)).ok())
+            .is_some_and(|built| build_lists_mods(&built))
+}
+
+/// The native mods the launcher built this game with, `id version, id version`, for the crash
+/// report (`built`: its [`BUILD_INFO`]). None for a release or Nightly, which have no mods.
+fn native_mods_detail(built: &str) -> Option<String> {
+    let info: serde_json::Value = serde_json::from_str(built).unwrap_or_default();
+    let list = info["mods"]
+        .as_array()?
+        .iter()
+        .map(|m| {
+            let text = |key: &str| m[key].as_str().unwrap_or("?").to_owned();
+            format!("{} {}", text("id"), text("version"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    (!list.is_empty()).then_some(list)
+}
+
+/// A row for each native mod the launcher installed in `dir` (`<id>.hnmod`) that this game wasn't
+/// built with (`built`: its [`BUILD_INFO`], empty for a release or Nightly) and that has no row
+/// yet. The page said "No mods" before, and players copied the files into `horizon-mods` (#4770).
+/// Its toggle is the `mod.<id>` line the launcher's next build follows.
+fn not_built(dir: &std::path::Path, built: &str, rows: &[Installed]) -> Vec<Installed> {
+    let info: serde_json::Value = serde_json::from_str(built).unwrap_or_default();
+    let in_build = |id: &str| {
+        info["mods"]
+            .as_array()
+            .is_some_and(|mods| mods.iter().any(|m| m["id"] == id))
+    };
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    paths.retain(|p| p.extension().is_some_and(|e| e == "hnmod"));
+    paths.sort();
+    let mut out: Vec<Installed> = Vec::new();
+    for path in paths {
+        let Ok(bundle) = horizon_mods::index::native::Bundle::read(&path) else {
             continue;
         };
-        let m = &package.manifest;
-        let on = enabled.contains(&m.id) || dev.contains(path);
-        if !on
-            || !m.capabilities.contains(&Capability::Registries)
-            || mods.iter().any(|c| c.id == m.id)
-        {
-            continue;
-        }
-        let content = Content::read(path, m).and_then(|content| {
-            // The first of two mods owning one namespace stays on.
-            let own = (m.id.as_str(), content.namespaces.as_slice());
-            match mods
-                .iter()
-                .find_map(|c| horizon_mods::content::clash((&c.id, &c.content.namespaces), own))
-            {
-                Some(e) => Err(e),
-                None => Ok(content),
-            }
-        });
-        match content {
-            Ok(content) => mods.push(ContentMod {
-                id: m.id.clone(),
-                content,
-            }),
-            Err(e) => log::warn!("Horizon: mod {} content not loaded: {e}", m.id),
+        let m = bundle.manifest;
+        let listed = rows.iter().chain(&out).any(|row| row.id == m.id);
+        if !listed && !in_build(&m.id) {
+            out.push(Installed {
+                title: format!("{} {}", m.id, m.version),
+                id: m.id,
+                description: String::new(),
+                problem: Some(mod_list::NOT_BUILT.to_owned()),
+                dev: false,
+                native: None,
+            });
         }
     }
-    match mod_content::resource_root(root, &mods, &here.join(".horizon-cache")) {
-        Ok(out) => {
-            if out != root {
-                log::info!(
-                    "Horizon: content from {} mod(s) in {}",
-                    mods.len(),
-                    out.display()
-                );
-            }
-            out
-        }
-        Err(e) => {
-            log::warn!("Horizon: content mods not loaded: {e}");
-            root.to_owned()
-        }
-    }
+    out
 }
 
-/// A build without the `mods` feature: no mod runs.
-#[cfg(not(feature = "mods"))]
+/// A WebAssembly code mod's row on the Mods page.
+const STOPPED: &str = "Doesn't run any more: needs a native port";
+/// The player was told once about the WebAssembly mods that stopped (`horizon-mods/<this>`).
+const NOTICE_SEEN: &str = ".native-notice";
+
 impl Game<'_> {
-    /// Says why the installed and dev mods don't run.
+    /// Lists the installed mods on the Mods page. Content mods load with the resources
+    /// (`content_root`); native ones are built into the game (`native_hooks.rs`). WebAssembly code
+    /// mods don't run any more: their rows say so, and the player hears it once in the chat
+    /// (`tell_native_now`).
     pub(super) fn start_mods(&mut self) {
-        let dir = Self::options_path().with_file_name(mod_list::DIR);
-        let found = horizon_mods::find(&dir).len() + self.mods.dev.len();
-        if found > 0 {
-            log::warn!(
-                "Horizon: {found} mod(s) not started: this build has no mod runtime (build with --features mods)"
-            );
+        if let Some(content) = &self.mods.content {
+            self.mods.catalog = Some(content.catalog.clone());
+            self.publish_mod_catalog();
+        }
+        self.sync_native_switches();
+        if self.options.execution_role.is_client() {
+            self.refresh_mod_catalog();
         }
     }
-    pub(super) fn sync_mods(&mut self) {}
-    pub(super) fn tick_mods(&mut self) {}
-    pub(super) fn mods_frame(&mut self, _elapsed: Duration) {}
-    pub(super) fn mod_command(&mut self, _command: &str) -> bool {
-        false
-    }
-    pub(super) fn mods_chat(&mut self, _line: &str) {}
-    pub(super) fn draw_mod_panels(&self, _batch: &mut HudBatch, _corners: &mut Corners) {}
-}
 
-#[cfg(feature = "mods")]
-impl Game<'_> {
-    /// Reads `horizon-mods/` and the dev mods, and starts the ones turned on.
-    pub(super) fn start_mods(&mut self) {
-        let dir = Self::options_path().with_file_name(mod_list::DIR);
-        let dev = &self.mods.dev;
-        let mut paths = horizon_mods::find(&dir);
-        paths.retain(|p| !dev.contains(p));
-        paths.extend(dev.iter().cloned());
-        // A dev mod is on whatever the list says.
-        let dev_ids: Vec<String> = dev
-            .iter()
-            .filter_map(|p| horizon_mods::Package::read(p).ok())
-            .map(|p| p.manifest.id)
-            .collect();
-        let enabled = &self.settings.mods.enabled;
-        let on = |id: &str| enabled.contains(id) || dev_ids.iter().any(|d| d == id);
-        let mods = Mods::load(&paths, on, vanilla_command);
-        self.mods.mods = mods;
-        self.list_mods();
-        self.sync_mod_commands();
-        self.show_mod_output();
-    }
-    /// The Mods page's rows, from what loaded.
-    fn list_mods(&mut self) {
-        let dev = &self.mods.dev;
-        self.settings.mods.installed = self
-            .mods
-            .mods
-            .entries()
-            .iter()
-            .map(|e| {
-                let file = e.path.file_name().unwrap_or_default().to_string_lossy();
-                let problem = match &e.status {
-                    Status::Failed(reason) => Some(format!("Stopped: {reason}")),
-                    _ => None,
-                };
-                let Some(m) = &e.manifest else {
-                    return Installed {
-                        id: String::new(),
-                        title: file.into_owned(),
-                        description: String::new(),
-                        problem,
-                        dev: false,
-                    };
-                };
-                // What it may do first: the row cuts long descriptions.
-                let may: Vec<&str> = m.capabilities.iter().map(|c| c.describe()).collect();
-                let may = if may.is_empty() {
-                    "Asks for nothing.".to_owned()
-                } else {
-                    format!("May {}.", may.join(", "))
-                };
-                Installed {
-                    id: m.id.clone(),
-                    title: format!("{} {}", m.name, m.version),
-                    description: format!("{may} {}", m.description).trim().to_owned(),
-                    problem,
-                    dev: dev.contains(&e.path),
-                }
+    fn refresh_mod_catalog(&mut self) {
+        if self.mods.catalog_job.is_some() {
+            self.mods.refresh_again = true;
+            return;
+        }
+        let home = Self::game_dir();
+        let dev = self.mods.dev.clone();
+        match super::mod_browser::OwnedJob::spawn("mod-catalogue", move |cancel| {
+            let _access =
+                horizon_client::import::acquire_home_access(&home).map_err(|e| e.to_string())?;
+            horizon_client::mod_registry::with_content_snapshot_managed(&home, &cancel, || {
+                catalog::read(&home, &dev, &cancel)
             })
-            .collect();
+            .map_err(|e| e.to_string())?
+        }) {
+            Ok(job) => self.mods.catalog_job = Some(job),
+            Err(error) => log::warn!("Horizon: mod catalogue refresh failed: {error}"),
+        }
     }
-    /// The chat's tree after the running mods changed.
-    fn sync_mod_commands(&mut self) {
-        let mut names = self.mods.mods.commands().peekable();
-        self.mods.tree = names
-            .peek()
-            .is_some()
-            .then(|| vanilla::game_dispatcher().with_mod_commands(names));
+
+    pub(super) fn poll_mod_catalog(&mut self) {
+        let Some(job) = &self.mods.catalog_job else {
+            return;
+        };
+        let result = match job.poll() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("mod catalogue worker stopped".into())
+            }
+        };
+        self.mods.catalog_job = None;
+        if self.mods.refresh_again {
+            self.mods.refresh_again = false;
+            self.refresh_mod_catalog();
+            return;
+        }
+        match result {
+            Ok(catalog) => {
+                self.mods.catalog = Some(catalog);
+                self.publish_mod_catalog();
+                self.switch_mods();
+            }
+            Err(error) => log::warn!("Horizon: mod catalogue not refreshed: {error}"),
+        }
     }
-    /// After the options changed: restart the mods if the list of the ones
-    /// turned on did.
-    pub(super) fn sync_mods(&mut self) {
-        let running: Vec<&str> = self
-            .mods
-            .mods
-            .entries()
-            .iter()
-            .filter(|e| e.status != Status::Off)
-            .filter_map(|e| Some(e.manifest.as_ref()?.id.as_str()))
-            .collect();
-        let wanted: Vec<&str> = self
+
+    fn publish_mod_catalog(&mut self) {
+        let Some(catalog) = self.mods.catalog.clone() else {
+            return;
+        };
+        self.settings.mods.installed = catalog.rows.clone();
+        self.list_native_mods();
+        self.sync_native_switches();
+        self.ui.options.mods_live = self.mods_live_now();
+        let detail = native_mods_detail(&catalog.built);
+        if let Some(list) = &detail {
+            horizon_client::crash::set_detail("Native Mods", list.clone());
+        }
+        horizon_client::gfx::native_render::set_mods_built_in(
+            detail.is_some()
+                || built_with_native_mods()
+                || self
+                    .settings
+                    .mods
+                    .installed
+                    .iter()
+                    .any(|m| m.native.is_some()),
+        );
+        self.mods.stopped = self
             .settings
             .mods
             .installed
             .iter()
-            .enumerate()
-            .filter(|&(i, _)| self.settings.mods.is_on(i))
-            .map(|(_, m)| m.id.as_str())
+            .filter(|row| row.problem.as_deref() == Some(STOPPED))
+            .map(|row| row.title.clone())
             .collect();
-        if running != wanted {
-            self.start_mods();
+    }
+
+    pub(super) fn mods_live_now(&self) -> std::collections::BTreeSet<String> {
+        if self.integrated.is_none() && self.remote.is_some() {
+            return Default::default();
         }
+        self.mods
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| entry.live)
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
-    /// What mods read this tick.
-    fn mod_snapshot(&self) -> Snapshot {
-        let player = self.player.as_ref().map(|p| Player {
-            x: p.position.x,
-            y: p.position.y,
-            z: p.position.z,
-            yaw: self.yaw,
-            pitch: self.pitch,
-            health: p.health.health(),
-            food: p.health.food.food.max(0) as u32,
-            dimension: self.dim.id().to_owned(),
-        });
-        let clock = player.is_some().then(|| Clock {
-            game_time: self.world.game_time.max(0) as u64,
-            day_time: self.world.day_time.max(0) as u64,
-        });
-        Snapshot { player, clock }
-    }
-    /// A game tick.
-    pub(super) fn tick_mods(&mut self) {
-        if !self.mods.mods.is_running() {
-            return;
-        }
-        let snapshot = self.mod_snapshot();
-        self.mods.mods.set_snapshot(snapshot);
-        self.mods.mods.tick(self.ticks);
-        self.show_mod_output();
-    }
-    /// Once per frame: the frame hook, and dev mods' rebuilds.
-    pub(super) fn mods_frame(&mut self, elapsed: Duration) {
-        if !self.mods.dev.is_empty()
-            && self
-                .mods
-                .checked
-                .is_none_or(|t| t.elapsed() >= RELOAD_CHECK)
+
+    pub(super) fn requested_mod_selection(&self) -> (Selection, Arc<Catalog>) {
+        if self.remote.is_some()
+            && self.integrated.is_none()
+            && let Some(content) = &self.mods.content
         {
-            self.mods.checked = Some(Instant::now());
-            if self.mods.mods.reload_changed(vanilla_command) {
-                self.list_mods();
-                self.sync_mod_commands();
-                self.system_message(Text::literal("Mods reloaded").with_color(text::GRAY));
-            }
+            return (content.selection.clone(), content.catalog.clone());
         }
-        if !self.mods.mods.is_running() {
+        let catalog = self.mods.catalog.clone().unwrap_or_default();
+        let selection = self
+            .mods
+            .pending
+            .clone()
+            .or_else(|| {
+                self.mods
+                    .content
+                    .as_ref()
+                    .map(|content| content.selection.clone())
+            })
+            .unwrap_or_default();
+        (selection, catalog)
+    }
+
+    pub(super) fn switch_mods(&mut self) {
+        let (Some(applied), Some(catalog)) = (&self.mods.content, &self.mods.catalog) else {
+            return;
+        };
+        let plan = catalog::switch_plan(
+            &applied.selection,
+            &catalog.wanted_ids(&self.settings.mods.enabled, &self.settings.mods.disabled),
+            catalog,
+            self.integrated.is_some() || self.remote.is_none(),
+        );
+        self.ui.options.mods_note = (!plan.waiting.is_empty()).then(|| {
+            lang::tr(
+                "horizon.mods.switch.restart",
+                &[&plan.waiting.into_iter().collect::<Vec<_>>().join(", ")],
+            )
+        });
+        if self.mods.pending.as_ref() == Some(&plan.next) {
             return;
         }
-        self.mods.mods.frame(elapsed.as_secs_f32());
-        self.show_mod_output();
-    }
-    /// `/command` typed in chat: true when a mod owns it.
-    pub(super) fn mod_command(&mut self, command: &str) -> bool {
-        if !self.mods.mods.is_running() {
-            return false;
+        if plan.next == applied.selection && self.mods.pending.is_none() {
+            return;
         }
-        // The command may follow a teleport in the same tick.
-        let snapshot = self.mod_snapshot();
-        self.mods.mods.set_snapshot(snapshot);
-        if !self.mods.mods.command(command) {
-            return false;
+        self.mods.pending = Some(plan.next);
+        self.mods.live = Some(std::time::Instant::now());
+        self.reload_packs();
+    }
+
+    /// Only a successfully installed resource generation becomes applied.
+    pub(super) fn mods_reloaded(&mut self, success: bool) {
+        if !success {
+            return;
         }
-        self.show_mod_output();
-        true
-    }
-    /// A chat line the player received.
-    pub(super) fn mods_chat(&mut self, line: &str) {
-        self.mods.mods.chat(line);
-        self.show_mod_output();
-    }
-    /// Chat lines, command feedback and stopped mods, into the chat.
-    fn show_mod_output(&mut self) {
-        for output in self.mods.mods.drain() {
-            let line = match output {
-                Output::Chat { name, text } => {
-                    let mut line = Text::literal(format!("[{name}] ")).with_color(text::GRAY);
-                    line.push(Text::literal(text));
-                    line
-                }
-                Output::Feedback { text, error: false } => Text::literal(text),
-                Output::Feedback { text, error: true } => Text::literal(text).with_color(text::RED),
-                Output::Stopped { name, reason } => {
-                    self.list_mods();
-                    self.sync_mod_commands();
-                    Text::literal(format!("Mod {name} stopped: {reason}")).with_color(text::RED)
-                }
-            };
-            // Not through system_message: a mod must not hear its own lines.
-            let focused = self.screen == Screen::Chat;
-            self.ui
-                .chat
-                .add(&self.gui.atlas, line, None, self.ticks, focused);
+        let Some(content) = self.pack.content.clone() else {
+            return;
+        };
+        self.mods.content = Some(content.clone());
+        self.mods.data_switched |= self.mods.live.is_some();
+        if self.mods.pending.as_ref() == Some(&content.selection) {
+            self.mods.pending = None;
+            self.mods.live = None;
         }
     }
-    /// The mods' HUD panels, stacked with the extras in their corners.
-    pub(super) fn draw_mod_panels(&self, batch: &mut HudBatch, corners: &mut Corners) {
-        for panel in self.mods.mods.panels() {
-            let corner = match panel.corner {
-                horizon_mods::Corner::TopLeft => Corner::TopLeft,
-                horizon_mods::Corner::TopRight => Corner::TopRight,
-                horizon_mods::Corner::BottomLeft => Corner::BottomLeft,
-                horizon_mods::Corner::BottomRight => Corner::BottomRight,
-            };
-            // F3 takes the top left, as it does from the extras.
-            if self.debug && corner == Corner::TopLeft {
-                continue;
+
+    pub(super) fn shutdown_mod_catalog(&mut self) -> bool {
+        self.mods.transaction = None;
+        self.mods
+            .catalog_job
+            .as_ref()
+            .is_none_or(|job| job.shutdown())
+    }
+    /// Trait mods follow the player's switches at once
+    /// (`mod_api::set_mod_on`): the next dispatch skips a mod turned off.
+    /// Mixin code checks `native_on` itself.
+    pub(super) fn sync_native_switches(&self) {
+        for id in horizon_client::mod_api::mod_ids() {
+            let on = !self.settings.mods.disabled.contains(*id);
+            horizon_client::mod_api::set_mod_on(id, on);
+        }
+    }
+    /// Once, in the first world after the update: which WebAssembly mods stopped.
+    pub(super) fn tell_native_now(&mut self) {
+        if self.mods.stopped.is_empty() || self.player.is_none() {
+            return;
+        }
+        let names = std::mem::take(&mut self.mods.stopped).join(", ");
+        let seen = Self::game_dir().join(mod_list::DIR).join(NOTICE_SEEN);
+        if seen.exists() {
+            return;
+        }
+        self.system_message(Text::literal(format!(
+            "Horizon mods are native now: {names} stopped running until they have a native version. The launcher's Mods page has the native ones."
+        )));
+        let _ = std::fs::write(&seen, "");
+    }
+}
+
+/// Mob types loaded from a scratch root whose `entity-types.json` has a
+/// zombie, a villager, and the rows a content root writes for a mod's types
+/// (`mod_content`): `ruby:ghoul` (a zombie with 40 health), `ruby:settler` (a
+/// villager as it is) and `ruby:bolt` (a thrown snowball, not a mob).
+#[cfg(test)]
+pub(super) fn living_mod_types()
+-> std::collections::HashMap<String, std::sync::Arc<horizon_client::mobs::MobType>> {
+    let zombie =
+        r#""width":0.6,"height":1.95,"eye_height":1.74,"category":"monster","fire_immune":false"#;
+    let villager =
+        r#""width":0.6,"height":1.95,"eye_height":1.62,"category":"misc","fire_immune":false"#;
+    let trader =
+        r#""width":0.6,"height":1.95,"eye_height":1.62,"category":"creature","fire_immune":false"#;
+    let table = format!(
+        r#"{{"minecraft:zombie":{{{zombie},"attributes":{{"minecraft:max_health":20.0,"minecraft:movement_speed":0.23000000417232513}}}},
+        "minecraft:villager":{{{villager},"attributes":{{"minecraft:max_health":20.0,"minecraft:movement_speed":0.5}}}},
+        "minecraft:wandering_trader":{{{trader},"attributes":{{"minecraft:max_health":20.0,"minecraft:movement_speed":0.7}}}},
+        "minecraft:snowball":{{"width":0.25,"height":0.25,"eye_height":0.0,"category":"misc","fire_immune":false}},
+        "ruby:ghoul":{{{zombie},"attributes":{{"minecraft:max_health":40.0,"minecraft:movement_speed":0.23000000417232513}},"template":"minecraft:zombie"}},
+        "ruby:settler":{{{villager},"attributes":{{"minecraft:max_health":20.0,"minecraft:movement_speed":0.5}},"template":"minecraft:villager"}},
+        "ruby:merchant":{{{trader},"attributes":{{"minecraft:max_health":20.0,"minecraft:movement_speed":0.7}},"template":"minecraft:wandering_trader"}},
+        "ruby:bolt":{{"width":0.25,"height":0.25,"eye_height":0.0,"category":"misc","fire_immune":false,"template":"minecraft:snowball"}}}}"#
+    );
+    // A folder per call: tests run in parallel in one process, and each removes its own.
+    static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "horizon-living-mod-types-{}-{call}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("entity-types.json"), table).unwrap();
+    let types = horizon_client::mobs::MobTypes::load_for_server(&root).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    types
+        .types
+        .into_iter()
+        .map(|(id, t)| (id, std::sync::Arc::new(t)))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sound_mod_dispatch_changes_real_channels_and_cancellation_short_circuits() {
+        use crate::mod_api::{Flow, Hooks, SoundPlayEvent};
+        use horizon_client::sound_engine::{
+            Attenuation, PlayResult, SoundEngine, SoundInstance, test_backend,
+        };
+        use horizon_client::sound_events::SoundRegistry;
+        use horizon_core::random::LegacyRandom;
+        struct First;
+        impl Hooks for First {
+            fn sound_play(&self, event: &mut SoundPlayEvent<'_>) -> Flow {
+                assert_eq!(event.sound.identifier, "test:beep");
+                event.volume *= 0.5;
+                Flow::Continue
             }
-            let lines: Vec<(&str, u32)> = panel
-                .lines
-                .iter()
-                .map(|l| (l.text.as_str(), l.color))
-                .collect();
-            extras_hud::draw_lines(batch, &self.gui.atlas, corners, corner, &lines);
         }
+        struct Second;
+        impl Hooks for Second {
+            fn sound_play(&self, event: &mut SoundPlayEvent<'_>) -> Flow {
+                assert_eq!(event.volume, 0.4);
+                event.pitch = 2.0;
+                Flow::Continue
+            }
+        }
+        struct Cancel;
+        impl Hooks for Cancel {
+            fn sound_play(&self, _: &mut SoundPlayEvent<'_>) -> Flow {
+                Flow::Cancel
+            }
+        }
+        struct Never;
+        impl Hooks for Never {
+            fn sound_play(&self, _: &mut SoundPlayEvent<'_>) -> Flow {
+                panic!("dispatch after cancellation")
+            }
+        }
+        static MODS: std::sync::LazyLock<Vec<Box<dyn Hooks>>> =
+            std::sync::LazyLock::new(|| vec![Box::new(First), Box::new(Second)]);
+        static CANCEL: std::sync::LazyLock<Vec<Box<dyn Hooks>>> =
+            std::sync::LazyLock::new(|| vec![Box::new(Cancel), Box::new(Never)]);
+        let mut registry = SoundRegistry::default();
+        registry.add_file("test", br#"{"beep":{"sounds":["beep"]}}"#, &|_, _| true);
+        let mut engine = SoundEngine::new(registry);
+        engine.listening = true;
+        let mut backend = test_backend::Null::default();
+        let instance = || {
+            SoundInstance::new(
+                "test:beep",
+                4,
+                0.8,
+                1.0,
+                LegacyRandom::new(1),
+                false,
+                0,
+                Attenuation::None,
+                [0.0; 3],
+                true,
+            )
+        };
+        engine.set_test_playback_hook(|sound, volume, pitch, cancel| {
+            crate::mod_api::dispatch_sound_play(&MODS, sound, volume, pitch, cancel)
+        });
+        let (id, result) = engine.play_new(instance(), false, &mut backend);
+        assert_eq!(result, PlayResult::Started);
+        let channel = engine.channel(id).unwrap();
+        assert_eq!(backend.volume[&channel], 0.4);
+        assert_eq!(backend.pitch[&channel], 2.0);
+        let notifications = engine.notifications.len();
+        engine.set_test_playback_hook(|sound, volume, pitch, cancel| {
+            crate::mod_api::dispatch_sound_play(&CANCEL, sound, volume, pitch, cancel)
+        });
+        let (_, result) = engine.play_new(instance(), false, &mut backend);
+        assert_eq!(result, PlayResult::NotStarted);
+        assert_eq!(backend.volume.len(), 1);
+        assert_eq!(engine.notifications.len(), notifications);
+    }
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    #[ignore = "prepared resources: run explicitly for native content"]
+    fn built_native_sound_content_reaches_the_resource_root_and_obeys_disable() {
+        let base = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
+        );
+        let scratch =
+            std::env::temp_dir().join(format!("horizon-native-content-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let version = scratch.join("version");
+        let home = scratch.join("game");
+        std::fs::create_dir_all(&home).unwrap();
+        let content = version.join("native-content/soundproof");
+        std::fs::create_dir_all(content.join("assets/soundproof/sounds")).unwrap();
+        std::fs::write(content.join("horizon-mod.toml"), "id=\"soundproof\"\nname=\"Sound proof\"\nversion=\"1\"\napi=\"0.2\"\ncapabilities=[\"registries\"]\n").unwrap();
+        std::fs::write(
+            content.join("assets/soundproof/sounds.json"),
+            r#"{"proof":{"sounds":["soundproof:proof"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            content.join("assets/soundproof/sounds/proof.ogg"),
+            b"synthetic existence marker; no audio decode",
+        )
+        .unwrap();
+        let legacy = home.join(mod_list::DIR).join("soundproof");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::copy(
+            content.join("horizon-mod.toml"),
+            legacy.join("horizon-mod.toml"),
+        )
+        .unwrap();
+        let enabled = ["soundproof".to_owned()].into();
+        let empty = Default::default();
+        let catalog =
+            catalog::read_at(&home, &[], &Default::default(), Some(&version), |_| {}).unwrap();
+        let build = |enabled, disabled| {
+            let selection = Selection::wanted(&catalog.wanted_ids(enabled, disabled), &catalog);
+            content::build(&base, &home, &selection, catalog.clone(), false).unwrap()
+        };
+        let loaded = build(&empty, &empty);
+        let root = &loaded.root;
+        assert_ne!(*root, base);
+        let sounds = horizon_client::sound_events::SoundRegistry::load(&root);
+        assert!(!sounds.tracks("soundproof:proof").is_empty());
+        let disabled = ["soundproof".to_owned()].into();
+        let off = build(&enabled, &disabled).root.clone();
+        assert_eq!(off, base, "disabled native mods contribute no assets");
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    /// A content mod's living type is a mob of its template's species under
+    /// its own id, with its own attributes: it saves its id with every field
+    /// its template's class saves, loads back as itself, and rolls its own
+    /// loot table. A thrown type stays a projectile.
+    #[test]
+    fn a_mod_living_type_is_its_templates_mob_with_its_own_attributes() {
+        use horizon_client::mobs::{Mob, Species, drops::death_loot_table};
+        use horizon_core::geometry::Vec3;
+        let types = living_mod_types();
+        let (zombie, ghoul) = (&types["minecraft:zombie"], &types["ruby:ghoul"]);
+        assert_eq!(ghoul.species, Species::Zombie);
+        assert_eq!(ghoul.class_id(), "minecraft:zombie");
+        assert_eq!(types["ruby:settler"].species, Species::Villager);
+        assert!(!types.contains_key("ruby:bolt"), "a thrown type is no mob");
+        assert_eq!((zombie.max_health, ghoul.max_health), (20.0, 40.0));
+        assert_eq!(ghoul.speed.to_bits(), zombie.speed.to_bits());
+        assert_eq!(
+            (ghoul.sounds, ghoul.texture.as_str()),
+            (zombie.sounds, zombie.texture.as_str())
+        );
+
+        let at = Vec3::new(0.5, 64.0, 0.5);
+        let (zombie, ghoul) = (
+            Mob::new(1, zombie.clone(), at, 0.0),
+            Mob::new(2, ghoul.clone(), at, 0.0),
+        );
+        assert_eq!(ghoul.health, 40.0);
+        let saved =
+            |m: &Mob| horizon_client::entity_nbt::mob_to_nbt(m, [0, 0, 0, 2], None, None, |_| None);
+        let keys = |tag: &horizon_world::nbt::Tag| -> Vec<String> {
+            let horizon_world::nbt::Tag::Compound(map) = tag else {
+                panic!("a mob saves a compound");
+            };
+            map.keys().map(|k| k.to_string_lossy()).collect()
+        };
+        let (zombie_tag, ghoul_tag) = (saved(&zombie), saved(&ghoul));
+        let Some(horizon_world::nbt::Tag::String(id)) = ghoul_tag.get("id") else {
+            panic!("a saved mob has its id");
+        };
+        assert_eq!(id.to_string_lossy(), "ruby:ghoul");
+        assert_eq!(
+            keys(&ghoul_tag),
+            keys(&zombie_tag),
+            "it saves what a zombie saves"
+        );
+        for key in ["IsBaby", "CanBreakDoors", "DrownedConversionTime"] {
+            assert!(keys(&ghoul_tag).iter().any(|k| k == key), "{key}");
+        }
+        let loaded = horizon_client::entity_nbt::mob_from_nbt(&ghoul_tag, &types, 3, None)
+            .expect("it loads back");
+        assert_eq!(
+            (loaded.kind.id.as_str(), loaded.health),
+            ("ruby:ghoul", 40.0)
+        );
+        assert_eq!(
+            death_loot_table(&ghoul, true).as_deref(),
+            Some("ruby:entities/ghoul")
+        );
+        assert_eq!(
+            death_loot_table(&zombie, true).as_deref(),
+            Some("minecraft:entities/zombie")
+        );
+    }
+
+    /// A content mod's type from the wandering trader, the neutral template
+    /// whose behaviour is all goals: a trader under its own id, with a
+    /// trader's goals, that saves what a trader saves and loads back.
+    #[test]
+    fn a_mod_trader_type_is_a_wandering_trader_under_its_own_id() {
+        use horizon_client::mobs::{Mob, Species};
+        use horizon_world::nbt::Tag;
+        let types = living_mod_types();
+        let merchant = &types["ruby:merchant"];
+        assert_eq!(merchant.species, Species::WanderingTrader);
+        assert_eq!(merchant.class_id(), "minecraft:wandering_trader");
+        let at = horizon_core::geometry::Vec3::new(0.5, 64.0, 0.5);
+        let trader = Mob::new(1, types["minecraft:wandering_trader"].clone(), at, 0.0);
+        let merchant = Mob::new(2, merchant.clone(), at, 0.0);
+        assert!(merchant.ai.goals.has("Float") && trader.ai.goals.has("Float"));
+        let saved =
+            |m: &Mob| horizon_client::entity_nbt::mob_to_nbt(m, [0, 0, 0, 2], None, None, |_| None);
+        let keys = |tag: &Tag| -> Vec<String> {
+            let Tag::Compound(map) = tag else {
+                panic!("a mob saves a compound");
+            };
+            map.keys().map(|k| k.to_string_lossy()).collect()
+        };
+        let tag = saved(&merchant);
+        assert_eq!(
+            keys(&tag),
+            keys(&saved(&trader)),
+            "it saves what a trader saves"
+        );
+        let loaded =
+            horizon_client::entity_nbt::mob_from_nbt(&tag, &types, 3, None).expect("it loads back");
+        assert_eq!(
+            (loaded.kind.id.as_str(), loaded.species()),
+            ("ruby:merchant", Species::WanderingTrader)
+        );
+    }
+
+    /// Content classification belongs to the immutable generation, not a mutable
+    /// folder's mtime. A developer edit is reflected by the next catalogue, while
+    /// an already installed generation retains its original live-switch verdict.
+    #[test]
+    fn a_mods_live_switch_verdict_follows_its_pinned_generation() {
+        let dir = std::env::temp_dir().join(format!("horizon-verdict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ruby = dir.join("ruby");
+        std::fs::create_dir_all(ruby.join("assets/ruby/lang")).unwrap();
+        std::fs::create_dir_all(ruby.join("data/ruby")).unwrap();
+        std::fs::write(ruby.join("assets/ruby/lang/en_us.json"), "{}").unwrap();
+        std::fs::write(
+            ruby.join("horizon-mod.toml"),
+            r#"id = "ruby"
+name = "Ruby"
+version = "0.1.0"
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
+"#,
+        )
+        .unwrap();
+        let read =
+            || catalog::read(&dir, std::slice::from_ref(&ruby), &Default::default()).unwrap();
+        let original = read();
+        let original_entry = original.entries["ruby"].clone();
+        assert!(original_entry.live);
+        let enabled = std::collections::BTreeSet::from(["ruby".into()]);
+        let running = Selection::wanted(&enabled, &original);
+        let unchanged = read();
+        assert_eq!(unchanged.entries["ruby"].revision, original_entry.revision);
+        assert!(
+            catalog::switch_plan(&running, &enabled, &unchanged, true)
+                .waiting
+                .is_empty()
+        );
+        let worldgen = ruby.join("data/ruby/worldgen/configured_feature");
+        std::fs::create_dir_all(&worldgen).unwrap();
+        std::fs::write(worldgen.join("ore.json"), "{}").unwrap();
+        let edited = read();
+        assert!(!edited.entries["ruby"].live);
+        assert_ne!(edited.entries["ruby"].revision, original_entry.revision);
+        assert!(
+            original_entry.live,
+            "the running snapshot keeps its original classification"
+        );
+        assert!(
+            !original_entry
+                .source
+                .join("data/ruby/worldgen/configured_feature/ore.json")
+                .exists()
+        );
+        let plan = catalog::switch_plan(&running, &enabled, &edited, true);
+        assert_eq!(plan.waiting, enabled);
+        assert_eq!(plan.next, running, "worldgen changes wait for restart");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The mods read on threads at once come back in the order given, each with its own
+    /// files, and a refused mod's error stays with that mod alone.
+    #[test]
+    fn pinned_mods_keep_their_order_and_their_own_errors() {
+        let dir = std::env::temp_dir().join(format!("horizon-read-at-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths: Vec<PathBuf> = (0..12).map(|i| dir.join(format!("m{i}"))).collect();
+        for (i, path) in paths.iter().enumerate() {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(
+                path.join("horizon-mod.toml"),
+                format!(
+                    "id = \"m{i}\"\nname = \"M\"\nversion = \"0.1.0\"\napi = \"0.2\"\n\
+                     side = \"both\"\ncapabilities = [\"registries\"]\n"
+                ),
+            )
+            .unwrap();
+            // Mod i has i + 1 language files; mod 5 also writes into another mod's namespace.
+            let lang = path.join(format!("assets/m{i}/lang"));
+            std::fs::create_dir_all(&lang).unwrap();
+            for n in 0..=i {
+                std::fs::write(lang.join(format!("l{n}.json")), "{}").unwrap();
+            }
+            if i == 5 {
+                std::fs::create_dir_all(path.join("assets/m0/lang")).unwrap();
+                std::fs::write(path.join("assets/m0/lang/x.json"), "{}").unwrap();
+            }
+        }
+        let catalog = catalog::read_at(&dir, &paths, &Default::default(), None, |_| {}).unwrap();
+        let expected: Vec<_> = (0..12)
+            .filter(|i| *i != 5)
+            .map(|i| format!("m{i}"))
+            .collect();
+        assert_eq!(catalog.order, expected);
+        assert!(catalog.invalid.contains("m5"));
+        for (i, path) in paths.iter().enumerate().filter(|(i, _)| *i != 5) {
+            let entry = &catalog.entries[&format!("m{i}")];
+            assert_ne!(&entry.source, path);
+            let package = horizon_mods::Package::read(&entry.source).unwrap();
+            let content = horizon_mods::Content::read(&entry.source, &package.manifest).unwrap();
+            assert_eq!(content.files.len(), i + 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Only a build whose `native-mods.json` lists a mod counts as built with mods.
+    #[test]
+    fn only_a_listed_mod_makes_a_build_a_mod_build() {
+        assert!(!build_lists_mods(""));
+        assert!(!build_lists_mods("{}"));
+        assert!(!build_lists_mods(r#"{"mods":[]}"#));
+        assert!(!build_lists_mods(r#"{"mods":"worldmap"}"#));
+        assert!(build_lists_mods(r#"{"mods":[{"id":"worldmap"}]}"#));
+    }
+
+    /// A minimal `.hnmod` the registry accepts: its manifest and its mixin's.
+    fn hnmod(dir: &std::path::Path, id: &str) {
+        let horizon = "a".repeat(40);
+        let manifest = serde_json::json!({
+            "schema": 1, "id": id, "version": "0.3.0", "game": "26.3",
+            "horizon": horizon, "mixins": "b".repeat(40),
+        });
+        let mixin = format!(
+            "[mod]\nid = \"{id}\"\nversion = \"0.3.0\"\n[compatibility]\nhorizon_revision = \"{horizon}\"\n"
+        );
+        let file = std::fs::File::create(dir.join(format!("{id}.hnmod"))).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("horizon-native.json", options).unwrap();
+        zip.write_all(manifest.to_string().as_bytes()).unwrap();
+        zip.start_file(format!("mixins/{id}/horizon-mixin.toml"), options)
+            .unwrap();
+        zip.write_all(mixin.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn the_crash_report_lists_the_builds_native_mods() {
+        let built = r#"{"mods":[{"id":"machine_sample","version":"0.1.0","sha256":null},{"id":"pipes","version":"2.0"}]}"#;
+        assert_eq!(
+            native_mods_detail(built).as_deref(),
+            Some("machine_sample 0.1.0, pipes 2.0")
+        );
+        // A release has no file; a build without mods has an empty list.
+        assert_eq!(native_mods_detail(""), None);
+        assert_eq!(native_mods_detail(r#"{"mods":[]}"#), None);
+    }
+
+    #[test]
+    fn native_mods_installed_but_not_built_get_a_row_saying_so() {
+        let dir = std::env::temp_dir().join(format!("horizon-not-built-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for id in ["veinminer", "zoom", "minimap"] {
+            hnmod(&dir, id);
+        }
+        std::fs::write(dir.join("notes.txt"), "not a mod").unwrap();
+        std::fs::write(dir.join("broken.hnmod"), "not a zip").unwrap();
+        // A release: none is built in; the page lists them, sorted, instead of "No mods".
+        let rows = not_built(&dir, "", &[]);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["minimap", "veinminer", "zoom"]);
+        assert_eq!(rows[1].title, "veinminer 0.3.0");
+        assert_eq!(rows[1].problem.as_deref(), Some(mod_list::NOT_BUILT));
+        assert!(rows.iter().all(|r| r.native.is_none() && !r.dev));
+        // A native build with zoom, and minimap's row already listed by its own hook.
+        let built =
+            r#"{"base":"nightly-2026-10-30-1da354b","mods":[{"id":"zoom","version":"0.3.0"}]}"#;
+        let listed = Installed {
+            id: "minimap".into(),
+            ..rows[0].clone()
+        };
+        let rows = not_built(&dir, built, &[listed]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "veinminer");
+        // No folder: no rows.
+        assert!(not_built(&dir.join("missing"), "", &[]).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A trait mod's `register_goals` (`Mob.registerGoals`) gets every new
+    /// mob: the goals of its type replace its template's, its `Float` goal
+    /// floats the navigation as FloatGoal's constructor does, and the
+    /// template's other types keep their goals. The only test here that
+    /// installs the client library's hooks.
+    #[test]
+    fn a_mods_register_goals_replaces_its_types_goals() {
+        use horizon_client::mobs::{
+            Mob,
+            goals::{self, Cx, Goal},
+        };
+        use horizon_client::mod_api::{Hooks, RegisterGoalsEvent, dispatch_register_goals};
+        use horizon_client::native_client_hooks::{NativeClientHooks, install};
+        use horizon_core::geometry::Vec3;
+        // docs/native-mods.md's example.
+        #[derive(Clone, Debug)]
+        struct ToPost {
+            post: [f64; 3],
+        }
+        impl Goal for ToPost {
+            fn flags(&self) -> u8 {
+                goals::MOVE
+            }
+            fn can_use(&mut self, m: &mut Mob, _: &mut Cx) -> bool {
+                let [x, y, z] = self.post;
+                let (dx, dy, dz) = (m.position.x - x, m.position.y - y, m.position.z - z);
+                dx * dx + dy * dy + dz * dz > 16.0
+            }
+            fn can_continue(&mut self, m: &mut Mob, _: &mut Cx) -> bool {
+                !m.ai.nav.is_done()
+            }
+            fn start(&mut self, m: &mut Mob, cx: &mut Cx) {
+                m.nav_move_to(cx.w, self.post, 1.0);
+            }
+            fn box_clone(&self) -> Box<dyn Goal> {
+                Box::new(self.clone())
+            }
+        }
+        struct Guards;
+        impl Hooks for Guards {
+            fn register_goals(&self, event: &mut RegisterGoalsEvent<'_>) {
+                if event.mob.kind.id == "ruby:guard" {
+                    let ai = &mut event.mob.ai;
+                    ai.goals.clear();
+                    ai.targets.clear();
+                    ai.goals.add(0, goals::Float);
+                    ai.goals.add(
+                        1,
+                        ToPost {
+                            post: [0.5, 64.0, 0.5],
+                        },
+                    );
+                }
+            }
+        }
+        static MODS: std::sync::LazyLock<Vec<Box<dyn Hooks>>> =
+            std::sync::LazyLock::new(|| vec![Box::new(Guards)]);
+        let installed = install(NativeClientHooks {
+            menu_slot_rules: |_, _, _, _, _| {},
+            sound_play: |_, _, _, _| {},
+            living_heal: |_, _, _| {},
+            player_chat: |_, _, _, _, _| {},
+            player_chat_v2: |_, _, _, _, _, _| {},
+            chat_decorate: |_, _, _, _| {},
+            living_breathe: |_, _, _, _, _| {},
+            living_drown: |_, _, _, _, _, _| {},
+            living_fall: |_, _, _, _, _| {},
+            living_jump: |_, _| {},
+            register_goals: |mob| dispatch_register_goals(&MODS, mob),
+            player_pre_login: |_, _, _, _| {},
+            player_profile: |_, _, _| {},
+            ingredient: |_, _, _| {},
+            ingredient_test: |_, _, _, _| {},
+            log_line: |_, _, _, _| {},
+            living_death_message: |_, _, _| {},
+            handshake: |_, _, _, _, _| {},
+        });
+        assert!(installed.is_ok());
+
+        let types = living_mod_types();
+        let mut guard = (*types["ruby:ghoul"]).clone();
+        guard.id = "ruby:guard".into();
+        let at = Vec3::new(0.5, 64.0, 0.5);
+        let guard = Mob::new(1, std::sync::Arc::new(guard), at, 0.0);
+        let ghoul = Mob::new(2, types["ruby:ghoul"].clone(), at, 0.0);
+        assert!(guard.ai.goals.has("Float") && guard.ai.goals.has("ToPost"));
+        assert!(!guard.ai.goals.has("RandomLookAround"));
+        assert!(!guard.ai.targets.has("NearestTarget"));
+        assert!(guard.ai.nav.can_float);
+        assert!(ghoul.ai.goals.has("RandomLookAround") && !ghoul.ai.goals.has("ToPost"));
+        assert!(ghoul.ai.targets.has("NearestTarget"));
+        assert!(!ghoul.ai.nav.can_float, "a zombie has no FloatGoal");
     }
 }

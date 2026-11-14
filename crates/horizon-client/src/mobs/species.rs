@@ -94,6 +94,7 @@ pub enum Species {
     Nautilus,
     ZombieNautilus,
     SulfurCube,
+    Mannequin,
 }
 /// Baby bounding boxes (each class's BABY_DIMENSIONS).
 #[derive(Clone, Copy, Debug)]
@@ -1307,9 +1308,90 @@ pub const ALL: &[Def] = &[
         None,
         Baby::None
     ),
+    // Mannequin: the player model; the DATA_PROFILE ResolvableProfile picks
+    // its skin, this texture only while that has none.
+    def!(
+        Mannequin,
+        "mannequin",
+        "player#main",
+        "entity/player/wide/steve",
+        A::Humanoid { zombie_arms: false },
+        ["", "entity.generic.hurt", "entity.generic.death"],
+        None,
+        Baby::None
+    ),
 ];
 pub fn def(s: Species) -> &'static Def {
     ALL.iter().find(|d| d.species == s).unwrap_or(&ALL[0])
+}
+/// `AgeableMob.canBeABaby`: the species `Mob::is_baby` can ever answer `true`
+/// for, which is what lets `getAge() < 0` mean "a baby" rather than "an age".
+///
+/// `canBeABaby` is `true` across the ageable tree but for the six classes
+/// that override it to `false` — `Frog`, `Parrot`, `ZombieNautilus`,
+/// `CamelHusk`, `Slime` and `MagmaCube`, the last two being `AbstractCubeMob`s
+/// and so `AgeableMob`s themselves — and the zombies, the piglins and the
+/// zoglin answer a synced `DATA_BABY_ID` rather than an age. Everything else
+/// inherits `LivingEntity.isBaby`, which is `false`: a `Giant`, a `Creeper`,
+/// a `PiglinBrute` or a `Tadpole` stays an adult however negative its `Age`.
+pub fn can_be_a_baby(s: Species) -> bool {
+    use Species as S;
+    matches!(
+        s,
+        S::Armadillo
+            | S::Axolotl
+            | S::Bee
+            | S::Camel
+            | S::Cat
+            | S::Chicken
+            | S::Cow
+            | S::Dolphin
+            | S::Donkey
+            | S::Drowned
+            | S::Fox
+            | S::GlowSquid
+            | S::Goat
+            | S::HappyGhast
+            | S::Hoglin
+            | S::Horse
+            | S::Husk
+            | S::Llama
+            | S::Mooshroom
+            | S::Mule
+            | S::Nautilus
+            | S::Ocelot
+            | S::Panda
+            | S::Pig
+            | S::Piglin
+            | S::PolarBear
+            | S::Rabbit
+            | S::Sheep
+            | S::SkeletonHorse
+            | S::Sniffer
+            | S::Squid
+            | S::Strider
+            | S::SulfurCube
+            | S::TraderLlama
+            | S::Turtle
+            | S::Villager
+            | S::WanderingTrader
+            | S::Wolf
+            | S::Zoglin
+            | S::Zombie
+            | S::ZombieHorse
+            | S::ZombieVillager
+            | S::ZombifiedPiglin
+    )
+}
+/// The vanilla entity type of a species, `minecraft:` and its [`Def::name`].
+pub fn vanilla_id(s: Species) -> &'static str {
+    static IDS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        ALL.iter()
+            .map(|d| format!("minecraft:{}", d.name))
+            .collect()
+    });
+    let index = ALL.iter().position(|d| d.species == s).unwrap_or(0);
+    &IDS[index]
 }
 impl Def {
     /// Model layer families to load for this entity (adult, baby, variants).
@@ -1318,6 +1400,7 @@ impl Def {
         let mut v = vec![base];
         let extra: &[&str] = match self.species {
             Species::Pig => &["pig_baby", "cold_pig"],
+            Species::Mannequin => &["player_slim"],
             Species::Cow => &[
                 "cow_baby",
                 "cold_cow",
@@ -1434,7 +1517,6 @@ impl Def {
                     | S::IronGolem
                     | S::Cat
                     | S::Ocelot
-                    | S::Frog
                     | S::Slime
                     | S::MagmaCube
                     | S::Wither
@@ -1457,20 +1539,25 @@ impl Def {
                         | S::Zoglin
                         | S::Wither
                 ),
+            // The `burn_in_daylight` entity type tag.
             burns_in_day: matches!(
                 s,
                 S::Zombie
+                    | S::ZombieHorse
                     | S::Drowned
                     | S::ZombieVillager
                     | S::Skeleton
                     | S::Stray
                     | S::Bogged
-                    | S::Parched
+                    | S::WitherSkeleton
                     | S::Phantom
                     | S::ZombieNautilus
             ),
             undead,
-            breathes_water: aquatic
+            // `#can_breathe_under_water`, and the iron golem, whose
+            // `decreaseAirSupply` keeps its air. Not the dolphin: it holds its
+            // breath (4800 ticks) and surfaces for air.
+            breathes_water: (aquatic && s != S::Dolphin)
                 || undead
                 || matches!(
                     s,
@@ -1479,16 +1566,15 @@ impl Def {
                         | S::Turtle
                         | S::Guardian
                         | S::ElderGuardian
-                        | S::IronGolem
-                        | S::SnowGolem
-                        | S::Ghast
-                        | S::Blaze
+                        | S::CopperGolem
                         | S::Nautilus
                 ),
-            // Nautilus.handleAirSupply: it dries out on land.
-            needs_water: aquatic || s == S::Nautilus,
-            water_sensitive: matches!(s, S::Enderman | S::Blaze | S::SnowGolem),
-            animal: !matches!(s, S::Bat | S::SulfurCube)
+            // WaterAnimal.handleAirSupply: it dries out on land; Nautilus's
+            // does the same. Dolphin.handleAirSupply is empty, so a dolphin
+            // takes LivingEntity.baseTick's air like a land mob.
+            needs_water: (aquatic && s != S::Dolphin) || s == S::Nautilus,
+            water_sensitive: matches!(s, S::Enderman | S::Blaze | S::SnowGolem | S::Strider),
+            animal: !matches!(s, S::Bat | S::SulfurCube | S::Mannequin)
                 && !self.hostile_class()
                 && !aquatic
                 && !matches!(
@@ -1568,7 +1654,7 @@ impl Def {
             S::Bee => "bee_food",
             S::Turtle => "turtle_food",
             S::Armadillo => "armadillo_food",
-            S::Frog => "frog_food",
+            S::Frog | S::Tadpole => "frog_food",
             S::Axolotl => "axolotl_food",
             S::Hoglin => "hoglin_food",
             S::Strider => "strider_food",
@@ -1589,6 +1675,8 @@ impl Def {
     pub fn water_slowdown(&self) -> f32 {
         match self.species {
             Species::PolarBear => 0.98,
+            // SkeletonHorse.getWaterSlowDown.
+            Species::SkeletonHorse => 0.96,
             _ => 0.8,
         }
     }
@@ -1616,6 +1704,7 @@ impl Def {
         match self.species {
             Species::Dolphin | Species::Axolotl => 1.0,
             Species::Slime | Species::MagmaCube | Species::SulfurCube => 0.0,
+            Species::Guardian | Species::ElderGuardian | Species::Shulker => 180.0,
             _ => 40.0,
         }
     }
@@ -1627,6 +1716,9 @@ impl Def {
             Species::Sniffer => 50.0,
             Species::Goat => 15.0,
             Species::Armadillo => 32.0,
+            Species::Ravager => 45.0,
+            Species::Camel | Species::CamelHusk => 30.0,
+            Species::Shulker => 180.0,
             _ => 75.0,
         }
     }
@@ -1645,6 +1737,12 @@ impl Def {
             | S::Camel
             | S::CamelHusk => 400,
             S::Ocelot => 900,
+            // Guardian.getAmbientSoundInterval (the elder too).
+            S::Guardian | S::ElderGuardian => 160,
+            // Hoglin extends Animal; Shulker extends AbstractGolem.
+            S::Hoglin | S::Shulker => 120,
+            // Allay is a PathfinderMob: the Mob default.
+            S::Allay => 80,
             S::Squid
             | S::GlowSquid
             | S::Cod
@@ -1677,10 +1775,15 @@ impl Def {
     }
 }
 /// Mobs whose `body` equipment slot Horizon keeps in `Extra::head` (a
-/// happy ghast's harness, nautilus armour, a sulfur cube's swallowed block).
+/// happy ghast's harness, nautilus armour, a sulfur cube's swallowed block,
+/// a wolf's armor).
 pub fn body_slot(s: Species) -> bool {
     matches!(
         s,
-        Species::HappyGhast | Species::Nautilus | Species::ZombieNautilus | Species::SulfurCube
+        Species::HappyGhast
+            | Species::Nautilus
+            | Species::ZombieNautilus
+            | Species::SulfurCube
+            | Species::Wolf
     )
 }

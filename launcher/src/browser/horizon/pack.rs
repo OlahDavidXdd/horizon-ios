@@ -37,7 +37,7 @@ pub fn list() -> Vec<Installed> {
     list_in(&packs_dir())
 }
 
-fn list_in(dir: &Path) -> Vec<Installed> {
+pub(crate) fn list_in(dir: &Path) -> Vec<Installed> {
     let mut packs: Vec<Installed> = fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -57,7 +57,8 @@ fn read(work: &Path) -> Option<Installed> {
 
 /// Whether `work` is a registry pack's folder.
 pub fn is_pack(work: &Path) -> bool {
-    work.join(RECORD).is_file()
+    // Imported Java packs also have pack.json, with a different record format.
+    read(work).is_some()
 }
 
 /// The profile's game folder.
@@ -84,7 +85,7 @@ fn install_in(
     if p.kind != idx::Kind::Modpack {
         return Err(format!("{} is a {}, not a modpack.", p.name, p.kind.name()));
     }
-    let v = newest(index, p)?;
+    let v = newest(index, p, None)?;
     let work = dir.join(&p.id);
     let fresh = !work.exists();
     let result = install_version_in(index, local, p, v, &work, progress);
@@ -121,6 +122,10 @@ fn install_version_in(
     let pack = Modpack::read(&path)?;
     let home = home(work);
     fs::create_dir_all(&home).map_err(|e| format!("{}: {e}", home.display()))?;
+    // A mod the pack's last version listed keeps the player's on/off choice from the Mods
+    // page; a mod this version adds starts at the pack's `on`. `install_version` turns a mod
+    // on, so the choice is read before it and written back after.
+    let before = read(work).map(|p| p.mods).unwrap_or_default();
     let mut mods = Vec::new();
     for m in &pack.manifest.mods {
         let found = index
@@ -132,8 +137,12 @@ fn install_version_in(
                 p.name, m.id, m.version
             ));
         };
+        let was = before
+            .iter()
+            .any(|s| s.split(' ').next() == Some(m.id.as_str()))
+            .then(|| java::is_enabled(&home, &m.id));
         install_version(index, local, mp, mv, &home, progress)?;
-        java::set_enabled(&home, &m.id, m.on)?;
+        java::set_enabled(&home, &m.id, was.unwrap_or(m.on))?;
         mods.push(format!("{} {}", m.id, m.version));
     }
     // Settings once: the player's own changes to the profile stay on updates.
@@ -189,18 +198,23 @@ mod tests {
 
     /// A local registry: the mod and a pack of it, as `file://` files.
     fn registry(dir: &Path, on: bool, extra: &str) -> Index {
+        registry_at(dir, "1.0.0", on, extra)
+    }
+
+    /// [`registry`] with the pack at `pack_version`.
+    fn registry_at(dir: &Path, pack_version: &str, on: bool, extra: &str) -> Index {
         let hmod_src = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../crates/horizon-mods/tests/index/coords_hud-0.1.0.hmod");
         let hmod = dir.join("coords_hud-0.1.0.hmod");
         fs::copy(hmod_src, &hmod).unwrap();
         let hmod_sha = idx::sha256_file(&hmod).unwrap();
-        let hpack = dir.join("cozy-1.0.0.hpack");
+        let hpack = dir.join(format!("cozy-{pack_version}.hpack"));
         let mut zip = zip::ZipWriter::new(fs::File::create(&hpack).unwrap());
         let o = zip::write::SimpleFileOptions::default();
         zip.start_file("horizon-modpack.toml", o).unwrap();
         write!(
             zip,
-            "format = 1\nid = \"cozy\"\nname = \"Cozy\"\nversion = \"1.0.0\"\ngame = \"26.3\"\n\
+            "format = 1\nid = \"cozy\"\nname = \"Cozy\"\nversion = \"{pack_version}\"\ngame = \"26.3\"\n\
              [[mods]]\nid = \"coords_hud\"\nversion = \"0.1.0\"\nsha256 = \"{hmod_sha}\"\non = {on}\n"
         )
         .unwrap();
@@ -208,6 +222,16 @@ mod tests {
         zip.write_all(b"renderDistance:8\n").unwrap();
         zip.finish().unwrap();
         let size = |p: &Path| fs::metadata(p).unwrap().len();
+        // A `file:///` URL: forward slashes (a Windows path's backslashes would be escapes in
+        // the JSON) and a leading slash before a Windows drive.
+        let url = |p: &Path| {
+            let path = p.display().to_string().replace('\\', "/");
+            if path.starts_with('/') {
+                path
+            } else {
+                format!("/{path}")
+            }
+        };
         let text = format!(
             r#"{{"schema": 1, "projects": [
               {{"id": "coords_hud", "kind": "mod", "name": "Coordinates HUD", "summary": "", "license": "MIT",
@@ -215,13 +239,13 @@ mod tests {
                 "capabilities": ["game-read", "hud", "chat"], "game": "26.3", "file": {{"name": "coords_hud-0.1.0.hmod",
                 "url": "file://{}", "size": {}, "sha256": "{hmod_sha}"}}}}]}},
               {{"id": "cozy", "kind": "modpack", "name": "Cozy", "summary": "", "license": "MIT",
-                "source": "https://x.test", "versions": [{{"version": "1.0.0", "api": "1", "game": "26.3",
+                "source": "https://x.test", "versions": [{{"version": "{pack_version}", "api": "1", "game": "26.3",
                 "requires": [{{"id": "coords_hud", "version": "0.1.0", "sha256": "{hmod_sha}"}}],
-                "file": {{"name": "cozy-1.0.0.hpack", "url": "file://{}", "size": {}, "sha256": "{}"}}}}]}}
+                "file": {{"name": "cozy-{pack_version}.hpack", "url": "file://{}", "size": {}, "sha256": "{}"}}}}]}}
             ]{extra}}}"#,
-            hmod.display(),
+            url(&hmod),
             size(&hmod),
-            hpack.display(),
+            url(&hpack),
             size(&hpack),
             idx::sha256_file(&hpack).unwrap()
         );
@@ -274,6 +298,38 @@ mod tests {
             .unwrap_err()
             .contains("not a modpack"));
         assert!(install_in(&index, true, "nope", &packs, &|_, _| {}).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A pack update keeps the mods the player turned on or off in the Mods page, as a Java
+    /// mod update does; a mod the new pack version adds takes the pack's own `on`.
+    #[test]
+    fn a_pack_update_keeps_the_players_mod_choices() {
+        let dir = scratch("keep-choice");
+        let packs = dir.join("horizon-packs");
+        let first = registry_at(&dir, "1.0.0", true, "");
+        install_in(&first, true, "cozy", &packs, &|_, _| {}).unwrap();
+        let home = home(&packs.join("cozy"));
+        assert!(
+            java::is_enabled(&home, "coords_hud"),
+            "the pack turns it on"
+        );
+
+        // The player turns it off on the Mods page; the next pack version leaves it off.
+        java::set_enabled(&home, "coords_hud", false).unwrap();
+        let second = registry_at(&dir, "1.1.0", true, "");
+        let pack = install_in(&second, true, "cozy", &packs, &|_, _| {}).unwrap();
+        assert_eq!(pack.version, "1.1.0", "it was an update");
+        assert!(
+            !java::is_enabled(&home, "coords_hud"),
+            "the update kept it off"
+        );
+
+        // Turned back on, the next one leaves it on.
+        java::set_enabled(&home, "coords_hud", true).unwrap();
+        let third = registry_at(&dir, "1.2.0", true, "");
+        install_in(&third, true, "cozy", &packs, &|_, _| {}).unwrap();
+        assert!(java::is_enabled(&home, "coords_hud"));
         fs::remove_dir_all(&dir).unwrap();
     }
 

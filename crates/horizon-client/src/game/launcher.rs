@@ -7,6 +7,7 @@
 //!
 //! The loading window answers the start, the state and imports before there is a `Game` to ask; anything else
 //! waits for the title.
+use super::event_loop::EventLoopCtl;
 use super::{Game, Loading};
 use horizon_client::{
     Result,
@@ -17,12 +18,50 @@ use std::{
     cell::RefCell,
     sync::mpsc::{self, Receiver, TryRecvError},
 };
-use winit::event_loop::ActiveEventLoop;
+
+/// The portrait launcher and landscape game share a UIWindow. Permit the
+/// launcher's orientation before acknowledging its presentation request.
+fn launcher_visibility(window: Option<&winit::window::Window>, visible: bool) -> bool {
+    if !visible {
+        if horizon_ios_launcher::cancellation_requested() {
+            return false;
+        }
+        horizon_ios_launcher::commit_start();
+    }
+    horizon_ios_launcher::set_covered(visible);
+    #[cfg(target_os = "ios")]
+    if let Some(window) = window {
+        use winit::platform::ios::{ValidOrientations, WindowExtIOS};
+        window.set_valid_orientations(if visible {
+            ValidOrientations::LandscapeAndPortrait
+        } else {
+            ValidOrientations::Landscape
+        });
+    }
+    #[cfg(not(target_os = "ios"))]
+    let _ = window;
+    true
+}
+
+/// The archive a phone is unpacking, as the launcher's loading screen draws it (`import::status`).
+fn import_state() -> Value {
+    match horizon_client::import::status() {
+        Some(status) => json!({
+            "label": status.label,
+            "files": status.files,
+            "total_files": status.total_files,
+            "bytes": status.bytes,
+            "error": status.error,
+        }),
+        None => Value::Null,
+    }
+}
 
 /// What came back for a launcher request so far: a control answer, or an import's result.
 enum Waiting {
     Control(Receiver<String>),
     Import(Receiver<std::result::Result<Installed, String>>),
+    CancelStart(String),
 }
 
 thread_local! {
@@ -37,6 +76,7 @@ fn deliver() -> bool {
     let mut still = Vec::new();
     for (waiting, request) in pending {
         match waiting {
+            Waiting::CancelStart(owner) => still.push((Waiting::CancelStart(owner), request)),
             Waiting::Control(answers) => match answers.try_recv() {
                 Ok(answer) => request.answer(&answer),
                 // Dropping the request answers it with an error.
@@ -58,12 +98,96 @@ fn deliver() -> bool {
     resources
 }
 
+/// Complete cancellation only after the supervisor has dropped the old engine.
+pub(super) fn acknowledge_cancelled_start(owner: &str) {
+    let pending = PENDING.with_borrow_mut(std::mem::take);
+    let mut still = Vec::new();
+    for (waiting, request) in pending {
+        if matches!(&waiting, Waiting::CancelStart(id) if id == owner) {
+            request.answer(r#"{"ok":true,"status":"stopped"}"#);
+        } else {
+            still.push((waiting, request));
+        }
+    }
+    PENDING.with_borrow_mut(|pending| pending.extend(still));
+}
+
+fn start_owner(line: &str) -> Option<&str> {
+    line.split_whitespace().nth(1)
+}
+
+fn allowed_while_stopping(command: &str) -> bool {
+    matches!(
+        command,
+        "launcher-state"
+            | "launcher-visible"
+            | "launcher-cancel-start"
+            | "launcher-session"
+            | "download-state"
+            | "game-files-source"
+            | "options-get"
+            | "worlds"
+            | "servers"
+            | "server-ping"
+            | "import"
+            | "import-game-files"
+    )
+}
+
+fn commit_start(request: horizon_ios_launcher::Request) {
+    let committed =
+        start_owner(&request.line).is_some_and(horizon_ios_launcher::commit_start_owned);
+    request.answer(
+        &json!({ "ok": committed, "status": if committed { "committed" } else { "stale" } })
+            .to_string(),
+    );
+}
+
+fn cancel_start(request: horizon_ios_launcher::Request) {
+    let Some(owner) = start_owner(&request.line).map(str::to_owned) else {
+        request.answer(r#"{"error":"a launch identity is required"}"#);
+        return;
+    };
+    // A visible game has already passed the native presentation commit point.
+    if !horizon_ios_launcher::covered() {
+        horizon_ios_launcher::commit_start();
+    }
+    match horizon_ios_launcher::request_cancel(&owner) {
+        horizon_ios_launcher::CancelDecision::Accepted => {
+            PENDING.with_borrow_mut(|pending| {
+                pending.push((Waiting::CancelStart(owner), request));
+            });
+        }
+        horizon_ios_launcher::CancelDecision::Stale => {
+            request.answer(r#"{"ok":true,"status":"stale"}"#);
+        }
+        horizon_ios_launcher::CancelDecision::Committed => {
+            request.answer(r#"{"ok":true,"status":"committed"}"#);
+        }
+    }
+}
+
+/// A native import owns its destination until its completion is delivered.
+fn importing_archive() -> bool {
+    PENDING.with_borrow(|pending| {
+        pending
+            .iter()
+            .any(|(waiting, _)| matches!(waiting, Waiting::Import(_)))
+    })
+}
+
 /// Install the archive named by `import PATH` on a worker: a prepared tree is hundreds of megabytes.
 fn start_import(request: horizon_ios_launcher::Request) {
+    if importing_archive() {
+        request.answer(r#"{"error":"Wait for the current import to finish."}"#);
+        return;
+    }
+    let command = request.line.split_whitespace().next().unwrap_or_default();
+    let resources_only = command == "import-game-files";
     let path = request
         .line
         .trim_start()
-        .strip_prefix("import")
+        .strip_prefix(command)
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(std::path::PathBuf::from);
@@ -76,15 +200,30 @@ fn start_import(request: horizon_ios_launcher::Request) {
     let spawned = std::thread::Builder::new()
         .name("horizon-import".into())
         .spawn(move || {
-            let installed = Pack::open(&path)
-                .and_then(|pack| pack.install(&home))
-                .map_err(|e| e.to_string());
+            let installed =
+                install_archive(&path, &home, resources_only).map_err(|e| e.to_string());
             let _ = sender.send(installed);
         });
     match spawned {
         Ok(_) => PENDING.with_borrow_mut(|p| p.push((Waiting::Import(receiver), request))),
         Err(error) => request.answer(&json!({ "error": error.to_string() }).to_string()),
     }
+}
+
+fn install_archive(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    resources_only: bool,
+) -> Result<Installed> {
+    let pack = Pack::open(path)?;
+    if resources_only && pack.kind != Kind::Resources {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "The automatic download did not contain game files.",
+        )
+        .into());
+    }
+    pack.install(home)
 }
 
 fn installed_json(installed: &Installed) -> Value {
@@ -104,13 +243,20 @@ fn installed_json(installed: &Installed) -> Value {
 impl Game<'_> {
     /// The launcher's requests, once a frame: its own lines here, the rest through the control socket's
     /// dispatcher, as if horizon-ctl had sent them.
-    pub(super) fn poll_launcher(&mut self, event_loop: &ActiveEventLoop) {
+    pub(super) fn poll_launcher(&mut self, event_loop: &dyn EventLoopCtl) {
         for request in horizon_ios_launcher::take() {
             let command = request.line.split_whitespace().next().unwrap_or_default();
+            if self.quit_to_launcher && !allowed_while_stopping(command) {
+                request.answer(r#"{"error":"The game is stopping. Try again shortly."}"#);
+                continue;
+            }
             match command {
                 "launcher-visible" => {
-                    horizon_ios_launcher::set_covered(request.line.ends_with(" true"));
-                    request.answer(r#"{"ok":true}"#);
+                    let accepted = launcher_visibility(
+                        self.window.as_deref(),
+                        request.line.ends_with(" true"),
+                    );
+                    request.answer(&json!({ "ok": accepted }).to_string());
                 }
 
                 "launcher-state" => {
@@ -119,13 +265,36 @@ impl Game<'_> {
                         "screen": self.screen_name(),
                         "player": self.options.player_name(),
                         "version": horizon_core::version::VERSION_ID,
+                        "import": import_state(),
                     });
                     request.answer(&state.to_string());
                 }
-                "import" => start_import(request),
+                "import" | "import-game-files" => start_import(request),
                 // The game is up: the download screen has nothing left to show.
                 "download-state" => request.answer(r#"{"phase":"done"}"#),
-                "launcher-start" => request.answer(r#"{"ok":true}"#),
+                "launcher-start" => {
+                    let accepted = !self.quit_to_launcher
+                        && horizon_ios_launcher::start_owned(start_owner(&request.line));
+                    request.answer(
+                        &json!({
+                            "ok": accepted,
+                            "phase": if self.title.is_some() { "title" } else { "world" },
+                        })
+                        .to_string(),
+                    );
+                }
+                "launcher-commit-start" => commit_start(request),
+                "launcher-cancel-start" => {
+                    // World entry is a committed action. A stale native task
+                    // must not tear down an already opened world or server.
+                    if self.title.is_none() {
+                        horizon_ios_launcher::commit_start();
+                    }
+                    cancel_start(request);
+                    if horizon_ios_launcher::cancellation_requested() {
+                        self.quit_to_launcher = true;
+                    }
+                }
                 "launcher-session" => session_request(request),
                 "launcher-world" => self.launcher_world(request),
                 _ => {
@@ -312,25 +481,64 @@ impl Loading {
     /// files gets them from the launcher), the options, and what is only files: worlds, servers, pings.
     /// Game files that arrive end the wait for them.
     pub(super) fn poll_launcher(&mut self) -> Result<()> {
+        // Imports and starts share the game home with the previous engine's
+        // finite cache collector. Do not enqueue a new home owner ahead of it.
+        if !horizon_client::mod_content::poll_root_collectors() {
+            return Ok(());
+        }
         for request in horizon_ios_launcher::take() {
             let command = request.line.split_whitespace().next().unwrap_or_default();
+            if horizon_ios_launcher::cancellation_requested() && !allowed_while_stopping(command) {
+                request.answer(r#"{"error":"The game is stopping. Try again shortly."}"#);
+                continue;
+            }
             match command {
                 "launcher-visible" => {
-                    horizon_ios_launcher::set_covered(request.line.ends_with(" true"));
-                    request.answer(r#"{"ok":true}"#);
+                    let accepted = launcher_visibility(
+                        self.window.as_deref(),
+                        request.line.ends_with(" true"),
+                    );
+                    request.answer(&json!({ "ok": accepted }).to_string());
                 }
 
+                "game-files-source" => request.answer(
+                    &json!({
+                        "url": horizon_client::import::download::url(horizon_core::VANILLA_VERSION),
+                        "version": horizon_core::VANILLA_VERSION,
+                    })
+                    .to_string(),
+                ),
                 "launcher-start" => {
-                    horizon_ios_launcher::start();
-                    request.answer(r#"{"ok":true}"#);
+                    if importing_archive() {
+                        request.answer(r#"{"error":"Wait for the current import to finish."}"#);
+                    } else {
+                        if horizon_ios_launcher::waiting() {
+                            self.refresh_import_root(&horizon_client::import::home())?;
+                        }
+                        let accepted =
+                            horizon_ios_launcher::start_owned(start_owner(&request.line));
+                        request.answer(&json!({ "ok": accepted, "phase": "loading" }).to_string());
+                    }
                 }
+                "launcher-commit-start" => commit_start(request),
+                "launcher-cancel-start" => cancel_start(request),
                 "launcher-state" => {
                     let state = if horizon_ios_launcher::waiting() {
-                        json!({ "phase": "waiting" })
+                        json!({
+                            "phase": "waiting",
+                            "import": import_state(),
+                            // An archive the launch found is still being installed: the launcher
+                            // must not hand the same zip over again, nor race it with a download.
+                            "importing": horizon_client::import::boot_importing(),
+                        })
                     } else if self.importing() {
-                        json!({ "phase": "needs_files", "reason": self.import_reason() })
+                        json!({ "phase": "needs_files", "reason": self.import_reason(), "import": import_state() })
                     } else {
-                        json!({ "phase": "loading", "progress": self.progress.fraction() })
+                        json!({
+                            "phase": "loading",
+                            "progress": self.progress.fraction(),
+                            "import": import_state(),
+                        })
                     };
                     request.answer(&state.to_string());
                 }
@@ -342,7 +550,7 @@ impl Loading {
                     };
                     request.answer(&answer.to_string());
                 }
-                "import" => start_import(request),
+                "import" | "import-game-files" => start_import(request),
                 "launcher-session" => session_request(request),
                 "options-get" | "options-set" => {
                     let answer = self.launcher_options(&request.line);
@@ -350,11 +558,14 @@ impl Loading {
                 }
                 "shader-pack" => {
                     let words: Vec<&str> = request.line.split_whitespace().collect();
-                    let answer =
-                        match super::shader_packs::shader_pack_command(&words, &request.line) {
-                            Ok(value) => value.unwrap_or_default(),
-                            Err(e) => json!({ "error": e.to_string() }),
-                        };
+                    let answer = match super::shader_packs::command(
+                        &mut self.settings,
+                        &words,
+                        &request.line,
+                    ) {
+                        Ok(value) => value.unwrap_or_default(),
+                        Err(e) => json!({ "error": e.to_string() }),
+                    };
                     request.answer(&answer.to_string());
                 }
                 "launcher-world" => {
@@ -375,9 +586,41 @@ impl Loading {
                 }
             }
         }
-        if deliver() && self.importing() {
+        if deliver() && self.importing() && !horizon_ios_launcher::cancellation_requested() {
             self.files_arrived()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn automatic_import_rejects_world_before_writing_but_manual_import_allows_it() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-auto-import-{}-{nonce}",
+            std::process::id()
+        ));
+        let world = root.join("world");
+        std::fs::create_dir_all(&world).unwrap();
+        std::fs::write(world.join("level.dat"), b"synthetic world fixture").unwrap();
+        let archive = root.join("world.zip");
+        horizon_client::import::pack(&world, &archive, |_, _| {}).unwrap();
+        let home = root.join("home");
+        let error = super::install_archive(&archive, &home, true).unwrap_err();
+        assert!(error.to_string().contains("did not contain game files"));
+        assert!(
+            !home.exists(),
+            "Wrong-kind download must not touch player data"
+        );
+        assert!(archive.exists());
+        let installed = super::install_archive(&archive, &home, false).unwrap();
+        assert_eq!(installed.kind, horizon_client::import::Kind::World);
+        assert!(installed.path.join("level.dat").is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

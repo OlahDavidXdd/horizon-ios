@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 use objc2::rc::Retained;
-use objc2::{declare_class, msg_send, msg_send_id, mutability, ClassType, DeclaredClass};
+use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_foundation::{MainThreadMarker, NSObject};
 use objc2_ui_kit::{
     UIDevice, UIInterfaceOrientationMask, UIRectEdge, UIResponder, UIStatusBarStyle,
@@ -43,7 +43,20 @@ declare_class!(
         fn view_did_appear(&self, animated: bool) {
             let _: () = unsafe { msg_send![super(self), viewDidAppear: animated] };
             // A full-screen launcher stole first responder; restore gameplay keyboard focus.
-            if let Some(view) = self.view() { unsafe { view.becomeFirstResponder(); } }
+            if let Some(view) = self.view() {
+                let restored: bool = unsafe { msg_send![&*view, becomeFirstResponder] };
+                super::view::log_to_console(&format!(
+                    "game view appeared; keyboard focus taken back: {restored}"
+                ));
+            }
+        }
+
+        #[method(didReceiveMemoryWarning)]
+        fn did_receive_memory_warning(&self) {
+            // iOS says this before it kills a foreground app: in the log it dates the stall, the evicted
+            // textures or the crash that follows.
+            super::view::log_to_console("the phone is low on memory (didReceiveMemoryWarning)");
+            let _: () = unsafe { msg_send![super(self), didReceiveMemoryWarning] };
         }
 
         #[method(shouldAutorotate)]
@@ -83,8 +96,13 @@ declare_class!(
 impl WinitViewController {
     pub(crate) fn set_pointer_locked(&self, locked: bool) {
         if self.ivars().pointer_locked.replace(locked) != locked {
-            // Public UIKit API, available since iPadOS 14 (Horizon requires 16).
-            let _: () = unsafe { msg_send![self, setNeedsUpdateOfPrefersPointerLocked] };
+            // Public UIKit API, iOS 16; on 15 the pointer simply stays uncaptured.
+            let responds: bool = unsafe {
+                msg_send![self, respondsToSelector: sel!(setNeedsUpdateOfPrefersPointerLocked)]
+            };
+            if responds {
+                let _: () = unsafe { msg_send![self, setNeedsUpdateOfPrefersPointerLocked] };
+            }
         }
     }
 

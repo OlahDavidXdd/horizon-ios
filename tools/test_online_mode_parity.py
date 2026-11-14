@@ -50,11 +50,13 @@ import urllib.parse
 try:
     from . import lab, oracle_harness as oh, test_rust_parity as base
     from .test_dedicated_server_parity import Server, free_port
+    from .integration_env import run_game
 except ImportError:
     import lab
     import oracle_harness as oh
     import test_rust_parity as base
     from test_dedicated_server_parity import Server, free_port
+    from integration_env import run_game
 
 NAME = 'online-mode-parity'
 PLAYER = 'Tester'
@@ -118,8 +120,12 @@ class Services:
                     if ok:
                         return self.reply(200, {'id': PLAYER_UUID, 'name': query['username'], 'properties': []})
                     return self.reply(204)
-                with services.lock:
-                    services.log.append(('unknown', url.path))
+                # A bare `GET /` is a local tool probing every new port (T3 Code does, on the Mac mini), not
+                # the game: none of the services has a root. `/publickeys` (getPublicKeys) is both servers
+                # fetching the services' keys in the background, at any moment of a scenario: no login step.
+                if url.path not in ('/', '/publickeys'):
+                    with services.lock:
+                        services.log.append(('unknown', url.path))
                 self.reply(404, {'error': 'NotFound', 'path': url.path})
 
             def do_POST(self):
@@ -185,7 +191,7 @@ def run_client(binary, build, port, label, token, discovery):
     if token:
         command += ['--session-file', session_file(directory, token)]
     with (build / f'client-{label}.log').open('w') as log:
-        subprocess.run([str(c) for c in command], cwd=directory, env=env, stdout=log, stderr=subprocess.STDOUT,
+        run_game([str(c) for c in command], cwd=directory, env=env, stdout=log, stderr=subprocess.STDOUT,
                        timeout=300, check=True)
     got = json.loads(report.read_text())
     got['session file left'] = (directory / 'session.json').exists()
@@ -302,7 +308,7 @@ def run_side(label, command, binary, build, services, discovery):
         server.wait_for(r'Failed to verify username', timeout=30)
         check('forgotten join: client message', got['error'], 'disconnected: Failed to verify username!')
         check('forgotten join: server verified and refused',
-              [(e[0], e[3]) for e in services.take_log()], [('join', True), ('verify', False)])
+              [(e[0], e[-1]) for e in services.take_log()], [('join', True), ('verify', False)])
 
         # 4. No account: refused by the client before anything is sent to the services.
         got = login('no-account', None)
@@ -317,7 +323,7 @@ def run_side(label, command, binary, build, services, discovery):
         got = login('not-whitelisted', GOOD)
         server.wait_for(r'Disconnecting Tester', timeout=30)
         check('not whitelisted: client message', got['error'], 'disconnected: You are not white-listed on this server!')
-        check('not whitelisted: verified first', [(e[0], e[3]) for e in services.take_log()],
+        check('not whitelisted: verified first', [(e[0], e[-1]) for e in services.take_log()],
               [('join', True), ('verify', True)])
 
         # 6. Whitelisted by name: the server knows the player from their first join (its name cache), so it
@@ -349,11 +355,11 @@ def main():
     build.mkdir(parents=True, exist_ok=True)
     report = build / 'report.json'
     report.unlink(missing_ok=True)
-    oh.run_logged(['cargo', 'build', '--release', '-p', 'horizon-client', '--bin', 'horizon-client'], build,
+    oh.run_logged(['cargo', 'build', '--profile', 'fast', '-p', 'horizon-client', '--bin', 'horizon-client'], build,
                   'compile-rust')
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'],
                                                   cwd=lab.ROOT, text=True))
-    binary = Path(metadata['target_directory']) / 'release' / ('horizon-client.exe' if os.name == 'nt' else 'horizon-client')
+    binary = Path(metadata['target_directory']) / 'fast' / ('horizon-client.exe' if os.name == 'nt' else 'horizon-client')
     dependencies = os.pathsep.join(map(str, [jars['server'], *libraries]))
 
     services = Services()

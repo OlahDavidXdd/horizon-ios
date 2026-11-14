@@ -17,6 +17,10 @@ use std::{
 pub const MAX_SIZE: u64 = 262_144_000;
 /// `DownloadQueue.MAX_KEPT_PACKS`.
 const MAX_KEPT: usize = 20;
+/// Longest wait for a connection, and for any one read from the server. The
+/// queue runs batches on one thread, so a server that accepts the connection
+/// and then goes silent would otherwise hold the pack screen forever.
+const NET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `createDownloadHeaders`: who is downloading, with which game.
 pub fn headers(name: &str, uuid: u128) -> Vec<(&'static str, String)> {
@@ -137,8 +141,8 @@ fn run(
             log::error!("Horizon: failed to log download of {}: {e}", request.url);
         }
         match result {
-            Ok(path) => batch.downloaded.push((request.id, path)),
-            Err(_) => batch.failed.push(request.id),
+            Ok(path) => batch.downloaded.push((request.id, request.key, path)),
+            Err(_) => batch.failed.push((request.id, request.key)),
         }
     }
     batch
@@ -196,6 +200,17 @@ pub fn download_file(
     max_size: u64,
     progress: &Sender<Progress>,
 ) -> Result<PathBuf, String> {
+    download_file_within(dir, request, headers, max_size, progress, NET_TIMEOUT)
+}
+/// `download_file` with the connect and read timeout given.
+fn download_file_within(
+    dir: &Path,
+    request: &Request,
+    headers: &[(&'static str, String)],
+    max_size: u64,
+    progress: &Sender<Progress>,
+    timeout: std::time::Duration,
+) -> Result<PathBuf, String> {
     let target = request.sha1.as_ref().map(|sha1| dir.join(sha1));
     if let (Some(target), Some(sha1)) = (&target, &request.sha1) {
         if matches(target, sha1) {
@@ -219,7 +234,11 @@ pub fn download_file(
             })
             .map_err(|e| format!("Failed to remove existing file {}: {e}", target.display()))?;
     }
-    let mut call = ureq::AgentBuilder::new().build().get(&request.url);
+    let mut call = ureq::AgentBuilder::new()
+        .timeout_connect(timeout)
+        .timeout_read(timeout)
+        .build()
+        .get(&request.url);
     for (name, value) in headers {
         call = call.set(name, value);
     }
@@ -403,6 +422,7 @@ mod tests {
         let body = b"PK pack".to_vec();
         let (url, server) = serve("200 OK", body.clone());
         let request = Request {
+            key: 101,
             id: 7,
             url,
             sha1: Some(sha1(&body)),
@@ -437,6 +457,7 @@ mod tests {
         let dir = scratch();
         let (url, server) = serve("200 OK", b"other bytes".to_vec());
         let wrong = Request {
+            key: 101,
             id: 1,
             url,
             sha1: Some("0".repeat(40)),
@@ -445,6 +466,7 @@ mod tests {
         assert!(err.contains("did not match requested"), "{err}");
         server.join().unwrap();
         let dead = Request {
+            key: 101,
             id: 2,
             url: "http://127.0.0.1:9/pack.zip".into(),
             sha1: None,
@@ -453,6 +475,7 @@ mod tests {
         assert!(!dir.join("dead").exists());
         let (url, server) = serve("200 OK", vec![0; 100]);
         let large = Request {
+            key: 101,
             id: 3,
             url,
             sha1: None,
@@ -462,12 +485,63 @@ mod tests {
         let _ = server.join();
         let (url, server) = serve("404 Not Found", Vec::new());
         let missing = Request {
+            key: 101,
             id: 4,
             url,
             sha1: None,
         };
         assert!(download_file(&dir, &missing, &[], MAX_SIZE, &channel().0).is_err());
         server.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_server_that_goes_silent_fails_the_download() {
+        let dir = scratch();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/pack.zip", listener.local_addr().unwrap());
+        let (release, hold) = channel::<()>();
+        let server = std::thread::spawn(move || {
+            // Accept, then answer nothing until the test is done.
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = hold.recv();
+        });
+        let request = Request {
+            key: 101,
+            id: 9,
+            url,
+            sha1: None,
+        };
+        let started = std::time::Instant::now();
+        let result = download_file_within(
+            &dir,
+            &request,
+            &[],
+            MAX_SIZE,
+            &channel().0,
+            std::time::Duration::from_millis(300),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        drop(release);
+        server.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_batch_retains_the_request_generation_and_protocol_uuid() {
+        let dir = scratch();
+        let (url, server) = serve("404 Not Found", Vec::new());
+        let request = Request {
+            id: 77,
+            key: 101,
+            url,
+            sha1: None,
+        };
+        let batch = run(&dir, &[request], &[], &channel().0);
+        server.join().unwrap();
+        assert!(batch.downloaded.is_empty());
+        assert_eq!(batch.failed, [(77, 101)]);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -480,6 +554,7 @@ mod tests {
         let id = 0x5b2c_7a4e_1f3d_4c8b_9a6e_2d4f_8b1c_3e5a;
         queue.download(
             vec![Request {
+                key: 101,
                 id,
                 url,
                 sha1: None,
@@ -497,7 +572,7 @@ mod tests {
         let file = dir
             .join("5b2c7a4e-1f3d-4c8b-9a6e-2d4f8b1c3e5a")
             .join(sha1(b"zip"));
-        assert_eq!(batch.downloaded, [(id, file)]);
+        assert_eq!(batch.downloaded, [(id, 101, file)]);
         // HttpUtil.downloadFile's listener calls, in order.
         assert_eq!(
             events.iter().collect::<Vec<_>>(),

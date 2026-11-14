@@ -29,21 +29,53 @@ struct GameOption {
 /// `options-set`): a change applies at once and is saved, as the game's own Options screen does it.
 @MainActor
 final class GameOptions: ObservableObject {
+    typealias Request = @MainActor (String) async -> [String: Any]
     @Published private(set) var options: [String: GameOption] = [:]
+    @Published private(set) var loading = false
+    @Published private(set) var issue: String?
+    @Published private(set) var unavailable: [String] = []
+    private let request: Request
+
+    init(request: @escaping Request = { await Bridge.send($0) }) { self.request = request }
 
     func load() async {
-        let keys = Self.groups.flatMap { $0.rows.map(\.key) }
-        let answer = await Bridge.send("options-get " + keys.joined(separator: " "))
-        guard let described = answer["options"] as? [String: [String: Any]] else { return }
-        options = described.compactMapValues(GameOption.init)
+        loading = true
+        issue = nil
+        defer { loading = false }
+        let rows = Self.groups.flatMap(\.rows)
+        let keys = rows.map(\.key)
+        let answer = await request("options-get " + keys.joined(separator: " "))
+        var described = answer["options"] as? [String: [String: Any]]
+        // One unsupported key must not hide every supported control on a different engine revision.
+        if let error = answer.error, error.hasPrefix("unknown option") {
+            var supported: [String: [String: Any]] = [:]
+            for key in keys {
+                let one = await request("options-get " + key)
+                if let value = (one["options"] as? [String: [String: Any]])?[key] { supported[key] = value }
+            }
+            described = supported
+        } else if let error = answer.error {
+            issue = error
+            return
+        }
+        let parsed = (described ?? [:]).compactMapValues(GameOption.init)
+            .filter { keys.contains($0.key) }
+        guard !parsed.isEmpty else {
+            issue = "The launcher did not receive any settings. Try loading them again."
+            return
+        }
+        options = parsed
+        unavailable = rows.filter { parsed[$0.key] == nil }.map(\.title)
     }
 
     func set(_ key: String, _ value: String) async -> String? {
-        let answer = await Bridge.send("options-set \(key) \(value)")
-        if let now = (answer["option"] as? [String: Any]).flatMap(GameOption.init) {
-            options[key] = now
+        let answer = await request("options-set \(key) \(value)")
+        if let error = answer.error { return error }
+        guard let now = (answer["option"] as? [String: Any]).flatMap(GameOption.init) else {
+            return "The launcher could not confirm that the setting was saved. Try again."
         }
-        return answer.error
+        options[key] = now
+        return nil
     }
 
     // MARK: What is shown
@@ -68,7 +100,7 @@ final class GameOptions: ObservableObject {
     static let groups: [Category] = [
         Category(title: "Video", icon: "display", rows: [
             Row(key: "graphicsPreset", title: "Graphics",
-                names: ["fast": "Fast", "fancy": "Fancy", "fabulous": "Fabulous!", "custom": "Custom"]),
+                names: ["low": "Low", "fast": "Fast", "fancy": "Fancy", "fabulous": "Fabulous!", "custom": "Custom"]),
             Row(key: "renderDistance", title: "Render Distance", format: { "\(Int($0)) chunks" }, cap: 32),
             Row(key: "simulationDistance", title: "Simulation Distance", format: { "\(Int($0)) chunks" }),
             Row(key: "maxFps", title: "Max Framerate", format: { $0 >= 260 ? "Unlimited" : "\(Int($0)) fps" }),
@@ -102,147 +134,93 @@ final class GameOptions: ObservableObject {
 struct SettingsPage: View {
     @ObservedObject var link: GameLink
     @ObservedObject var download: GameFilesDownload
-    @StateObject private var model = GameOptions()
+    @ObservedObject var updates: UpdateChecker
     @State private var showingNews = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            PageTitle(title: "Settings", subtitle: "Saved to the game's options.txt, and applied at once while it runs.")
-            if link.canList {
-                ForEach(GameOptions.groups, id: \.title) { group in
-                    SectionHeader(title: group.title) {
-                        Image(systemName: group.icon).foregroundStyle(Theme.textFaint)
-                    }
-                    VStack(spacing: 0) {
-                        ForEach(group.rows, id: \.key) { row in
-                            if let option = model.options[row.key] {
-                                OptionRow(row: row, option: option) { value in
-                                    Task {
-                                        if let error = await model.set(row.key, value) {
-                                            link.problem = error
-                                        }
-                                    }
-                                }
-                                if row.key != group.rows.last?.key {
-                                    Divider().overlay(Theme.border).padding(.leading, 14)
-                                }
-                            }
-                        }
-                    }
-                    .card()
-                }
-            } else {
-                EmptyNote(icon: "hourglass", text: "The game's settings show here in a moment.")
-            }
-
             SectionHeader(title: "Game files")
             GameFilesCard(download: download, missing: !GameFolder.hasGameFiles)
 
+            SectionHeader(title: "Updates")
+            UpdateSettings(updates: updates)
+
             SectionHeader(title: "About")
             SecondaryButton(title: "What's New", icon: "sparkles") { showingNews = true }
+            ShareLogs()
             About(version: link.version)
-        }
-        .task(id: link.canList) {
-            if link.canList {
-                await model.load()
-            }
         }
         .sheet(isPresented: $showingNews) {
             ScrollView {
                 NewsPage().pageColumn()
             }
             .background(Theme.background.ignoresSafeArea())
-            .presentationDetents([.large])
-            .preferredColorScheme(.dark)
+            .horizonDetents(.large)
+
         }
     }
 }
 
-private struct OptionRow: View {
-    let row: GameOptions.Row
-    let option: GameOption
-    let set: (String) -> Void
-    @State private var dragging: Double?
-
+/// The logs the engine and the launcher write, in one share sheet: what a bug report needs from the phone.
+private struct ShareLogs: View {
     var body: some View {
-        Group {
-            switch option.type {
-            case "bool":
-                Toggle(isOn: Binding(get: { option.flag }, set: { set($0 ? "true" : "false") })) {
-                    title
-                }
-                .tint(Theme.accent)
-            case "enum":
-                choice(option.choices.map { ($0, row.names[$0] ?? $0.capitalized) }, current: option.text)
-            case "int" where !row.names.isEmpty:
-                choice(row.names.keys.sorted().map { ($0, row.names[$0] ?? $0) }, current: String(Int(option.number)))
-            default:
-                slider
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(minHeight: 50)
+        SecondaryButton(title: "Share logs", icon: "square.and.arrow.up") { share() }
     }
 
-    private var title: some View {
-        Text(row.title).font(Theme.sans(14)).foregroundStyle(Theme.text)
+    private func share() {
+        let documents = GameFolder.documents
+        // The engine writes its log under `Library/Application Support/horizon/logs` (packaging/ios/README.md,
+        // "Where the game looks, on the phone"), not beside the launcher's in `Documents/logs`: share the
+        // newest `latest.log` of the two, so a build that logs to either place is captured.
+        let engine = documents.deletingLastPathComponent()
+            .appendingPathComponent("Library/Application Support/horizon")
+        let logFolders: [URL] = [engine.appendingPathComponent("logs"),
+                                 documents.appendingPathComponent("logs")]
+        let latest = logFolders.map { $0.appendingPathComponent("latest.log") }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+            .max { modified($0) < modified($1) }
+        var files = ["logs/launcher.log", "logs/launcher-1.log", "horizon-boot.log"]
+            .map { documents.appendingPathComponent($0) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+        if let latest { files.insert(latest, at: 0) }
+        // Each start rolls the previous `latest.log` into `logs/YYYY-MM-DD-N.log.gz` (the engine
+        // keeps seven a day), so the run that failed is usually the newest archive, not
+        // `latest.log` — which holds the run the person reopened the game in to report it.
+        let rolled = logFolders.flatMap { folder in
+            (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        }
+        .filter { $0.pathExtension == "gz" }
+        .sorted { modified($0) > modified($1) }
+        var seen = Set<String>()
+        files.append(contentsOf: rolled.filter { seen.insert($0.lastPathComponent).inserted }.prefix(3))
+        // The engine writes crash reports beside its log (`Library/Application Support/horizon`),
+        // the launcher in `Documents`: share the newest of the two, as the log above.
+        let folders: [URL] = [documents.appendingPathComponent("crash-reports"),
+                              engine.appendingPathComponent("crash-reports")]
+        let reports: [URL] = folders.flatMap { folder in
+            (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        }
+        let crashes = reports.filter { $0.lastPathComponent.hasPrefix("crash-") && $0.pathExtension == "txt" }
+        if let newest = crashes.max(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            files.append(newest)
+        }
+        guard let host = gameViewController() else { return }
+        let items: [Any]
+        if let archive = LogsArchive.write(files) {
+            items = [archive]
+        } else {
+            items = files.isEmpty ? ["Horizon has written no logs yet."] : files
+        }
+        let sheet = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let popover = sheet.popoverPresentationController {
+            popover.sourceView = host.view
+            popover.sourceRect = CGRect(x: host.view.bounds.midX, y: host.view.bounds.midY, width: 1, height: 1)
+        }
+        host.present(sheet, animated: true)
     }
 
-    private func choice(_ values: [(String, String)], current: String) -> some View {
-        HStack {
-            title
-            Spacer()
-            Menu {
-                ForEach(values.indices, id: \.self) { index in
-                    let (value, name) = values[index]
-                    Button {
-                        Haptics.tap()
-                        set(value)
-                    } label: {
-                        if value == current {
-                            Label(name, systemImage: "checkmark")
-                        } else {
-                            Text(name)
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Text(values.first(where: { $0.0 == current })?.1 ?? current)
-                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 10, weight: .semibold))
-                }
-                .font(Theme.sans(13, .semiBold))
-                .foregroundStyle(Theme.accentText)
-            }
-        }
-    }
-
-    private var slider: some View {
-        let low = option.min ?? 0
-        let high = Swift.max(low + (option.step ?? 1), Swift.min(option.max ?? low + 10, row.cap ?? .infinity))
-        let step = option.step ?? (option.type == "int" ? 1 : 0.01)
-        let shown = dragging ?? option.number
-        return VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                title
-                Spacer()
-                Text(row.format(shown)).font(Theme.mono(11)).foregroundStyle(Theme.accentText)
-            }
-            Slider(
-                value: Binding(get: { Swift.min(Swift.max(shown, low), high) }, set: { dragging = $0 }),
-                in: low...high,
-                step: step,
-                onEditingChanged: { editing in
-                    // Sent when the finger lifts: each change reloads what depends on it (chunks, for distance).
-                    if !editing, let value = dragging {
-                        set(option.type == "int" ? String(Int(value.rounded())) : String(value))
-                        dragging = nil
-                    }
-                }
-            )
-            .tint(Theme.accent)
-        }
+    private func modified(_ url: URL) -> Date {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
     }
 }
 
@@ -253,7 +231,6 @@ private struct About: View {
         VStack(alignment: .leading, spacing: 10) {
             line("Horizon for iPhone and iPad", Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
             line("Build", Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "")
-            line("Input", "iPad keyboard + pointer lock")
             line("Minecraft: Java Edition", version)
             line("Game files", GameFolder.hasGameFiles ? "Installed" : "Not installed")
             Link(destination: URL(string: "https://github.com/heyskylo/horizon-ios")!) {

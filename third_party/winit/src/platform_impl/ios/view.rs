@@ -5,13 +5,16 @@ use std::collections::HashMap;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
-use objc2_foundation::{CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
+use objc2_foundation::{
+    CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSProcessInfo, NSProcessInfoThermalState,
+    NSSet, NSString,
+};
 use objc2_ui_kit::{
-    UIHoverGestureRecognizer, UICoordinateSpace, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
-    UIGestureRecognizerDelegate, UIGestureRecognizerState, UIKeyInput, UIPanGestureRecognizer,
-    UIPinchGestureRecognizer, UIPress, UIPressesEvent, UIResponder, UIRotationGestureRecognizer,
-    UITapGestureRecognizer, UITextInputTraits, UITouch, UITouchPhase, UITouchType,
-    UITraitEnvironment, UIView,
+    UICoordinateSpace, UIDevice, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
+    UIGestureRecognizerDelegate, UIGestureRecognizerState, UIHoverGestureRecognizer, UIKeyInput,
+    UIPanGestureRecognizer, UIPinchGestureRecognizer, UIPress, UIPressesEvent, UIResponder,
+    UIRotationGestureRecognizer, UIScreen, UITapGestureRecognizer, UITextInputTraits, UITouch,
+    UITouchPhase, UITouchType, UITraitEnvironment, UIUserInterfaceIdiom, UIView,
 };
 
 use super::app_state::{self, EventWrapper};
@@ -19,7 +22,7 @@ use super::window::WinitUIWindow;
 use crate::dpi::PhysicalPosition;
 use crate::event::{ElementState, Event, Force, KeyEvent, Touch, TouchPhase, WindowEvent};
 use crate::keyboard::{
-    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey,
+    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey,
 };
 use crate::platform_impl::platform::DEVICE_ID;
 use crate::platform_impl::KeyEventExtra;
@@ -75,18 +78,10 @@ declare_class!(
             let mtm = MainThreadMarker::new().unwrap();
             let _: () = unsafe { msg_send![super(self), layoutSubviews] };
 
-            let window = self.window().unwrap();
+            // A full-screen modal (the launcher) takes the game's view out of its window while
+            // it covers it, and that view can still be laid out: there is no window to resize to.
+            let Some(window) = self.window() else { return };
             let window_bounds = window.bounds();
-            let screen = window.screen();
-            let screen_space = screen.coordinateSpace();
-            let screen_frame = self.convertRect_toCoordinateSpace(window_bounds, &screen_space);
-            let scale_factor = screen.scale();
-            let size = crate::dpi::LogicalSize {
-                width: screen_frame.size.width as f64,
-                height: screen_frame.size.height as f64,
-            }
-            .to_physical(scale_factor as f64);
-
             // If the app is started in landscape, the view frame and window bounds can be mismatched.
             // The view frame will be in portrait and the window bounds in landscape. So apply the
             // window bounds to the view frame to make it consistent.
@@ -94,6 +89,15 @@ declare_class!(
             if view_frame != window_bounds {
                 self.setFrame(window_bounds);
             }
+
+            // Match Window::inner_size, the Metal layer, and view-local input.
+            // Query after correcting the frame so rotation cannot report old bounds.
+            let bounds = self.bounds();
+            let size = crate::dpi::LogicalSize {
+                width: bounds.size.width as f64,
+                height: bounds.size.height as f64,
+            }
+            .to_physical(self.contentScaleFactor() as f64);
 
             app_state::handle_nonuser_event(
                 mtm,
@@ -130,12 +134,9 @@ declare_class!(
             );
             let scale_factor = scale_factor as f64;
             let bounds = self.bounds();
-            let screen = window.screen();
-            let screen_space = screen.coordinateSpace();
-            let screen_frame = self.convertRect_toCoordinateSpace(bounds, &screen_space);
             let size = crate::dpi::LogicalSize {
-                width: screen_frame.size.width as f64,
-                height: screen_frame.size.height as f64,
+                width: bounds.size.width as f64,
+                height: bounds.size.height as f64,
             };
             let window_id = RootWindowId(window.id());
             app_state::handle_nonuser_events(
@@ -194,6 +195,11 @@ declare_class!(
                     (TouchPhase::Moved, recognizer.scale() - last_scale)
                 }
                 UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
+                    log_to_console(&format!(
+                        "pinch gesture {:?} at {:.2}; the zoom it had is undone",
+                        recognizer.state(),
+                        recognizer.scale()
+                    ));
                     self.ivars().rotation_last_delta.set(0.0);
                     // Pass -delta so that action is reversed
                     (TouchPhase::Cancelled, -recognizer.scale())
@@ -252,6 +258,11 @@ declare_class!(
                     (TouchPhase::Ended, recognizer.rotation() - last_rotation)
                 }
                 UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
+                    log_to_console(&format!(
+                        "rotation gesture {:?} at {:.1} degrees; the turn it had is undone",
+                        recognizer.state(),
+                        recognizer.rotation().to_degrees()
+                    ));
                     self.ivars().rotation_last_delta.set(0.0);
 
                     // Pass -delta so that action is reversed
@@ -304,6 +315,12 @@ declare_class!(
                 }
                 UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
                     let last_pan: CGPoint = self.ivars().pan_last_delta.replace(CGPoint{x:0.0, y:0.0});
+                    log_to_console(&format!(
+                        "pan gesture {:?} after ({:.0}, {:.0}) points; the swipe it had is undone",
+                        recognizer.state(),
+                        last_pan.x,
+                        last_pan.y
+                    ));
 
                     // Pass -delta so that action is reversed
                     (TouchPhase::Cancelled, -last_pan.x, -last_pan.y)
@@ -412,12 +429,98 @@ declare_class!(
     }
 );
 
+/// The device console (`os_log`): the game's own log has no winit messages on a phone, and a build that
+/// types nothing into a field needs the keyboard's side of the story beside the game's.
+pub(super) fn log_to_console(message: &str) {
+    // The game's log, when it asked for these (`set_log_hook`): a phone's console is not in
+    // the zip a player shares, its `logs/latest.log` is.
+    if let Some(hook) = *LOG_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        hook(message);
+    }
+    extern "C" {
+        // `NSLog(NSString *format, ...)`: the format is an object, not a C string. Handing it a
+        // `c"%s"` messages a C buffer as an `NSString` and segfaults in `objc_msgSend`.
+        fn NSLog(format: *mut objc2::runtime::AnyObject, ...);
+    }
+    let format = NSString::from_str("%@");
+    let line = NSString::from_str(message);
+    // SAFETY: both arguments are live `NSString`s and `%@` forwards the second one unchanged.
+    unsafe {
+        NSLog(
+            &*format as *const NSString as *mut objc2::runtime::AnyObject,
+            &*line as *const NSString as *mut objc2::runtime::AnyObject,
+        );
+    }
+}
+
+/// Where [`log_to_console`]'s messages go besides the console.
+static LOG_HOOK: std::sync::Mutex<Option<fn(&str)>> = std::sync::Mutex::new(None);
+
+/// Sends [`log_to_console`]'s messages to `hook` (the game's log) as well.
+pub(crate) fn set_log_hook(hook: Option<fn(&str)>) {
+    *LOG_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+}
+
+/// The phone this build runs on, once: a graphics line or a missed touch means more beside the screen it
+/// was drawn on and the heat and power the phone was under when it happened.
+#[allow(deprecated)] // `UIScreen::mainScreen` is the only screen at this point: no window exists yet.
+pub(super) fn log_device_once(mtm: MainThreadMarker) {
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if LOGGED.set(()).is_err() {
+        return;
+    }
+    let device = UIDevice::currentDevice(mtm);
+    // SAFETY: plain getters on a live `UIDevice`.
+    let (system, model, version) = unsafe {
+        (
+            device.systemName(),
+            device.model(),
+            device.systemVersion(),
+        )
+    };
+    log_to_console(&format!(
+        "device: {system} {version}, {model}, {:?}",
+        device.userInterfaceIdiom()
+    ));
+    let process = NSProcessInfo::processInfo();
+    let thermal = match unsafe { process.thermalState() } {
+        NSProcessInfoThermalState::Nominal => "nominal",
+        NSProcessInfoThermalState::Fair => "fair",
+        NSProcessInfoThermalState::Serious => "serious",
+        NSProcessInfoThermalState::Critical => "critical",
+        other => return log_to_console(&format!("device: unknown thermal state {other:?}")),
+    };
+    log_to_console(&format!(
+        "device: {:.1} GB RAM, {} cores, thermal {thermal}, low power mode {}",
+        unsafe { process.physicalMemory() } as f64 / (1024.0 * 1024.0 * 1024.0),
+        unsafe { process.activeProcessorCount() },
+        unsafe { process.isLowPowerModeEnabled() },
+    ));
+    let screen = UIScreen::mainScreen(mtm);
+    let bounds = screen.bounds();
+    let scale = screen.scale();
+    log_to_console(&format!(
+        "screen: {}x{} points at {scale}x ({}x{} pixels), up to {} Hz",
+        bounds.size.width,
+        bounds.size.height,
+        bounds.size.width * scale,
+        bounds.size.height * scale,
+        screen.maximumFramesPerSecond(),
+    ));
+}
+
 impl WinitView {
     pub(crate) fn new(
         mtm: MainThreadMarker,
         window_attributes: &WindowAttributes,
         frame: CGRect,
     ) -> Retained<Self> {
+        log_device_once(mtm);
         let this = mtm.alloc().set_ivars(WinitViewState {
             pinch_gesture_recognizer: RefCell::new(None),
             doubletap_gesture_recognizer: RefCell::new(None),
@@ -435,7 +538,13 @@ impl WinitView {
         let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
 
         this.setMultipleTouchEnabled(true);
-        let hover = unsafe { UIHoverGestureRecognizer::initWithTarget_action(mtm.alloc(), Some(&*this), Some(sel!(hardwareHover:))) };
+        let hover = unsafe {
+            UIHoverGestureRecognizer::initWithTarget_action(
+                mtm.alloc(),
+                Some(&*this),
+                Some(sel!(hardwareHover:)),
+            )
+        };
         this.addGestureRecognizer(&hover);
 
         if let Some(scale_factor) = window_attributes.platform_specific.scale_factor {
@@ -548,7 +657,8 @@ impl WinitView {
         let mut touch_events = Vec::new();
         let os_supports_force = app_state::os_capabilities().force_touch;
         for touch in touches {
-            let logical_location = touch.locationInView(None);
+            // Hover, direct touches and trackpad clicks share the render-view origin.
+            let logical_location = touch.locationInView(Some(self));
             let touch_type = touch.r#type();
             if touch_type == UITouchType::IndirectPointer && self.ivars().mouse.captured() {
                 continue;
@@ -599,15 +709,26 @@ impl WinitView {
             };
             if touch_type == UITouchType::IndirectPointer {
                 touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                    window_id: RootWindowId(window.id()), event: WindowEvent::CursorMoved {
-                        device_id: DEVICE_ID, position: physical_location,
+                    window_id: RootWindowId(window.id()),
+                    event: WindowEvent::CursorMoved {
+                        device_id: DEVICE_ID,
+                        position: physical_location,
                     },
                 }));
-                if matches!(phase, TouchPhase::Started | TouchPhase::Ended | TouchPhase::Cancelled) {
+                if matches!(
+                    phase,
+                    TouchPhase::Started | TouchPhase::Ended | TouchPhase::Cancelled
+                ) {
                     touch_events.push(EventWrapper::StaticEvent(Event::WindowEvent {
-                        window_id: RootWindowId(window.id()), event: WindowEvent::MouseInput {
-                            device_id: DEVICE_ID, button: crate::event::MouseButton::Left,
-                            state: if phase == TouchPhase::Started { ElementState::Pressed } else { ElementState::Released },
+                        window_id: RootWindowId(window.id()),
+                        event: WindowEvent::MouseInput {
+                            device_id: DEVICE_ID,
+                            button: crate::event::MouseButton::Left,
+                            state: if phase == TouchPhase::Started {
+                                ElementState::Pressed
+                            } else {
+                                ElementState::Released
+                            },
                         },
                     }));
                 }
@@ -629,18 +750,35 @@ impl WinitView {
     }
 
     pub(crate) fn set_mouse_captured(&self, captured: bool) {
+        if self.ivars().mouse.captured() != captured {
+            log_to_console(&format!("mouse capture: {captured}"));
+        }
         self.ivars().mouse.capture(captured);
         self.update_mice();
     }
 
     pub(crate) fn update_mice(&self) {
         if let Some(window) = self.window() {
-            self.ivars().mouse.update(RootWindowId(window.id()));
+            let size = self.bounds().size;
+            let scale = self.contentScaleFactor() as f64;
+            // A phone has no system pointer to lock or to hover with: its mouse's relative
+            // motion is what the game's cursor follows.
+            let phone = UIDevice::currentDevice(MainThreadMarker::from(self)).userInterfaceIdiom()
+                == UIUserInterfaceIdiom::Phone;
+            self.ivars().mouse.update(
+                RootWindowId(window.id()),
+                (size.width * scale, size.height * scale),
+                scale,
+                phone,
+            );
         }
     }
 
     pub(crate) fn set_ime_allowed(&self, allowed: bool) {
-        self.ivars().ime_allowed.set(allowed);
+        let was = self.ivars().ime_allowed.replace(allowed);
+        if was != allowed {
+            log_to_console(&format!("the game asked for the keyboard: {allowed}"));
+        }
         unsafe {
             self.reloadInputViews();
             self.becomeFirstResponder();
@@ -708,15 +846,15 @@ impl WinitView {
             }
             let text = unsafe { key.characters() }.to_string();
             let logical_key = super::hardware_keyboard::logical_key(physical_key, &text);
+            let event_text = if state == ElementState::Pressed {
+                super::hardware_keyboard::key_text(&logical_key, &text)
+            } else {
+                None
+            };
             let event = KeyEvent {
                 physical_key,
                 logical_key,
-                text: (state == ElementState::Pressed
-                    && !text.is_empty()
-                    && !text
-                        .chars()
-                        .any(|c| c.is_control() || ('\u{f700}'..='\u{f8ff}').contains(&c)))
-                .then(|| text.into()),
+                text: event_text,
                 location: super::hardware_keyboard::location(physical_key),
                 state,
                 repeat: state == ElementState::Pressed
@@ -737,44 +875,53 @@ impl WinitView {
     }
 
     fn handle_insert_text(&self, text: &NSString) {
+        log_to_console(&format!(
+            "the keyboard typed {:?} (keyboard allowed: {})",
+            text.to_string(),
+            self.ivars().ime_allowed.get()
+        ));
         let window = self.window().unwrap();
         let window_id = RootWindowId(window.id());
         let mtm = MainThreadMarker::new().unwrap();
-        // send individual events for each character
+        // Both software typing and hardware navigation can arrive via insertText:.
+        // Decode navigation tokens before expanding genuine text into characters.
         app_state::handle_nonuser_events(
             mtm,
-            text.to_string().chars().flat_map(|c| {
-                let text = smol_str::SmolStr::from_iter([c]);
-                // Emit both press and release events
-                [ElementState::Pressed, ElementState::Released].map(|state| {
-                    EventWrapper::StaticEvent(Event::WindowEvent {
-                        window_id,
-                        event: WindowEvent::KeyboardInput {
-                            event: KeyEvent {
-                                text: if state == ElementState::Pressed {
-                                    Some(text.clone())
-                                } else {
-                                    None
+            super::hardware_keyboard::insert_text_keys(&text.to_string())
+                .into_iter()
+                .flat_map(|(physical_key, logical_key)| {
+                    let text = match &logical_key {
+                        Key::Character(text) => Some(text.clone()),
+                        _ => None,
+                    };
+                    [ElementState::Pressed, ElementState::Released].map(|state| {
+                        EventWrapper::StaticEvent(Event::WindowEvent {
+                            window_id,
+                            event: WindowEvent::KeyboardInput {
+                                event: KeyEvent {
+                                    text: if state == ElementState::Pressed {
+                                        text.clone()
+                                    } else {
+                                        None
+                                    },
+                                    state,
+                                    location: KeyLocation::Standard,
+                                    repeat: false,
+                                    logical_key: logical_key.clone(),
+                                    physical_key,
+                                    platform_specific: KeyEventExtra {},
                                 },
-                                state,
-                                location: KeyLocation::Standard,
-                                repeat: false,
-                                logical_key: Key::Character(text.clone()),
-                                physical_key: PhysicalKey::Unidentified(
-                                    NativeKeyCode::Unidentified,
-                                ),
-                                platform_specific: KeyEventExtra {},
+                                is_synthetic: false,
+                                device_id: DEVICE_ID,
                             },
-                            is_synthetic: false,
-                            device_id: DEVICE_ID,
-                        },
+                        })
                     })
-                })
-            }),
+                }),
         );
     }
 
     fn handle_delete_backward(&self) {
+        log_to_console("the keyboard deleted a character");
         let window = self.window().unwrap();
         let window_id = RootWindowId(window.id());
         let mtm = MainThreadMarker::new().unwrap();

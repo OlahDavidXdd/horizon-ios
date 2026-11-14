@@ -7,7 +7,7 @@
 //! usage: chat_screen_fixture RESOURCES REGISTRIES CASES OUTPUT
 use crate::pack_screen_fixture;
 use horizon_client::{
-    chat::{ChatAction, ChatScreen, Commands},
+    chat::{ChatAbilities, ChatAction, ChatScreen, ChatVisibility, Commands},
     command::vanilla,
     hud::HudAtlas,
     lang,
@@ -50,9 +50,11 @@ pub fn main() -> horizon_client::Result<()> {
             &m,
             &c,
             case["initial"].as_str().unwrap_or(""),
+            false,
             history.len(),
             w,
             h,
+            ChatAbilities::new(ChatVisibility::Full),
         );
         screen.auto_suggestions = case["autoSuggest"] == true;
         let mut closed = false;

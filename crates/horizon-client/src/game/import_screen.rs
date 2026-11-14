@@ -29,6 +29,19 @@ pub(super) struct Import {
     /// The game files coming from the download server (`import::download`): the first door, tried
     /// before the screen asks anyone to send them. `None` once it is over or failed.
     download: Option<horizon_client::import::download::Download>,
+    /// A look for an archive dropped into the folder while this screen is up. It runs on its own
+    /// thread: an install is the same hundreds of megabytes the launch loader unpacks.
+    watch: Option<Watch>,
+    /// The zips the folder held at the last look, as name, size and modification: an unchanged
+    /// folder is not scanned again, so an archive that is not ours is left alone once.
+    listing: Vec<String>,
+    /// The earliest next look: a folder need not be read every frame.
+    next_watch: std::time::Instant,
+}
+
+/// One look at the folder for a zip the Files app left there, and what it installed.
+struct Watch {
+    installed: std::sync::mpsc::Receiver<Vec<horizon_client::import::Installed>>,
 }
 
 /// Whether this run has downloaded the game files already.
@@ -85,6 +98,7 @@ impl Loading {
             "Horizon: no game files to load ({reason}); waiting for an import in {}",
             home.display()
         );
+        let next_watch = std::time::Instant::now();
         self.import = Some(Import {
             session,
             atlas,
@@ -94,6 +108,9 @@ impl Loading {
             received: 0,
             total: 0,
             download,
+            watch: None,
+            listing: Vec::new(),
+            next_watch,
         });
     }
 
@@ -170,6 +187,41 @@ impl Loading {
                 }
             }
         }
+        // A zip dropped into the folder while this screen is up takes the same door the launch
+        // loader's `scan` uses; without it only a relaunch would ever see the file.
+        let now = std::time::Instant::now();
+        match import
+            .watch
+            .as_ref()
+            .map(|watch| watch.installed.try_recv())
+        {
+            Some(Ok(installed)) => {
+                import.watch = None;
+                import.next_watch = now + std::time::Duration::from_secs(1);
+                for placed in installed {
+                    log::info!(
+                        "Horizon: imported {} ({} files) to {}",
+                        placed.kind.label(),
+                        placed.files,
+                        placed.path.display()
+                    );
+                    ready |= placed.kind == horizon_client::import::Kind::Resources;
+                }
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                import.watch = None;
+                import.next_watch = now + std::time::Duration::from_secs(5);
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+        }
+        if import.watch.is_none() && import.download.is_none() && now >= import.next_watch {
+            import.next_watch = now + std::time::Duration::from_millis(500);
+            let listing = zip_listing(&import.home);
+            if listing != import.listing {
+                import.listing = listing;
+                import.watch = Some(start_watch(&import.home));
+            }
+        }
         if ready {
             return self.files_arrived();
         }
@@ -233,28 +285,45 @@ impl Loading {
         self.import.as_ref().map(|import| import.reason.as_str())
     }
 
+    /// Resolve newly installed files before a loader captures its vanilla base.
+    /// An existing explicit base wins; a staged pack overlay is never the base.
+    pub(super) fn refresh_import_root(&mut self, home: &std::path::Path) -> Result<()> {
+        let options = self.options.as_mut().ok_or("loading already finished")?;
+        let root = horizon_client::import::resources_root(&self.vanilla_root, Some(home))
+            // A concurrent publish briefly has only resources.previous. Keep
+            // the intended import destination; the worker's lease waits for
+            // publication before it reads, without blocking the frame thread.
+            .or_else(|| home.is_dir().then(|| home.join("resources")));
+        if let Some(root) = root {
+            options.resources = root.clone();
+            self.vanilla_root = root;
+        }
+        Ok(())
+    }
+
     /// Start the loader again on the files that arrived, as if the first attempt had found them.
     fn load_the_files_that_arrived(&mut self, home: std::path::PathBuf) -> Result<()> {
         self.loaded = None;
+        self.delivered = false;
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
         self.progress = Progress::new();
-        let mut options = self.options.take().ok_or("loading already finished")?;
-        if let Some(root) = horizon_client::import::resources_root(&options.resources, Some(&home))
-        {
-            options.resources = root;
-        }
-        let (receiver, handle) = startup_menu::spawn_loader(
+        self.refresh_import_root(&home)?;
+        let options = self.options.take().ok_or("loading already finished")?;
+        let spawned = startup_menu::spawn_loader(
             &options,
             &self.settings,
             &self.vanilla_root,
             self.started,
             &self.progress,
-        )?;
+        );
+        // A failed thread spawn must not consume the options needed by retry
+        // or by a native cancellation returning to the idle launcher.
+        self.options = Some(options);
+        let (receiver, handle) = spawned?;
         self.receiver = receiver;
         self.handle = Some(handle);
-        self.options = Some(options);
         log::info!("Horizon: loading the imported game files");
         Ok(())
     }
@@ -292,6 +361,49 @@ impl Loading {
             },
         );
     }
+}
+
+/// The zips in the folder, as name, size and modification: what tells a new archive from the one
+/// the last look already saw.
+fn zip_listing(home: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return Vec::new();
+    };
+    let mut zips = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("zip") {
+            continue;
+        }
+        let metadata = entry.metadata().ok();
+        let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+        let modified = metadata
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_secs());
+        zips.push(format!(
+            "{}:{size}:{modified}",
+            entry.file_name().to_string_lossy()
+        ));
+    }
+    zips.sort();
+    zips
+}
+
+/// The folder door while the screen waits: look for an archive on its own thread, since `scan`
+/// unpacks whatever it finds before it answers.
+fn start_watch(home: &std::path::Path) -> Watch {
+    let (sender, installed) = std::sync::mpsc::channel();
+    let home = home.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("import-watch".into())
+        .spawn(move || {
+            let _ = sender.send(horizon_client::import::scan(&home));
+        });
+    if let Err(error) = spawned {
+        log::warn!("Horizon: the import folder is not being watched: {error}");
+    }
+    Watch { installed }
 }
 
 /// The Wi-Fi door: a listener for an upload. Its address goes to the log too: a phone plugged into a Mac

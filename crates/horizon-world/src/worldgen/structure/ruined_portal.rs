@@ -25,6 +25,17 @@ pub enum Vertical {
     InNether,
 }
 impl Vertical {
+    /// `RuinedPortalPiece.VerticalPlacement.getSerializedName`.
+    pub(super) fn saved_name(self) -> &'static str {
+        match self {
+            Self::OnLandSurface => "on_land_surface",
+            Self::PartlyBuried => "partly_buried",
+            Self::OnOceanFloor => "on_ocean_floor",
+            Self::InMountain => "in_mountain",
+            Self::Underground => "underground",
+            Self::InNether => "in_nether",
+        }
+    }
     fn heightmap(self) -> HeightmapType {
         if self == Self::OnOceanFloor {
             HeightmapType::OceanFloorWg
@@ -69,10 +80,13 @@ impl Setup {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct PortalProps {
-    placement: Vertical,
-    cold: bool,
-    overgrown: bool,
-    vines: bool,
+    pub(super) placement: Vertical,
+    pub(super) mossiness: f32,
+    pub(super) air_pocket: bool,
+    pub(super) blackstone: bool,
+    pub(super) cold: bool,
+    pub(super) overgrown: bool,
+    pub(super) vines: bool,
 }
 
 fn between(random: &mut impl RandomSource, min: i32, max: i32) -> i32 {
@@ -182,49 +196,14 @@ pub fn start(
     };
     let props = PortalProps {
         placement: setup.placement,
+        mossiness: setup.mossiness,
+        air_pocket,
+        blackstone: setup.blackstone,
         cold,
         overgrown: setup.overgrown,
         vines: setup.vines,
     };
-    let rule = |source: &str, probability: Option<f32>, target: &str| {
-        let input = match probability {
-            Some(p) => {
-                json!({"predicate_type": "minecraft:random_block_match", "block": source, "probability": p})
-            }
-            None => json!({"predicate_type": "minecraft:block_match", "block": source}),
-        };
-        json!({"input_predicate": input, "location_predicate": {"predicate_type": "minecraft:always_true"}, "output_state": target})
-    };
-    let mut rules = vec![rule("minecraft:gold_block", Some(0.3), "minecraft:air")];
-    rules.push(if setup.placement == Vertical::OnOceanFloor {
-        rule("minecraft:lava", None, "minecraft:magma_block")
-    } else if cold {
-        rule("minecraft:lava", None, "minecraft:netherrack")
-    } else {
-        rule("minecraft:lava", Some(0.2), "minecraft:magma_block")
-    });
-    if !cold {
-        rules.push(rule(
-            "minecraft:netherrack",
-            Some(0.07),
-            "minecraft:magma_block",
-        ));
-    }
-    let mut list = vec![
-        json!({"processor_type": "minecraft:rule", "rules": rules}),
-        json!({"processor_type": "minecraft:block_age", "mossiness": setup.mossiness}),
-        json!({"processor_type": "minecraft:protected_blocks", "value": "#minecraft:features_cannot_replace"}),
-        json!({"processor_type": "minecraft:lava_submerged_block"}),
-    ];
-    if setup.blackstone {
-        list.push(json!({"processor_type": "minecraft:blackstone_replace"}));
-    }
-    let processors = ProcessorList::decode(
-        &json!({ "processors": list }).to_string(),
-        resources,
-        bindings,
-    )
-    .ok()?;
+    let processors = processors(resources, bindings, props)?;
     let mut ignore = vec!["minecraft:structure_block".to_owned()];
     if !air_pocket {
         ignore.push("minecraft:air".into());
@@ -237,12 +216,60 @@ pub fn start(
         rotation,
         mirror,
         pivot,
-        Arc::new(processors),
+        processors,
         true,
         ignore,
         TemplateHandler::RuinedPortal(props),
     );
     Some((origin, piece))
+}
+
+/// `RuinedPortalPiece.makeSettings`: rebuild the same processor chain on load and generation.
+pub(super) fn processors(
+    resources: &StructureResources,
+    bindings: &FeatureBlockBindings<'_>,
+    props: PortalProps,
+) -> Option<Arc<ProcessorList>> {
+    let rule = |source: &str, probability: Option<f32>, target: &str| {
+        let input = match probability {
+            Some(p) => {
+                json!({"predicate_type": "minecraft:random_block_match", "block": source, "probability": p})
+            }
+            None => json!({"predicate_type": "minecraft:block_match", "block": source}),
+        };
+        json!({"input_predicate": input, "location_predicate": {"predicate_type": "minecraft:always_true"}, "output_state": target})
+    };
+    let mut rules = vec![rule("minecraft:gold_block", Some(0.3), "minecraft:air")];
+    rules.push(if props.placement == Vertical::OnOceanFloor {
+        rule("minecraft:lava", None, "minecraft:magma_block")
+    } else if props.cold {
+        rule("minecraft:lava", None, "minecraft:netherrack")
+    } else {
+        rule("minecraft:lava", Some(0.2), "minecraft:magma_block")
+    });
+    if !props.cold {
+        rules.push(rule(
+            "minecraft:netherrack",
+            Some(0.07),
+            "minecraft:magma_block",
+        ));
+    }
+    let mut list = vec![
+        json!({"processor_type": "minecraft:rule", "rules": rules}),
+        json!({"processor_type": "minecraft:block_age", "mossiness": props.mossiness}),
+        json!({"processor_type": "minecraft:protected_blocks", "value": "#minecraft:features_cannot_replace"}),
+        json!({"processor_type": "minecraft:lava_submerged_block"}),
+    ];
+    if props.blackstone {
+        list.push(json!({"processor_type": "minecraft:blackstone_replace"}));
+    }
+    let processors = ProcessorList::decode(
+        &json!({ "processors": list }).to_string(),
+        resources,
+        bindings,
+    )
+    .ok()?;
+    Some(Arc::new(processors))
 }
 
 const NETHERRACK_BY_DISTANCE: [f32; 14] = [
@@ -378,4 +405,29 @@ pub fn post_process(piece: &TemplatePiece, c: &mut PieceContext<'_>) -> Result<(
         }
     }
     Ok(())
+}
+
+impl PortalProps {
+    /// `RuinedPortalPiece`'s `VerticalPlacement` and `Properties` tags.
+    pub fn save(&self) -> [(&'static str, crate::nbt::Tag); 2] {
+        use crate::nbt::Tag;
+        let flag = |b: bool| Tag::Byte(i8::from(b));
+        [
+            (
+                "VerticalPlacement",
+                Tag::String(self.placement.saved_name().into()),
+            ),
+            (
+                "Properties",
+                Tag::compound([
+                    ("cold", flag(self.cold)),
+                    ("mossiness", Tag::Float(self.mossiness.to_bits())),
+                    ("air_pocket", flag(self.air_pocket)),
+                    ("overgrown", flag(self.overgrown)),
+                    ("vines", flag(self.vines)),
+                    ("replace_with_blackstone", flag(self.blackstone)),
+                ]),
+            ),
+        ]
+    }
 }

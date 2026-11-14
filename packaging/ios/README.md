@@ -6,7 +6,7 @@ Three files and one crate make the app shell, and a fourth puts the game itself 
   `brew install xcodegen && xcodegen generate` in this folder to write `HorizonIOS.xcodeproj`, which is
   not checked in. Its paths are relative to this directory, so generate it from here.
 - `Info.plist`: the bundle's plist, filled in by Xcode from `project.yml`'s `MARKETING_VERSION` and
-  `CURRENT_PROJECT_VERSION`. Bundle id `dev.horizon.ios`, iOS 16 or later, iPhone and iPad.
+  `CURRENT_PROJECT_VERSION`. Bundle id `dev.horizon.ios`, iOS 15 or later, iPhone and iPad.
 - `Sources/main.m`: the app. One `AppDelegate`, one view controller, and no storyboard: it calls
   `horizon_probe()` in `viewDidLoad` and shows what came back in a monospaced text view.
 - `GameInfo.plist`: a second bundle's plist, for the `.ipa` whose executable is the cross-compiled
@@ -51,7 +51,7 @@ between this bundle and a playable one:
 | Gap | Why it is structural | Decided |
 |---|---|---|
 | Assets | `horizon-prepare` runs a JDK against the player's own Minecraft install to produce `.local/horizon-client/26.3`; there is no Java on iOS | Prepare off-device, download to the phone |
-| Mods | `horizon-mods` runs them through wasmtime's cranelift JIT, and Apple forbids generating executable code at runtime (`docs/mods.md`) -- note the runner says the `mods` *feature compiles*, which is about the compiler and not about running | Disabled on iOS |
+| Mods | Native mods (`.hnmod`) are Rust built into the game, and code-bearing `.hmod` files need wasmtime's cranelift JIT, which Apple forbids at runtime (`docs/mods.md`) -- note the runner says the `mods` *feature compiles*, which is about the compiler and not about running | Content `.hmod` mods install, list, switch and delete from the launcher's Mods page; native and code mods do not run on iOS |
 | Input | the client's winit loop is desktop-shaped: cursor-warp mouse look, no touch | A touch layer, in no crate yet |
 | Sound, controllers | `hidapi`/`gilrs` need libudev or IOKit, which is what `--no-default-features` drops and why the phone build asks for that flag; `cpal` (the `audio` feature) has a CoreAudio backend for iOS too, through RemoteIO | `--features audio` on the phone, with the launcher setting up the audio session; `GCController` for pads |
 
@@ -116,8 +116,9 @@ claim and not an assumption.
 
 The game is landscape-only on a phone, and both halves are needed:
 
-- `UISupportedInterfaceOrientations` in `Info.plist` and `GameInfo.plist` lists the two landscape directions and
-  no portrait. This is what the launch screen and the bundle's own metadata are judged by.
+- `UISupportedInterfaceOrientations` in `Info.plist` lists the two landscape directions and no portrait, and
+  `GameInfo.plist` adds portrait for the launcher, which turns with the device while it covers the game. This is
+  what the launch screen and the bundle's own metadata are judged by.
 - `ValidOrientations::Landscape` on the winit window attributes (`crates/horizon-client/src/game.rs`, both
   `resumed` implementations). Without it the plist alone does not hold: winit implements
   `supportedInterfaceOrientations` on its own view controller from its default
@@ -184,15 +185,18 @@ back with the new reason and asks again on a new port with new digits, so a bad 
 rather than a dead end.
 
 **By cable, with no network involved.** Copy the same `.zip` into the app's `Documents` folder -- Finder's
-*Files* tab, or iTunes' *File Sharing*, or any manager that gets there -- and launch. `main.rs` unpacks what it
-finds there before the game looks for its resources, then deletes the archive.
+*Files* tab, or iTunes' *File Sharing*, or any manager that gets there -- and launch. The game unpacks what it
+finds there on a worker while the launcher draws its progress (the launcher's *Preparing game files* screen,
+fed by `launcher-state`'s `import`), then deletes the archive. Unpacking on the launch thread is what iOS's
+watchdog kills before a window appears; the resource loader unpacks on its own thread, before it reads the folder.
 
 Both doors route by the archive's root, so one file format carries three things: `horizon-resources.json` is
 the game files, `level.dat` is a world (into `Documents/saves`, never over one that exists), `pack.mcmeta` is a
 resource pack, which stays a `.zip` because the game reads those where they are. An archive that will not
 unpack is renamed `<name>.zip.failed` rather than retried every launch, and an unpacking that a flat battery
 interrupts is finished, or its old tree put back, on the next start -- `import::recover`, before anything reads
-the folder it was working on.
+the folder it was working on. A tree cut short is never published: the unpacker writes
+`resources.unpacking.done` last, and `recover` only promotes a scratch tree that carries it.
 
 What is measured of this, on Linux rather than on a phone: a game started with no files stayed open, refused a
 wrong code with `403` and wrote nothing, took a real archive posted to the address it logged, unpacked it into
@@ -205,6 +209,28 @@ nothing installed, but nobody has read it on a real phone yet. Nobody has run th
 is measured there is in the workflow's summary -- the game compiles for the target, links, and comes out of
 Xcode's bundle as the same bytes Cargo wrote.
 
+### Checking first-run import without a device
+
+The shared importer can be checked end to end with prebuilt desktop binaries and
+resources prepared from your own game:
+
+```sh
+python3 tools/test_import_startup.py --bin-dir target/fast \
+  --resources .local/horizon-client/26.3
+```
+
+This starts a scratch game without resources, serves a temporary archive over
+loopback, and requires the game to reach its title without restarting and exit
+cleanly. It checks the installed manifest and rejects Authorization headers on the
+automatic download. Logs and a JSON result go under `.local/import-startup`; the
+archive and installed test copy are removed afterward. `--scratch-parent` can put
+those temporary files on a drive with enough free space.
+
+The desktop explicitly enables `HORIZON_IMPORT_SCREEN` to exercise the shared
+first-run flow. This does not verify physical iOS input, orientation, or shader
+appearance. Native launcher download/import presentation is covered separately by
+`tools/test_ios_game_files.py` on the Simulator.
+
 ## Why the game, when it comes, is the Cargo executable and not another static library
 
 `crates/horizon-ios` is a library, so `cargo rustc --crate-type staticlib` works for it. The game is not a
@@ -215,3 +241,23 @@ library: `Game` and `game::run()` live in the **bin** target (`crates/horizon-cl
 need for that detour anyway: `EventLoop::run_app` calls `UIApplicationMain` itself, so a Rust executable built
 by `cargo build --target aarch64-apple-ios` is a legitimate `Payload/Horizon.app/Horizon`, which is what
 `.github/workflows/ios.yml` now produces beside this shell.
+
+### Unsigned builds in GitHub Releases
+
+After this workflow is merged, each successful `main` push in `heyskylo/horizon-ios`
+creates a versioned prerelease containing an unsigned IPA and its `.sha256` checksum.
+The app's build number is the workflow run number and attempt (for example `42.1`),
+and its source commit is recorded in `Info.plist`. Release tags use `ios-build-42.1`;
+assets are named `Horizon-iOS-<version>-build42.1-unsigned.ipa`.
+
+PRs and fork builds only upload temporary Actions artifacts. A manual run on `main`
+can publish by selecting **publish_release**; other manual runs remain artifact-only.
+The publishing job alone receives `contents: write`, uses the same successful run's
+artifact, verifies its source commit, and audits every Mach-O binary for signatures.
+It also rejects provisioning profiles, certificates, private files and prepared game
+data. No extra publishing token or signing certificate is required.
+
+Files upload to a draft release before it becomes public. A release-only retry can
+resume a partial draft, but cannot overwrite a published build or reuse a tag pointing
+at another commit. Downloaded IPAs still need the user's own signing method before
+installation. Prereleases are not marked as the stable `latest` release.

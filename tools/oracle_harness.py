@@ -9,13 +9,16 @@ import subprocess
 
 try:
     from . import lab, test_rust_parity as base, test_model_baking_parity as baking
+    from .integration_env import run_game
 except ImportError:
     import lab, test_rust_parity as base, test_model_baking_parity as baking
+    from integration_env import run_game
 
 
 def run_logged(command, build, name, timeout=900, **kwargs):
     with (build / (name + '.log')).open('w') as log:
-        subprocess.run([str(c) for c in command], cwd=lab.ROOT, check=True, timeout=timeout,
+        runner = run_game if Path(command[0]).name == 'horizon-client' else subprocess.run
+        runner([str(c) for c in command], cwd=lab.ROOT, check=True, timeout=timeout,
                        stdout=log, stderr=subprocess.STDOUT, **kwargs)
 
 
@@ -32,7 +35,7 @@ def compile_oracle(build, oracle_name, jars, libraries, java_major):
 
 def build_probe(build, example):
     """Build the horizon-client probe binary; returns the command that runs probe `example`."""
-    run_logged(['cargo', 'build', '--locked', '-p', 'horizon-client', '--example', 'client_probe'],
+    run_logged(['cargo', 'build', '--locked', '-p', 'horizon-client-lib', '--example', 'client_probe'],
                build, 'compile-rust-' + example, env=dict(os.environ, CARGO_BUILD_JOBS='3'))
     import json
     metadata = json.loads(subprocess.check_output(
@@ -64,7 +67,7 @@ def differential(name, oracle, probe, make_input, scope, sources=(), expected_li
     oracle_path = lab.ROOT / 'mods/horizon/src/test/java/dev/horizonlab/parity' / (oracle + '.java')
     all_sources = [Path(__file__).resolve(), lab.ROOT / 'tools/oracle_harness.py', lab.ROOT / 'tools/test_rust_parity.py',
                    lab.ROOT / 'tools/lab.py', oracle_path, lab.ROOT / 'Cargo.toml', lab.ROOT / 'Cargo.lock',
-                   lab.ROOT / 'crates/horizon-client/Cargo.toml', lab.ROOT / 'crates/horizon-client/src/lib.rs',
+                   lab.ROOT / 'crates/horizon-client-lib/Cargo.toml', lab.ROOT / 'crates/horizon-client/src/client_lib.rs',
                    lab.ROOT / f'crates/horizon-client/examples/probe/{probe}.rs', *map(Path, sources)]
     tested = base.source_hashes(all_sources)
     input_path, units = make_input(build)

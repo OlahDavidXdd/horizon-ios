@@ -9,7 +9,8 @@ Upstream revision: `e9809ef54b18499bb4f2cac945719ecc2a61061b`.
 The upstream Apache-2.0 license and copyright notices are retained in LICENSE.
 
 The patch is confined to Cargo.toml (UIKit binding features), src/lib.rs (host mapping tests),
-and src/platform_impl/ios/{mod,view,view_controller,window,event_loop,scene,hardware_keyboard,hardware_mouse}.rs.
+src/event.rs (`KeyEvent::synthetic`, a key event for a touch control's mapped key), and
+src/platform_impl/ios/{mod,view,view_controller,window,event_loop,scene,hardware_keyboard,hardware_mouse}.rs.
 All other files are the unmodified published crate. Root Cargo.toml patches crates.io so local
 and CI builds use the same input backend; Cargo.lock removes only winit's registry source/checksum.
 
@@ -24,7 +25,9 @@ relative movement, captured buttons, and scroll. New mice are attached during re
 disconnection releases buttons. Handler queues remain Apple's documented main-thread default.
 Captured indirect pointer touches are suppressed so one click does not also hit touch controls.
 
-The app requires iOS 16; pointer lock/GCMouse require iPadOS 14 and UIKey requires iOS 13.4.
+The app requires iOS 15; UIKey requires iOS 13.4 and GCMouse requires iOS 14. pointerLockState
+is readable on iOS 14, but prefersPointerLocked/setNeedsUpdateOfPrefersPointerLocked are iOS 16,
+so capture requests are skipped on iOS 15 and the pointer stays uncaptured there.
 UIKit ultimately decides whether to honor lock requests. Touch/controller input remains the
 fallback when no supported mouse is present. No cursor warping or private API is used.
 
@@ -42,3 +45,15 @@ notification path. This is lifecycle adoption, not an SDK-version spoof or runti
 
 Apple guidance: https://developer.apple.com/documentation/uikit/transitioning-to-the-uikit-scene-based-life-cycle
 and https://developer.apple.com/videos/play/wwdc2026/278/.
+
+Named hardware navigation keys do not produce text, even when UIKit supplies symbolic
+UIKeyInput names. Their physical/logical key actions are retained; printable layout text
+and space continue to produce character input. Host regression tests cover this mapping.
+
+## Render-view coordinates
+
+`inner_size`, layout resize events and content-scale changes report the full render-view
+bounds multiplied by its content scale. Safe-area insets must not shrink the Metal drawable,
+which fills that view: doing so stretches the image and shifts rendered button locations away
+from their input regions after renderer recreation. Touches and indirect-pointer clicks use
+view-local coordinates, matching hover events, including across orientation changes.

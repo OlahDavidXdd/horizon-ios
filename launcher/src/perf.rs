@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use horizon_bench::{App, Frames, Hardware, Kind, Report};
+use horizon_platform::bench::{self as horizon_bench, App, Frames, Hardware, Kind, Report};
 
 /// The first thing `main` does; every start time counts from here.
 pub fn process_started() -> Instant {
@@ -229,6 +229,11 @@ pub struct Bench {
 }
 
 impl Bench {
+    /// Whether this launcher measures itself (`HORIZON_LAUNCHER_BENCH` set).
+    pub fn wanted() -> bool {
+        std::env::var_os(BENCH_ENV).is_some()
+    }
+
     pub fn from_env() -> Option<Bench> {
         let out = std::env::var_os(BENCH_ENV)?;
         Some(Bench {

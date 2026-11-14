@@ -1,399 +1,386 @@
 import SwiftUI
 import UIKit
 
-/// The launcher, upright: Play (the game, its worlds and the player), Servers, Packs, Gallery and Settings
-/// (What's New is in Settings). Everything it knows about the game it asks the game under it (GameLink.swift,
-/// Bridge.swift).
+/// Native launcher shared by iPhone and iPad. The game/session bridge is unchanged.
 struct HomeView: View {
-    /// Play: uncover the game (Present.swift).
     var onPlay: () -> Void
     @StateObject private var link = GameLink()
-    @StateObject private var device = DeviceStatus()
     @StateObject private var download = GameFilesDownload()
     @StateObject private var player = PlayerName()
     @StateObject private var head = SkinHead()
     @StateObject private var account = MicrosoftAccount()
+    @StateObject private var updates = UpdateChecker()
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var tab = Destination.play
+    @State private var showingAccount = false
     @State private var editingName = false
     @State private var nameDraft = ""
     @State private var nameRejected = false
-    @State private var tab = Tab.play
 
-    enum Tab: Hashable {
-        case play, servers, packs, gallery, settings
+    enum Destination: String, CaseIterable, Identifiable {
+        case play, packs, settings
+        var id: Self { self }
+        var title: String { rawValue.capitalized }
+        var icon: String {
+            switch self {
+            case .play: return "play.circle"
+            case .packs: return "shippingbox"
+            case .settings: return "gearshape"
+            }
+        }
     }
 
-    // Spelled out: a private property makes the memberwise one private, and Present.swift builds this view.
-    init(onPlay: @escaping () -> Void = {}) {
-        self.onPlay = onPlay
-        // The bar under the pages, in the launcher's colours rather than the system's grey.
-        let bar = UITabBarAppearance()
-        bar.configureWithOpaqueBackground()
-        bar.backgroundColor = UIColor(Theme.background)
-        bar.shadowColor = UIColor(Theme.border)
-        UITabBar.appearance().standardAppearance = bar
-        UITabBar.appearance().scrollEdgeAppearance = bar
-    }
+    init(onPlay: @escaping () -> Void = {}) { self.onPlay = onPlay }
 
     var body: some View {
-        TabView(selection: $tab) {
-            page(refresh: { await link.reload() }) { PlayPage(link: link, device: device, download: download, player: player, head: head,
-                            account: account, editName: editName) }
-                .tabItem { Label("Play", systemImage: "play.fill") }
-                .tag(Tab.play)
-            page(refresh: { await link.reloadServers() }) { ServersPage(link: link, account: account) }
-                .tabItem { Label("Servers", systemImage: "globe") }
-                .tag(Tab.servers)
-            page { PacksPage(link: link) }
-                .tabItem { Label("Packs", systemImage: "square.stack.3d.up.fill") }
-                .tag(Tab.packs)
-            page { GalleryPage() }
-                .tabItem { Label("Gallery", systemImage: "photo.on.rectangle") }
-                .tag(Tab.gallery)
-            page { SettingsPage(link: link, download: download) }
-                .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
-                .tag(Tab.settings)
-        }
-        .tint(Theme.accentText)
-        .onChange(of: tab) { _ in Haptics.tap() }
-        // The offline name the game plays with.
-        .alert("Player name", isPresented: $editingName) {
-            TextField("Name", text: $nameDraft)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-            Button("Save") {
-                nameRejected = !player.save(nameDraft.trimmingCharacters(in: .whitespaces))
+        Group {
+            if sizeClass == .regular {
+                split
+            } else {
+                tabView
             }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Your name in single player and on servers that don't check accounts. Up to 16 characters, no spaces.")
         }
-        .alert("That name can't be used", isPresented: $nameRejected) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("Use 1 to 16 letters, digits or symbols, with no spaces.")
+        .background(Theme.background.ignoresSafeArea())
+        .tint(Theme.accent)
+        .overlay {
+            if let progress = link.importing {
+                ImportingOverlay(progress: progress) { link.dismissImport() }
+            }
         }
+        .sheet(isPresented: $showingAccount) { accountSheet }
         .alert("Something went wrong", isPresented: Binding(
-            get: { link.problem != nil },
-            set: { if !$0 { link.problem = nil } }
-        )) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(link.problem ?? "")
+            get: { link.problem != nil }, set: { if !$0 { link.problem = nil } }
+        )) { Button("OK", role: .cancel) {} } message: { Text(link.problem ?? "") }
+        .alert(item: $updates.offered) { release in
+            Alert(
+                title: Text("Horizon \(release.versionText) is out"),
+                message: Text("A new version has been released. Open its release page to see what changed and download it?"),
+                primaryButton: .default(Text("View release page")) { UIApplication.shared.open(release.url) },
+                secondaryButton: .cancel(Text("Later"))
+            )
         }
-        // The face follows the name: the skin of the Minecraft account that has it.
         .task(id: shownName) { await head.load(shownName) }
-        // A signed-in account goes to the game, renewed when it is close to expiring.
-        .task(id: account.profile) { await account.handOver() }
+        .task(id: account.profile) { try? await account.handOver() }
+        .onChange(of: account.profile) { profile in
+            if profile != nil { editingName = false; nameDraft = "" }
+        }
+        .onChange(of: link.phase) { phase in
+            LauncherLog.write("game phase: \(String(describing: phase))")
+        }
+        // First run: a zip the player dropped in comes first, then the launcher's own download;
+        // the game's unpacking card shows either one. The game reports when the archive it found
+        // at launch is still being installed, so neither door touches that zip a second time.
+        .task(id: link.phase) { await beginGameFilesSetup() }
+        .task(id: link.bootImporting) { await beginGameFilesSetup() }
         .task {
+            await updates.check()
             link.uncover = onPlay
+            link.prepareSession = { try await account.handOver() }
             await link.watch()
         }
     }
 
-    /// One tab's page: the header bar over a scrolling column, on the launcher's background.
-    private func page<Content: View>(refresh: (() async -> Void)? = nil,
-                                     @ViewBuilder _ content: () -> Content) -> some View {
-        ScrollView {
-            content().pageColumn()
+    /// The iPad layout: a navigation rail beside the pages. NavigationSplitView is iOS 16; on iOS 15 a
+    /// two-column NavigationView gives the same sidebar-beside-detail shape.
+    @ViewBuilder private var split: some View {
+        if #available(iOS 16.0, *) {
+            NavigationSplitView {
+                sidebar
+                    .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 280)
+            } detail: {
+                NavigationStack { destination(tab) }
+            }
+            .navigationSplitViewStyle(.balanced)
+        } else {
+            NavigationView {
+                sidebar
+                destination(tab)
+            }
+            .navigationViewStyle(.columns)
         }
-        .refreshable { await refresh?() }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            Header(name: shownName, face: head.face, editName: editName)
-                .frame(maxWidth: 520).frame(maxWidth: .infinity).background(Theme.background)
-        }
-        .background(Theme.background.ignoresSafeArea())
     }
 
-    /// The Microsoft account's name when one is signed in, else the offline name.
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            HStack(spacing: 12) {
+                Kit.image("horizon-mark").resizable().renderingMode(.template).scaledToFit().frame(width: 32, height: 32)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Horizon").font(.system(.title3, design: .rounded).bold())
+                    Text("JAVA EDITION").font(.caption2.weight(.medium)).tracking(1.5).foregroundStyle(.secondary)
+                }
+            }.padding(.horizontal, 12)
+            VStack(spacing: 8) {
+                ForEach(Destination.allCases) { item in
+                    Button { tab = item } label: {
+                        Label(item.title, systemImage: item.icon)
+                            .font(.system(.body, design: .rounded).weight(tab == item ? .semibold : .medium))
+                            .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+                            .padding(.horizontal, 16)
+                            .foregroundStyle(tab == item ? Theme.accent : Theme.textMuted)
+                            .background(tab == item ? Theme.notice : .clear, in: RoundedRectangle(cornerRadius: 18))
+                    }.buttonStyle(.plain).accessibilityIdentifier("launcher-nav-" + item.rawValue)
+                }
+            }
+            Spacer()
+        }
+        .padding(20).padding(.top, 12)
+        .background(Theme.background)
+        .accessibilityIdentifier("launcher-navigation-rail")
+    }
+
+    private var tabView: some View {
+        TabView(selection: $tab) {
+            ForEach(Destination.allCases) { item in
+                CompatNavigationStack { destination(item) }
+                    .tabItem { Label(item.title, systemImage: item.icon) }
+                    .tag(item)
+            }
+        }
+    }
+
+    private func pageHeading(_ item: Destination) -> some View {
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("HORIZON\(item == .play ? " / JAVA EDITION" : "")")
+                    .font(.caption2.weight(.semibold)).tracking(2).foregroundStyle(Theme.accent)
+                Text(item.title).font(.system(.largeTitle, design: .rounded).bold())
+                if item == .settings {
+                    Text("Display, sound & the way you play").font(.subheadline).foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+            Button { showingAccount = true } label: {
+                Avatar(name: shownName, face: head.face, size: 34)
+                    .frame(width: 48, height: 48)
+                    .accountCircleGlass()
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Account: \(shownName ?? "Not signed in")")
+            .accessibilityIdentifier("launcher-account-button")
+        }
+    }
+
     private var shownName: String? { account.profile?.name ?? player.name }
 
     private func editName() {
+        guard account.profile == nil else { return }
         nameDraft = player.name ?? ""
+        nameRejected = false
         editingName = true
     }
-}
 
-// MARK: - Header
-
-private struct Header: View {
-    let name: String?
-    let face: UIImage?
-    let editName: () -> Void
-
-    var body: some View {
-        HStack {
-            HStack(spacing: 10) {
-                HorizonMark()
-                Text("HORIZON")
-                    .font(Theme.pixel(25, .bold))
-                    .foregroundStyle(Theme.text)
-            }
-            Spacer()
-            Button(action: editName) {
-                Avatar(name: name, face: face, size: 40)
-            }
-            .accessibilityLabel("Player name: \(name ?? "not set")")
+    private func saveName() {
+        guard account.profile == nil else { return }
+        if player.save(nameDraft.trimmingCharacters(in: .whitespaces)) {
+            editingName = false
+            nameRejected = false
+        } else {
+            nameRejected = true
         }
-        .padding(.horizontal, 20)
-        .frame(height: 62)
+    }
+
+    private func destination(_ item: Destination) -> some View {
+        page {
+            VStack(alignment: .leading, spacing: 26) {
+                pageHeading(item)
+                switch item {
+                case .play: home
+                case .packs: PacksPage(link: link)
+                case .settings:
+                    VStack(spacing: 24) {
+                        SettingsPage(link: link, download: download, updates: updates)
+                        NavigationLink { page { GalleryPage() }.navigationTitle("Screenshots") } label: {
+                            Label("Screenshots", systemImage: "photo.on.rectangle")
+                                .frame(maxWidth: .infinity, alignment: .leading).padding(16).card()
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+        .horizonHiddenNavigationBarBackground()
+    }
+
+    private func page<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        ScrollView {
+            content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(sizeClass == .regular ? 32 : 20)
+                .frame(maxWidth: sizeClass == .regular ? 1200 : 700)
+                .frame(maxWidth: .infinity)
+        }
         .background(Theme.background)
+        .refreshable { await link.refresh() }
     }
-}
 
-/// Horizon's plus-shaped mark: a violet horizon crossed by a white stroke.
-private struct HorizonMark: View {
-    var body: some View {
-        ZStack {
-            Rectangle().fill(Theme.accentBright).frame(width: 22, height: 3)
-            Rectangle().fill(Theme.text).frame(width: 3, height: 22)
+    private var home: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            launchPanel
+            if updates.enabled && !updates.online {
+                Label("No internet connection — update checks are paused until you're back online.", systemImage: "wifi.slash")
+                    .font(Theme.sans(12)).foregroundStyle(Theme.warn)
+                    .padding(.horizontal, 4)
+                    .accessibilityIdentifier("launcher-update-offline")
+            }
+            NavigationLink { page { ModsPage() }.navigationTitle("Mods") } label: {
+                HStack(spacing: 14) {
+                    Image(systemName: "puzzlepiece.extension")
+                        .font(.title3).foregroundStyle(Theme.accent)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Mods (experimental ⚠️)").font(.headline).foregroundStyle(Theme.text)
+                        Text("Install .hmod content mods, and open the mod folder")
+                            .font(.subheadline).foregroundStyle(Theme.textMuted)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right")
+                        .font(.footnote.weight(.semibold)).foregroundStyle(Theme.textFaint)
+                }
+                .padding(16)
+                .card()
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("launcher-mods-card")
+            if needsFiles { GameFilesCard(download: download, missing: true) }
         }
-        .frame(width: 22, height: 22)
     }
-}
 
-/// The player's skin face, its pixels kept sharp; the name's first letter until a skin is found.
-struct Avatar: View {
-    let name: String?
-    let face: UIImage?
-    let size: CGFloat
-
-    var body: some View {
-        Group {
-            if let face {
-                Image(uiImage: face)
-                    .resizable()
-                    .interpolation(.none)
-                    .padding(size * 0.12)
-            } else {
-                Text(name.map { String($0.prefix(1)).lowercased() } ?? "?")
-                    .font(Theme.pixel(size * 0.52, .medium))
-                    .foregroundStyle(Theme.text)
+    private var launchPanel: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            HStack(spacing: 8) {
+                Text("JAVA EDITION · \(link.version)").font(.caption.weight(.semibold)).tracking(1.4)
+            }
+            .foregroundStyle(.white.opacity(0.9))
+            Spacer(minLength: 22)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 14) {
+                    Kit.image("horizon-mark").resizable().renderingMode(.template)
+                        .scaledToFit().frame(width: 54, height: 54).accessibilityHidden(true)
+                    Text("Horizon").font(.system(.largeTitle, design: .rounded).bold())
+                }
+                .foregroundStyle(.white)
+                .padding(.top, 8)
+                HStack(spacing: 8) {
+                    Avatar(name: shownName, face: head.face, size: 26)
+                    Text(shownName ?? "Offline player").font(.subheadline.weight(.medium)).lineLimit(1)
+                    if account.profile != nil {
+                        Image(systemName: "checkmark.seal.fill").font(.caption)
+                            .accessibilityLabel("Microsoft account")
+                    }
+                }.foregroundStyle(.white.opacity(0.9))
+                    .accessibilityIdentifier("launcher-playing-as")
+            }
+            HStack {
+                Button { LauncherLog.write("play pressed"); Task { await link.play() } } label: {
+                    Label(playLabel, systemImage: "play.fill")
+                        .font(.headline).frame(minWidth: 124, minHeight: 36)
+                }
+                .controlSize(.large)
+                .launcherPrimaryButton()
+                .tint(Theme.accent)
+                .disabled(needsFiles || link.importing != nil || link.launching != nil)
+                .accessibilityIdentifier("launcher-play-button")
+                if link.launching != nil {
+                    Button("Cancel") { link.cancelLaunch() }.foregroundStyle(.white).frame(minHeight: 44)
+                }
+                Spacer(minLength: 0)
+            }
+            if case let .loading(progress) = link.phase {
+                ProgressView(value: progress).tint(.white).accessibilityLabel("Loading game")
             }
         }
-        .frame(width: size, height: size)
-        .background(Theme.notice, in: RoundedRectangle(cornerRadius: size * 0.3))
-        .overlay(RoundedRectangle(cornerRadius: size * 0.3).strokeBorder(Theme.border))
-    }
-}
-
-// MARK: - Play
-
-private struct PlayPage: View {
-    @ObservedObject var link: GameLink
-    @ObservedObject var device: DeviceStatus
-    @ObservedObject var download: GameFilesDownload
-    @ObservedObject var player: PlayerName
-    @ObservedObject var head: SkinHead
-    @ObservedObject var account: MicrosoftAccount
-    let editName: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            GameCard(link: link, device: device)
-            if needsFiles {
-                GameFilesCard(download: download, missing: true)
-            }
-            if let last = link.worlds.first {
-                ContinueCard(world: last, link: link)
-            }
-            AccountCard(account: account)
-            WorldsSection(link: link)
-            PlayerCard(name: player.name, face: head.face, edit: editName)
+        .padding(sizeClass == .regular ? 32 : 24)
+        .frame(maxWidth: .infinity, minHeight: sizeClass == .regular ? 350 : 300, alignment: .leading)
+        .background {
+            LauncherLandscape(index: 0)
+                .overlay(LinearGradient(colors: [.black.opacity(0.05), .black.opacity(0.72)],
+                                        startPoint: .topTrailing, endPoint: .bottomLeading))
         }
-        .animation(.easeInOut(duration: 0.25), value: link.phase)
-        .animation(.easeInOut(duration: 0.25), value: link.worlds)
+        .clipShape(RoundedRectangle(cornerRadius: 28))
     }
 
-    /// The game said it has nothing to load, or, before it starts, there are no game files to start it with.
+    /// A dropped zip is offered before the network: it is what the player already did. The game's
+    /// launch-time install owns the folder until it says it is done, so neither door runs twice.
+    private func beginGameFilesSetup() async {
+        guard link.phase == .waiting, !link.bootImporting else { return }
+        if link.importDroppedArchives() { return }
+        await download.startAutomaticallyIfNeeded()
+    }
+
+    private var playLabel: String {
+        if let launching = link.launching { return launching }
+        if link.importing != nil { return "Preparing files" }
+        return needsFiles ? "Game files needed" : "Play"
+    }
     private var needsFiles: Bool {
         if case .needsFiles = link.phase { return true }
         return link.phase == .waiting && !GameFolder.hasGameFiles
     }
-}
 
-private struct GameCard: View {
-    @ObservedObject var link: GameLink
-    @ObservedObject var device: DeviceStatus
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Hero(version: link.version)
-            VStack(spacing: 12) {
-                StatusChips(link: link, device: device)
-                PlayButton(link: link)
-            }
-            .padding(16)
-        }
-        .background(Theme.surface)
-        .clipShape(RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Theme.border))
-    }
-}
-
-private struct Hero: View {
-    let version: String
-    /// Picked once per showing, as the title screen picks one per start.
-    @State private var splash = Splash.pick()
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 6) {
-                Rectangle().fill(Theme.ready).frame(width: 5, height: 5)
-                Text("MINECRAFT \(version)").font(Theme.mono(9)).foregroundStyle(Theme.text)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(Color(red: 16 / 255, green: 13 / 255, blue: 32 / 255, opacity: 0.8), in: RoundedRectangle(cornerRadius: 4))
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Horizon").font(Theme.pixel(44)).foregroundStyle(Theme.text)
-                    .overlay(alignment: .topTrailing) {
-                        if let splash {
-                            Splash(text: splash)
-                                .offset(x: 70, y: 18)
-                                .onTapGesture {
-                                    Haptics.tap()
-                                    self.splash = Splash.pick()
-                                }
+    private var accountSheet: some View {
+        CompatNavigationStack {
+            Form {
+                Section {
+                    HStack(spacing: 16) {
+                        Avatar(name: shownName, face: head.face, size: 52)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(shownName ?? "Offline player").font(.headline)
+                            Text(account.profile == nil ? "Offline profile" : "Microsoft account")
+                                .font(.subheadline).foregroundStyle(.secondary)
                         }
-                    }
-                Text("Your next world is waiting.").font(Theme.sans(12)).foregroundStyle(Color(hex: 0xDDD2ED))
-            }
-            .padding(.top, 35)
-            Spacer(minLength: 0)
-        }
-        .padding(20)
-        .frame(maxWidth: .infinity, minHeight: 214, maxHeight: 214, alignment: .topLeading)
-        .background {
-            Kit.image("pixel-sunset")
-                .resizable()
-                .interpolation(.none)
-                .scaledToFill()
-                .overlay(
-                    LinearGradient(
-                        colors: [
-                            Color(red: 16 / 255, green: 12 / 255, blue: 34 / 255, opacity: 0.2),
-                            Color(red: 16 / 255, green: 12 / 255, blue: 34 / 255, opacity: 0.91),
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-        }
-        .clipped()
-    }
-}
-
-/// Play, in every state the game can be in: loading (the bar fills behind the word), waiting to take the
-/// player somewhere (it says where, and can be cancelled), and with no game files (it says so).
-private struct PlayButton: View {
-    @ObservedObject var link: GameLink
-
-    var body: some View {
-        VStack(spacing: 8) {
-            Button {
-                Task { await link.play() }
-            } label: {
-                HStack(spacing: 10) {
-                    if link.launching != nil {
-                        ProgressView().tint(Theme.text)
-                    } else {
-                        Kit.image("play")
-                    }
-                    Text(label).font(Theme.pixel(label.count > 12 ? 20 : 27)).foregroundStyle(Theme.text)
-                        .lineLimit(1).minimumScaleFactor(0.6)
-                }
-                .padding(.horizontal, 12)
-                .frame(maxWidth: .infinity, minHeight: 54, maxHeight: 54)
-                .background(alignment: .leading) {
-                    GeometryReader { size in
-                        ZStack(alignment: .leading) {
-                            (missing ? Theme.surfaceDisabled : Theme.accent.opacity(fill < 1 ? 0.55 : 1))
-                            if fill < 1 {
-                                Theme.accent.frame(width: size.size.width * fill)
+                    }.padding(.vertical, 8)
+                    if account.profile == nil {
+                        if editingName {
+                            TextField("Name", text: $nameDraft)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .submitLabel(.done)
+                                .onSubmit(saveName)
+                                .accessibilityIdentifier("offline-name-field")
+                            HStack {
+                                Button("Save", action: saveName)
+                                Spacer()
+                                Button("Cancel") { editingName = false; nameRejected = false }
+                                    .foregroundStyle(.secondary)
                             }
+                            Text("Up to 16 characters, with no spaces.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            if nameRejected {
+                                Text("That name can’t be used.")
+                                    .font(.footnote).foregroundStyle(Theme.warn)
+                            }
+                        } else {
+                            Button("Change Offline Name", action: editName)
                         }
                     }
                 }
-                // The design's lit top edge: a one-point border on the top side only.
-                .overlay(alignment: .top) { (missing ? Color.clear : Theme.accentEdge).frame(height: 1) }
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .animation(.easeOut(duration: 0.3), value: fill)
+                Section { AccountCard(account: account) }
             }
-            .buttonStyle(PressStyle())
-            .disabled(missing || link.launching != nil)
-            if link.launching != nil {
-                Button("Cancel") { link.cancelLaunch() }
-                    .font(Theme.sans(12, .semiBold)).foregroundStyle(Theme.textMuted)
-            }
+            .navigationTitle("Account")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showingAccount = false } } }
         }
-    }
-
-    private var missing: Bool {
-        if case .needsFiles = link.phase { return true }
-        return false
-    }
-
-    /// How full the bar is: the loading progress, full once the game is ready.
-    private var fill: Double {
-        if case let .loading(progress) = link.phase { return max(progress, 0.04) }
-        return 1
-    }
-
-    private var label: String {
-        if let launching = link.launching { return launching }
-        return missing ? "Game files needed" : "Play"
+        .horizonDetents(.mediumLarge)
     }
 }
 
-/// The world played last, one tap away.
-private struct ContinueCard: View {
-    let world: World
-    @ObservedObject var link: GameLink
-
-    var body: some View {
-        Button {
-            Task { await link.play(world) }
-        } label: {
-            HStack(spacing: 12) {
-                WorldIcon(world: world, size: 56)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("CONTINUE").font(Theme.mono(8)).foregroundStyle(Theme.accentText)
-                    Text(world.name).font(Theme.pixel(19)).foregroundStyle(Theme.text).lineLimit(1)
-                    Text(world.subtitle).font(Theme.sans(11)).foregroundStyle(Theme.textMuted).lineLimit(1)
-                }
-                Spacer(minLength: 0)
-                Image(systemName: "play.circle.fill").font(.system(size: 30)).foregroundStyle(Theme.accentBright)
-            }
-            .padding(12)
-            .card()
-        }
-        .buttonStyle(PressStyle())
-        .disabled(link.launching != nil)
-    }
-}
-
-// MARK: - The player
-
-private struct PlayerCard: View {
+struct Avatar: View {
     let name: String?
     let face: UIImage?
-    let edit: () -> Void
-
+    let size: CGFloat
     var body: some View {
-        HStack(spacing: 12) {
-            Avatar(name: name, face: face, size: 48)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("PLAYING AS").font(Theme.mono(8)).foregroundStyle(Theme.textMuted)
-                Text(name ?? "No name yet").font(Theme.sans(15, .semiBold)).foregroundStyle(Theme.text)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-            Button(action: edit) {
-                Text("Change").font(Theme.sans(12, .semiBold)).foregroundStyle(Theme.accentText)
-                    .frame(minWidth: 44, minHeight: 44)
+        Group {
+            if let face {
+                Image(uiImage: face).resizable().interpolation(.none).scaledToFit().padding(size * 0.10)
+            } else {
+                Image(systemName: "person.fill").resizable().scaledToFit().padding(size * 0.24)
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(14)
-        .card()
+        .frame(width: size, height: size)
+        .background(Theme.surfaceDisabled, in: Circle())
+        .clipShape(Circle())
+        .accessibilityHidden(true)
     }
 }

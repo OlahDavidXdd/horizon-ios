@@ -359,11 +359,14 @@ fn can_attack(m: &Mob, w: &MobWorld, who: Who) -> bool {
 /// `Sensor.isEntityAttackable`: `TargetingConditions.forCombat()` within the
 /// follow range, in sight.
 fn attackable(m: &mut Mob, w: &MobWorld, who: Who) -> bool {
+    // The current ATTACK_TARGET is tested with ignoreInvisibilityTesting.
+    let current = mem_ref(m).attack_target.value() == Some(who);
     let range = m.attrs.follow_range;
     if !can_attack(m, w, who) {
         return false;
     }
     match who {
+        Who::Player if current => m.can_keep_target_player(w, range),
         Who::Player => m.can_target_player(w, range, true),
         Who::Mob(id) => {
             let Some(s) = w.seen(id) else { return false };
@@ -606,7 +609,7 @@ impl B {
                     t.begin(cx.lr, cx.now);
                     // start
                     mem(m).path.set_opt(path.clone());
-                    m.nav_move_to_path(path.clone(), f64::from(*speed));
+                    m.nav_move_to_path(cx.w, path.clone(), f64::from(*speed));
                     if *slide {
                         // SlideToTargetSink.start
                         let at = m.center();
@@ -772,7 +775,7 @@ impl B {
                 let w = cx.w;
                 let in_reach = w
                     .target_info(target)
-                    .is_some_and(|t| m.within_melee_range(&t));
+                    .is_some_and(|t| m.within_melee_range(w, &t));
                 if !super::creaking::can_move(m) || !in_reach || !visible_contains(m, w, target) {
                     return false;
                 }
@@ -780,6 +783,7 @@ impl B {
                 m.swing();
                 let mut gcx = Cx {
                     w,
+                    lr: cx.lr,
                     events: cx.events,
                 };
                 super::ai::do_hurt_target(m, target, &mut gcx);
@@ -839,9 +843,13 @@ impl B {
                 }
                 super::breeze::set_pose(m, super::breeze::INHALING);
                 // level.playSound(null, breeze, BREEZE_CHARGE, HOSTILE, 1, 1)
-                let at = [m.position.x, m.position.y, m.position.z];
-                cx.events
-                    .push(MobEvent::Sound("entity.breeze.charge", at, 1.0, 1.0));
+                cx.events.push(MobEvent::entity_sound(
+                    m,
+                    "entity.breeze.charge",
+                    5,
+                    1.0,
+                    1.0,
+                ));
                 if let Some(p) = mem(m).breeze_jump_target.value() {
                     look_at_eyes(
                         m,
@@ -957,7 +965,7 @@ impl B {
                     if d > 4 && compute_path(m, cx.w, cx.now, &walk, path, speed, cant_reach) {
                         *last_target = Some(now_target);
                         mem(m).path.set_opt(path.clone());
-                        m.nav_move_to_path(path.clone(), f64::from(*speed));
+                        m.nav_move_to_path(cx.w, path.clone(), f64::from(*speed));
                     }
                 }
             }
@@ -1076,7 +1084,7 @@ fn block_of(p: Vec3) -> [i32; 3] {
 }
 /// `Swim`: deeper than the jump threshold, or in lava.
 fn swim_condition(m: &Mob) -> bool {
-    m.fluids.water > m.fluid_jump_threshold() || m.fluids.in_lava
+    m.floats()
 }
 /// `PositionTracker.isVisibleBy`.
 fn tracker_visible(m: &mut Mob, w: &MobWorld, t: Tracker) -> bool {
@@ -1091,7 +1099,7 @@ fn tracker_visible(m: &mut Mob, w: &MobWorld, t: Tracker) -> bool {
 /// ranged weapon: `Mob.isWithinMeleeAttackRange`.
 fn within_attack_range(m: &Mob, w: &MobWorld, target: Who) -> bool {
     w.target_info(target)
-        .is_some_and(|t| m.within_melee_range(&t))
+        .is_some_and(|t| m.within_melee_range(w, &t))
 }
 
 // ---- The breeze's behaviours --------------------------------------------
@@ -1137,6 +1145,7 @@ struct Quarry {
     position: Vec3,
     head_yaw: f32,
     height: f64,
+    passenger: bool,
 }
 fn quarry(w: &MobWorld, who: Who) -> Option<Quarry> {
     let t = w.target_info(who)?;
@@ -1148,6 +1157,7 @@ fn quarry(w: &MobWorld, who: Who) -> Option<Quarry> {
         position: t.position,
         head_yaw,
         height: t.bounds.max_position().y - t.bounds.min_position().y,
+        passenger: t.passenger,
     })
 }
 /// `BreezeUtil.randomPointBehindTarget`.
@@ -1233,7 +1243,8 @@ fn shoot_tick(m: &mut Mob, cx: &mut Bx) {
     let firing = super::breeze::firing_y(m);
     let (xd, yd, zd) = (
         q.position.x - m.position.x,
-        q.position.y + q.height * 0.3 - firing,
+        // target.getY(target.isPassenger() ? 0.8 : 0.3).
+        q.position.y + q.height * if q.passenger { 0.8 } else { 0.3 } - firing,
         q.position.z - m.position.z,
     );
     let start = Vec3::new(m.position.x, firing, m.position.z);
@@ -1242,14 +1253,9 @@ fn shoot_tick(m: &mut Mob, cx: &mut Bx) {
         start,
         Some(Who::Mob(m.id)),
     );
-    // The new entity's own random spreads the shot (5 - difficulty * 4 at
-    // normal): not the breeze's.
-    let mut own = LegacyRandom::new(
-        cx.now
-            .wrapping_mul(0x5DEE_CE66)
-            .wrapping_add(i64::from(m.id)),
-    );
-    p.shoot(&mut own, [xd, yd, zd], 0.7, -3.0);
+    // The new entity's own random spreads the shot (5 - difficulty id * 4):
+    // not the breeze's.
+    p.shoot_own([xd, yd, zd], 0.7, 5.0 - f32::from(cx.w.difficulty.id) * 4.0);
     cx.events.push(MobEvent::Projectile(p));
     breeze_sound(m, cx, "entity.breeze.shoot", 1.5);
 }
@@ -1258,7 +1264,7 @@ fn long_jump_can_run(m: &mut Mob, cx: &mut Bx) -> bool {
     if !m.on_ground && !m.fluids.in_water {
         return false;
     }
-    if m.fluids.water > m.fluid_jump_threshold() || m.fluids.in_lava {
+    if m.floats() {
         return false;
     }
     if mem(m).breeze_jump_target.present() {

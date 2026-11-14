@@ -33,7 +33,12 @@ final class Thumbnails: ObservableObject {
         let size = CGSize(width: side * 16 / 9 * 3, height: side * 3)
         Task.detached(priority: .utility) {
             let image = await UIImage(contentsOfFile: url.path)?.byPreparingThumbnail(ofSize: size)
-            await MainActor.run { self.images[url] = image }
+            await MainActor.run {
+                self.images[url] = image
+                // A file may still be arriving or temporarily unreadable.
+                // Coalesce only in-flight work and successfully cached images.
+                if image == nil { self.asked.remove(url) }
+            }
         }
     }
 }
@@ -60,7 +65,7 @@ struct GalleryPage: View {
                         }
                         .buttonStyle(PressStyle())
                         .contextMenu {
-                            ShareLink(item: shot.url) { Label("Share", systemImage: "square.and.arrow.up") }
+                            CompatShareLink(item: shot.url) { Label("Share", systemImage: "square.and.arrow.up") }
                             Button(role: .destructive) {
                                 delete(shot)
                             } label: { Label("Delete", systemImage: "trash") }
@@ -132,7 +137,7 @@ private struct ShotViewer: View {
                 Text(current.date.formatted(date: .abbreviated, time: .shortened))
                     .font(Theme.mono(11))
                 Spacer()
-                ShareLink(item: current.url) {
+                CompatShareLink(item: current.url) {
                     Image(systemName: "square.and.arrow.up").font(.system(size: 16, weight: .semibold))
                         .frame(width: 44, height: 44)
                 }
@@ -150,7 +155,7 @@ private struct ShotViewer: View {
                 dismiss()
             }
         }
-        .preferredColorScheme(.dark)
+
     }
 }
 

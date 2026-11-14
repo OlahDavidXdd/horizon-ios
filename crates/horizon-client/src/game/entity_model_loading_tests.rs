@@ -17,13 +17,14 @@ const WOODS: [&str; 11] = [
     "pale_oak",
     "test_wood",
 ];
-const CARTS: [&str; 6] = [
+const CARTS: [&str; 7] = [
     "minecart",
     "chest_minecart",
     "hopper_minecart",
     "furnace_minecart",
     "tnt_minecart",
     "command_block_minecart",
+    "spawner_minecart",
 ];
 
 fn fixture() -> Value {
@@ -142,7 +143,10 @@ fn optimized(root: &Path) -> BTreeMap<String, Part> {
         } else {
             "armor_stand"
         };
-        models.insert(format!("{model}/{slot}"), part);
+        models.insert(
+            format!("{model}/{slot}"),
+            std::sync::Arc::unwrap_or_clone(part),
+        );
     }
     for (slot, part) in armor.player {
         models.insert(format!("player/{slot}"), part);
@@ -152,7 +156,10 @@ fn optimized(root: &Path) -> BTreeMap<String, Part> {
         ("armor_stand_small", armor.small),
     ] {
         if let Some(part) = part {
-            models.insert(format!("{model}/main"), part);
+            models.insert(
+                format!("{model}/main"),
+                std::sync::Arc::unwrap_or_clone(part),
+            );
         }
     }
     models
@@ -178,7 +185,7 @@ fn entity_model_batches_preserve_parts_missing_layers_and_load_failures() {
     let mut all = fixture();
     fs::write(&file, serde_json::to_vec(&all).unwrap()).unwrap();
     assert_equivalent(&root.0);
-    assert_eq!(optimized(&root.0).len(), 42);
+    assert_eq!(optimized(&root.0).len(), 43);
     all.as_object_mut()
         .unwrap()
         .remove("minecraft:armor_stand_small#main");
@@ -187,7 +194,7 @@ fn entity_model_batches_preserve_parts_missing_layers_and_load_failures() {
         .remove("minecraft:boat/oak#main");
     fs::write(&file, serde_json::to_vec(&all).unwrap()).unwrap();
     assert_equivalent(&root.0);
-    assert_eq!(optimized(&root.0).len(), 40);
+    assert_eq!(optimized(&root.0).len(), 41);
     let document = EntityModelDocument::load(&root.0).unwrap();
     let mut first = document.model("minecraft:armor_stand#main").unwrap();
     first.children.clear();
@@ -207,9 +214,10 @@ fn armor_equipment_loads_without_an_entity_model_document() {
     fs::create_dir_all(&equipment).unwrap();
     fs::write(
         equipment.join("leather.json"),
-        serde_json::to_vec(&json!({"layers": {"humanoid": [{
-            "texture": "minecraft:leather", "dyeable": {"color_when_undyed": 0x123456}
-        }]}}))
+        serde_json::to_vec(&json!({"layers": {"humanoid": [
+            {"texture": "minecraft:leather", "dyeable": {"color_when_undyed": 0x123456}},
+            {"texture": "minecraft:leather_overlay"}
+        ]}}))
         .unwrap(),
     )
     .unwrap();
@@ -219,9 +227,184 @@ fn armor_equipment_loads_without_an_entity_model_document() {
     assert!(assets.layers.is_empty());
     assert_eq!(
         assets.equipment["minecraft:leather"]["humanoid"],
-        ("entity/equipment/humanoid/leather".into(), Some(0x123456))
+        vec![
+            (
+                "entity/equipment/humanoid/leather".into(),
+                Some(horizon_client::equipment_color::Dyeable {
+                    color_when_undyed: Some(0x123456)
+                })
+            ),
+            ("entity/equipment/humanoid/leather_overlay".into(), None),
+        ]
     );
     assert!(!assets.equipment.contains_key("minecraft:invalid"));
+}
+
+#[test]
+fn content_mods_equipment_loads_under_its_namespace() {
+    let root = FixtureRoot::new();
+    let equipment = root.0.join("assets/gems/equipment");
+    fs::create_dir_all(&equipment).unwrap();
+    fs::write(
+        equipment.join("ruby.json"),
+        serde_json::to_vec(&json!({"layers": {
+            "humanoid": [{"texture": "gems:ruby"}],
+            "humanoid_leggings": [{"texture": "gems:ruby"}]
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    // Native client resource lookup reads pack namespaces even without a content mod.
+    let resource_only = ArmorStandAssets::load(&root.0, None);
+    assert_eq!(
+        resource_only.equipment["gems:ruby"]["humanoid_leggings"],
+        vec![("gems:entity/equipment/humanoid_leggings/ruby".into(), None)]
+    );
+    fs::write(
+        root.0.join(horizon_items::content_namespaces::MARKER),
+        br#"["gems"]"#,
+    )
+    .unwrap();
+    let assets = ArmorStandAssets::load(&root.0, None);
+    assert_eq!(
+        assets.equipment["gems:ruby"]["humanoid_leggings"],
+        vec![("gems:entity/equipment/humanoid_leggings/ruby".into(), None)]
+    );
+}
+
+#[test]
+#[ignore = "equipment parity driver supplies isolated roots and output"]
+fn equipment_assets_native_fixture() {
+    let root =
+        std::path::PathBuf::from(std::env::var_os("HORIZON_EQUIPMENT_FIXTURE_ROOT").unwrap());
+    let output = std::env::var_os("HORIZON_EQUIPMENT_FIXTURE_OUTPUT").unwrap();
+    let model_root = FixtureRoot::new();
+    fs::write(
+        model_root.0.join("entity-models.json"),
+        serde_json::to_vec(&fixture()).unwrap(),
+    )
+    .unwrap();
+    let document = EntityModelDocument::load(&model_root.0).unwrap();
+    let mut assets = ArmorStandAssets::load(&root.join("base"), Some(&document));
+    let prepared_model = assets.main.clone().unwrap();
+    let mut rows = Vec::new();
+    for (phase, directory) in ["base", "merged", "base"].into_iter().enumerate() {
+        if phase != 0 {
+            assets.apply_resources(ArmorStandAssets::load(&root.join(directory), None));
+        }
+        assert!(
+            std::sync::Arc::ptr_eq(assets.main.as_ref().unwrap(), &prepared_model),
+            "metadata reload discarded prepared model geometry"
+        );
+        let atlas = horizon_client::hud::HudAtlas::build(&root.join(directory)).unwrap();
+        for (id, kinds) in &assets.equipment {
+            for (kind, layers) in kinds {
+                for (index, (texture, dyeable)) in layers.iter().enumerate() {
+                    let player_texture = kind == "wings"
+                        && assets
+                            .wing_player_textures
+                            .get(id)
+                            .and_then(|flags| flags.get(index))
+                            .copied()
+                            .unwrap_or(false);
+                    let pixel = atlas.sprites.get(texture).map(|rect| {
+                        let x = (rect.u0 * atlas.width as f32).round() as usize;
+                        let y = (rect.v0 * atlas.height as f32).round() as usize;
+                        let offset = (y * atlas.width as usize + x) * 4;
+                        atlas.pixels[offset..offset + 4].to_vec()
+                    });
+                    rows.push(json!({"phase":phase,"id":id,"kind":kind,"index":index,"texture":texture,"pixel":pixel,
+                        "playerTexture":player_texture,"dyeable":dyeable.is_some(),
+                        "undyed":dyeable.and_then(|d|d.color_when_undyed)}));
+                }
+            }
+        }
+    }
+    rows.sort_by_key(|row| {
+        (
+            row["phase"].as_u64().unwrap(),
+            row["id"].as_str().unwrap().to_owned(),
+            row["kind"].as_str().unwrap().to_owned(),
+            row["index"].as_u64().unwrap(),
+        )
+    });
+    fs::write(output, serde_json::to_vec(&rows).unwrap()).unwrap();
+}
+
+#[test]
+fn equipment_reload_replaces_pack_metadata_and_retains_prepared_geometry() {
+    let old = FixtureRoot::new();
+    let new = FixtureRoot::new();
+    fs::write(
+        old.0.join("entity-models.json"),
+        serde_json::to_vec(&fixture()).unwrap(),
+    )
+    .unwrap();
+    for (root, name, player) in [(&old.0, "old", false), (&new.0, "new", true)] {
+        let path = root.join("assets/minecraft/equipment/gear.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            serde_json::to_vec(&json!({"layers":{"wings":[{
+                "texture":format!("minecraft:{name}"),"use_player_texture":player
+            }]}}))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let added = new.0.join("assets/gems/equipment/nested/added.json");
+    fs::create_dir_all(added.parent().unwrap()).unwrap();
+    fs::write(
+        added,
+        br#"{"layers":{"humanoid":[{"texture":"gems:added"}]}}"#,
+    )
+    .unwrap();
+    let document = EntityModelDocument::load(&old.0).unwrap();
+    let mut assets = ArmorStandAssets::load(&old.0, Some(&document));
+    let prepared = assets.main.as_ref().unwrap().clone();
+    for (root, name, player, has_added) in
+        [(&new.0, "new", true, true), (&old.0, "old", false, false)]
+    {
+        assets.apply_resources(ArmorStandAssets::load(root, None));
+        assert!(std::sync::Arc::ptr_eq(
+            assets.main.as_ref().unwrap(),
+            &prepared
+        ));
+        assert_eq!(
+            assets.equipment["minecraft:gear"]["wings"][0].0,
+            format!("entity/equipment/wings/{name}")
+        );
+        assert_eq!(assets.wing_player_textures["minecraft:gear"], [player]);
+        assert_eq!(
+            assets.equipment.contains_key("gems:nested/added"),
+            has_added
+        );
+        assert_eq!(assets.root, *root);
+    }
+}
+
+#[test]
+fn equipment_commit_uses_the_prepared_snapshot_not_later_file_edits() {
+    let root = FixtureRoot::new();
+    let file = root.0.join("assets/minecraft/equipment/gear.json");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        br#"{"layers":{"wings":[{"texture":"minecraft:prepared","use_player_texture":true}]}}"#,
+    )
+    .unwrap();
+    let prepared = ArmorStandAssets::load(&root.0, None);
+    fs::write(&file, br#"{"layers":{"wings":[{"texture":"minecraft:edited_after_staging","use_player_texture":false}]}}"#).unwrap();
+    let expected = prepared.equipment.clone();
+    let expected_flags = prepared.wing_player_textures.clone();
+    let mut destination = ArmorStandAssets::load(&root.0.join("empty"), None);
+    // The render-thread operation consumes what the CPU worker prepared.
+    destination.apply_resources(prepared);
+    assert_eq!(
+        destination.equipment, expected,
+        "the committed metadata no longer matches the textures prepared on the worker"
+    );
+    assert_eq!(destination.wing_player_textures, expected_flags);
 }
 
 #[test]

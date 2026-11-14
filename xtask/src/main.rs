@@ -1,7 +1,7 @@
 //! Repository tasks, run with `cargo run -p xtask -- TASK`.
 //!
 //! `package BINARY OUTDIR`: a playable Horizon folder with the game binary, horizon-ctl,
-//! horizon-prepare and horizon-server (built beside it: cargo build --release -p horizon-client
+//! horizon-prepare and horizon-server (built beside it: cargo build --release -p horizon-client -p horizon-client-lib
 //! --bins -p horizon-prepare -p horizon-server), the exporters horizon-prepare compiles, its sources (the launcher compares
 //! them to its own), and PLAY.txt. It holds none of Minecraft's files: players prepare those
 //! from their own copy. .github/workflows/release.yml makes the release folders with it.
@@ -10,18 +10,24 @@
 //! (`cargo build --release -p horizon-client --no-default-features`, without sound or controllers)
 //! as horizon-engine, with horizon-prepare and horizon-server from beside it and the same sources.
 //!
-//! `tokens`: writes `website/src/tokens.css`, the design tokens of `crates/horizon-theme` as CSS
+//! `tokens`: writes `crates/horizon-theme/tokens.css`, the design tokens of `crates/horizon-theme` as CSS
 //! custom properties (a horizon-theme test fails when the file is out of date).
 //!
 //! `icons`: renders the icon masters in `docs/media/brand` (with `rsvg-convert`, from librsvg)
 //! into every size the platforms and the website use, and packs `packaging/icons/horizon.ico`
 //! and `horizon.icns`. `docs/media/brand/README.md` lists what goes where.
+//!
+//! `perf-wasm`: builds `crates/horizon-perf` for `wasm32-unknown-unknown` with the `wasm` feature
+//! and writes `target/perf-wasm/{horizon_perf.wasm,horizon_perf.js}`, which horizon-rust/horizon-site imports into
+//! its static assets (docs/perf-platform.md §7.1).
+
+mod mod_api;
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo run -p xtask -- package BINARY OUTDIR | package-server ENGINE OUTDIR | tokens | icons";
+const USAGE: &str = "usage: cargo run -p xtask -- package BINARY OUTDIR | package-server ENGINE OUTDIR | tokens | icons | perf-wasm";
 
 /// What the release folder takes from the repository at HEAD, as `git archive` writes it.
 const ARCHIVED: [&str; 5] = [
@@ -48,8 +54,10 @@ fn main() -> ExitCode {
         [task, engine, out] if task == "package-server" => {
             package_server(Path::new(engine), Path::new(out))
         }
+        [task] if task == "mod-api" => mod_api::run(),
         [task] if task == "tokens" => tokens(),
         [task] if task == "icons" => icons(),
+        [task] if task == "perf-wasm" => perf_wasm(),
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -78,10 +86,58 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(output.stdout)
 }
 
+/// Builds the web UI's wasm and puts it and its JS wrapper in `target/perf-wasm/`.
+fn perf_wasm() -> Result<(), String> {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("xtask has no parent folder")?;
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = Command::new(&cargo)
+        .current_dir(repo)
+        .args([
+            "build",
+            "--release",
+            "--lib",
+            "-p",
+            "horizon-perf",
+            "--features",
+            "wasm",
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
+        .status()
+        .map_err(|e| format!("{cargo} build: {e}"))?;
+    if !status.success() {
+        return Err(
+            "the wasm build failed; `rustup target add wasm32-unknown-unknown` installs the target"
+                .to_string(),
+        );
+    }
+    let target =
+        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| repo.join("target"), PathBuf::from);
+    let wasm = target.join("wasm32-unknown-unknown/release/horizon_perf.wasm");
+    let script = repo.join("crates/horizon-perf/web/horizon_perf.js");
+    let out = target.join("perf-wasm");
+    fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    fs::copy(&wasm, out.join("horizon_perf.wasm"))
+        .map_err(|e| format!("{}: {e}", wasm.display()))?;
+    fs::copy(&script, out.join("horizon_perf.js"))
+        .map_err(|e| format!("{}: {e}", script.display()))?;
+    let size = fs::metadata(out.join("horizon_perf.wasm"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    println!(
+        "wrote {} ({} KiB) and horizon_perf.js",
+        out.join("horizon_perf.wasm").display(),
+        size / 1024
+    );
+    Ok(())
+}
+
 fn tokens() -> Result<(), String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../website/src/tokens.css");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/horizon-theme/tokens.css");
     fs::write(&path, horizon_theme::css()).map_err(|e| format!("{}: {e}", path.display()))?;
-    println!("wrote website/src/tokens.css");
+    println!("wrote crates/horizon-theme/tokens.css");
     Ok(())
 }
 
@@ -195,7 +251,7 @@ fn icons() -> Result<(), String> {
         &repo.join("crates/horizon-theme/icons/horizon-64.png"),
         &render(&square, (64, 64))?,
     )?;
-    // Avatars and the website's icons.
+    // Avatars, and the website's icons (horizon-site copies docs/media/brand/web/ into its public/).
     let avatar = brand.join("avatar.svg");
     for (svg, size, out) in [
         (
@@ -203,15 +259,15 @@ fn icons() -> Result<(), String> {
             500,
             "docs/media/brand/social/github-avatar-500.png",
         ),
-        (&avatar, 180, "website/public/apple-touch-icon.png"),
-        (&square, 32, "website/public/favicon-32.png"),
+        (&avatar, 180, "docs/media/brand/web/apple-touch-icon.png"),
+        (&square, 32, "docs/media/brand/web/favicon-32.png"),
         (&square, 1024, "docs/media/brand/icon-1024.png"),
         (&macos, 1024, "docs/media/brand/icon-macos-1024.png"),
     ] {
         write(&repo.join(out), &render(svg, (size, size))?)?;
     }
     write(
-        &repo.join("website/public/favicon.svg"),
+        &repo.join("docs/media/brand/web/favicon.svg"),
         &fs::read(&square).map_err(|e| format!("{}: {e}", square.display()))?,
     )?;
     println!("wrote packaging/icons, the window icon, the avatars and the website's icons");
@@ -222,14 +278,38 @@ fn package(binary: &Path, out: &Path) -> Result<(), String> {
     let repo = new_folder(out)?;
     copy_into(binary, out)?;
     copy_beside(binary, &TOOLS, out)?;
+    copy_exporters(&repo.join("exporters"), &out.join("exporters"))?;
     let play = repo.join("packaging/PLAY.txt");
     copy(&play, &out.join("PLAY.txt"))
 }
 
 fn package_server(engine: &Path, out: &Path) -> Result<(), String> {
-    new_folder(out)?;
+    let repo = new_folder(out)?;
+    copy_exporters(&repo.join("exporters"), &out.join("exporters"))?;
     copy(engine, &out.join(program_name(engine, "horizon-engine")))?;
     copy_beside(engine, &SERVER_TOOLS, out)
+}
+
+/// Release builds supply only our compiled classes and their integrity manifest.
+fn copy_exporters(from: &Path, to: &Path) -> Result<(), String> {
+    if !from.join("manifest.json").is_file() {
+        return Err("Missing exporters/manifest.json; run horizon-prepare compile-exporters and copy its bundle to exporters/".into());
+    }
+    copy_exporter_tree(from, to)
+}
+
+fn copy_exporter_tree(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(from).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        let target = to.join(path.file_name().unwrap());
+        if path.is_dir() {
+            copy_exporter_tree(&path, &target)?;
+        } else {
+            copy(&path, &target)?;
+        }
+    }
+    Ok(())
 }
 
 /// `OUT`, emptied, with the sources the release folders take (`ARCHIVED`); the repository's path.
@@ -270,7 +350,7 @@ fn copy_beside(program: &Path, tools: &[&str], out: &Path) -> Result<(), String>
             .join(program_name(program, tool));
         if !path.is_file() {
             return Err(format!(
-                "{} is missing; build it too: cargo build --release -p horizon-client --bins -p horizon-prepare -p horizon-server",
+                "{} is missing; build it too: cargo build --release -p horizon-client -p horizon-client-lib --bins -p horizon-prepare -p horizon-server",
                 path.display()
             ));
         }

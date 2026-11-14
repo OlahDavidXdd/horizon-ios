@@ -7,7 +7,8 @@ use horizon_client::{
     biome::{BiomeInfo, Biomes, GrassModifier},
     blocks::BlockFacts,
     chunk::{Chunk, Light, MIN_Y, index},
-    mesher::{MeshTables, Mesher, OPAQUE_LAYER, TerrainVertex},
+    graphics::LeafCullingMode,
+    mesher::{EMISSION_BITS, FLUID_FACE_BITS, MeshTables, Mesher, OPAQUE_LAYER, TerrainVertex},
     models,
 };
 use horizon_core::biome::BiomeZoom;
@@ -127,6 +128,9 @@ fn scene(
         std::array::from_fn(|z| std::array::from_fn(|x| Some(&chunks[z * 3 + x])));
     let mut mesher = Mesher {
         nether_shading: row["nether"].as_bool().unwrap_or(false),
+        shader_pack_lighting: false,
+        separate_ao: false,
+        shader_pack: false,
         assets,
         render,
         tables,
@@ -136,6 +140,9 @@ fn scene(
         blend_radius,
         smooth_lighting,
         cutout_leaves,
+        opaque_ice: false,
+        translucent_layers: &[],
+        leaf_culling: LeafCullingMode::Off,
     };
     let section_y = int(&row["section_y"])?;
     let started = Instant::now();
@@ -161,7 +168,15 @@ fn scene(
                 .iter()
                 .map(|v| {
                     let ([x, y, z], [u, w]) = (v.pos, v.uv());
-                    json!([x, y, z, u, w, argb(v.color), light_coords(v.light)])
+                    json!([
+                        x,
+                        y,
+                        z,
+                        u,
+                        w,
+                        argb(v.color | EMISSION_BITS | FLUID_FACE_BITS),
+                        light_coords(v.light)
+                    ])
                 })
                 .collect();
             quads.push(json!({"layer": layer, "sprite": sprite, "vertices": vertices}));

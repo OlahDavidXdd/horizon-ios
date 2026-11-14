@@ -1,8 +1,9 @@
-//! The JDK that compiles and runs the vanilla exporters. They call Mojang's own code, so they
+//! Java discovery and execution for the vanilla exporters. They call Mojang's own code, so they
 //! stay Java; everything around them is here.
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -14,9 +15,26 @@ pub struct Jdk {
 
 const TIMEOUT: Duration = Duration::from_secs(3600);
 
-/// Exporters and JDK probes write to pipes or log files: on Windows they open no terminal.
-fn command(program: impl AsRef<OsStr>) -> Command {
-    let command = Command::new(program);
+/// Options for every JVM preparing starts (the exporters, the data generator, javac with `-J`).
+/// They are short batch jobs that run side by side: the C2 compiler's background work costs
+/// more CPU than it wins back, and the serial collector keeps their heaps small. Measured on the
+/// pinned jars, a fresh preparation took 105 s with the defaults and 63-66 s with these, same
+/// output; the serial collector was as fast as the parallel one and its JVMs together took
+/// 1.25 GB instead of 2 GB.
+pub(crate) const BATCH_OPTIONS: [&str; 2] = ["-XX:TieredStopAtLevel=1", "-XX:+UseSerialGC"];
+
+/// The variables a JVM reads extra options from. A collector chosen there, such as a player's
+/// global `-XX:+UseZGC`, stops a JVM started with [`BATCH_OPTIONS`]: "Multiple garbage collectors
+/// selected" (#10067).
+const JVM_OPTION_VARS: [&str; 3] = ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"];
+
+/// Exporters and JDK probes write to pipes or log files: on Windows they open no terminal. They
+/// run with [`BATCH_OPTIONS`] alone, whatever options the player's environment sets for Java.
+pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    for var in JVM_OPTION_VARS {
+        command.env_remove(var);
+    }
     #[cfg(windows)]
     let command = {
         use std::os::windows::process::CommandExt;
@@ -56,9 +74,9 @@ fn without_verbatim(path: PathBuf) -> PathBuf {
 
 /// Resolve compiler symlinks before picking its sibling runtime. The first `java` on the
 /// PATH may be an older, runtime-only install; it must not be paired with a newer `javac`.
-fn path_jdks(path: &OsStr) -> Vec<PathBuf> {
+fn path_homes(path: &OsStr, tool: &str) -> Vec<PathBuf> {
     std::env::split_paths(path)
-        .map(|dir| executable(&dir, "javac"))
+        .map(|dir| executable(&dir, tool))
         .filter(|javac| javac.is_file())
         .map(real_path)
         .filter_map(|javac| {
@@ -162,7 +180,7 @@ fn jdk_parents() -> Vec<PathBuf> {
 
 /// The JDKs (folders with `bin/javac`) one level below `parents`; a macOS bundle's home is
 /// its `Contents/Home`. Those named for `major` come first, then the others newest name first.
-fn installed_jdks(parents: &[PathBuf], major: i64) -> Vec<PathBuf> {
+fn installed_jdks(parents: &[PathBuf], major: i64, tool: &str) -> Vec<PathBuf> {
     let mut homes: Vec<PathBuf> = parents
         .iter()
         .filter_map(|parent| fs::read_dir(parent).ok())
@@ -176,7 +194,7 @@ fn installed_jdks(parents: &[PathBuf], major: i64) -> Vec<PathBuf> {
                 entry.path()
             }
         })
-        .filter(|home| executable(&home.join("bin"), "javac").is_file())
+        .filter(|home| executable(&home.join("bin"), tool).is_file())
         .collect();
     let named = |home: &Path| {
         home.iter().any(|part| {
@@ -191,8 +209,7 @@ fn installed_jdks(parents: &[PathBuf], major: i64) -> Vec<PathBuf> {
 }
 
 /// The Java runtimes the official launcher downloaded into `runtime` (a game directory's
-/// `runtime` folder: `<component>/<platform>/<component>/`, a macOS one in `jre.bundle`). Mojang's
-/// runtimes are whole JDKs, javac included, so a player who has run Minecraft has one already.
+/// `runtime` folder: `<component>/<platform>/<component>/`, a macOS one in `jre.bundle`).
 pub fn minecraft_runtimes(runtime: &Path) -> Vec<PathBuf> {
     let children = |dir: &Path| -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = fs::read_dir(dir)
@@ -206,7 +223,7 @@ pub fn minecraft_runtimes(runtime: &Path) -> Vec<PathBuf> {
         for platform in children(&component) {
             let home = platform.join(component.file_name().unwrap_or_default());
             for home in [home.join("jre.bundle/Contents/Home"), home] {
-                if executable(&home.join("bin"), "javac").is_file() {
+                if executable(&home.join("bin"), "java").is_file() {
                     homes.push(home);
                     break;
                 }
@@ -221,8 +238,18 @@ pub fn minecraft_runtimes(runtime: &Path) -> Vec<PathBuf> {
 /// `/usr/libexec/java_home -v <major>` reports, else the homes in `more` (the launcher's pick,
 /// Minecraft's own runtimes), else the folders installers use (`jdk_parents`).
 pub fn find(major: i64, more: &[PathBuf]) -> Result<Jdk, String> {
+    find_tools(major, more, true)
+}
+
+/// Finds a compatible runtime; precompiled exporters do not need javac.
+pub fn find_runtime(major: i64, more: &[PathBuf]) -> Result<Jdk, String> {
+    find_tools(major, more, false)
+}
+
+fn find_tools(major: i64, more: &[PathBuf], compiler: bool) -> Result<Jdk, String> {
+    let tool = if compiler { "javac" } else { "java" };
     let need = format!(
-        "Java {major} is needed (a JDK with javac, e.g. Eclipse Temurin {major}). \
+        "Java {major} is needed ({tool}, e.g. Eclipse Temurin {major}). \
          Install it, or set JAVA_HOME to it, and try again."
     );
     let mut candidates = Vec::new();
@@ -235,7 +262,7 @@ pub fn find(major: i64, more: &[PathBuf]) -> Result<Jdk, String> {
         ));
     }
     if let Some(path) = std::env::var_os("PATH") {
-        for home in path_jdks(&path) {
+        for home in path_homes(&path, tool) {
             let bin = home.join("bin");
             candidates.push((executable(&bin, "javac"), executable(&bin, "java"), "PATH"));
         }
@@ -265,7 +292,7 @@ pub fn find(major: i64, more: &[PathBuf]) -> Result<Jdk, String> {
             "Minecraft's Java",
         ));
     }
-    for home in installed_jdks(&jdk_parents(), major) {
+    for home in installed_jdks(&jdk_parents(), major, tool) {
         let bin = home.join("bin");
         candidates.push((
             executable(&bin, "javac"),
@@ -275,15 +302,16 @@ pub fn find(major: i64, more: &[PathBuf]) -> Result<Jdk, String> {
     }
     let mut problems = Vec::new();
     for (javac, java, from) in candidates {
-        if !javac.is_file() || !java.is_file() {
+        if (compiler && !javac.is_file()) || !java.is_file() {
             problems.push(format!(
-                "{from} ({}) has no javac and java",
+                "{from} ({}) has no compatible Java tools",
                 javac.parent().unwrap().display()
             ));
             continue;
         }
         let checked = [(&javac, "javac"), (&java, "java")]
             .into_iter()
+            .filter(|(_, name)| compiler || *name == "java")
             .try_for_each(|(program, name)| {
                 let found = tool_major(program, name)?;
                 if i64::from(found) >= major {
@@ -293,15 +321,53 @@ pub fn find(major: i64, more: &[PathBuf]) -> Result<Jdk, String> {
                 }
             });
         match checked {
-            Ok(()) => return Ok(Jdk { javac, java }),
+            // Absolute: the exporters run in another working directory, where a relative
+            // `JAVA_HOME`, `--java-home` or `PATH` entry would name nothing.
+            Ok(()) => {
+                return Ok(Jdk {
+                    javac: std::path::absolute(&javac).unwrap_or(javac),
+                    java: std::path::absolute(&java).unwrap_or(java),
+                });
+            }
             Err(e) => problems.push(format!("{from}: {e}")),
         }
     }
     if problems.is_empty() {
-        Err(format!("{need} No javac was found."))
+        Err(format!("{need} No {tool} was found."))
     } else {
         Err(format!("{need} Found: {}.", problems.join("; ")))
     }
+}
+
+/// Add a repair hint only for a failure the exporter actually reported.
+pub(crate) fn export_failure(error: String, java: &Path, log: &Path) -> String {
+    // An incomplete JDK can still pass `java -version`. Diagnose its actual failure,
+    // rather than requiring one vendor's runtime layout from every Java installation.
+    let mut bytes = Vec::new();
+    let read = fs::File::open(log).and_then(|file| file.take(64 * 1024).read_to_end(&mut bytes));
+    if read.is_ok()
+        && String::from_utf8_lossy(&bytes).lines().any(|line| {
+            let missing = [
+                "java.io.FileNotFoundException: ",
+                "java.nio.file.NoSuchFileException: ",
+            ]
+            .into_iter()
+            .find_map(|exception| line.split_once(exception).map(|(_, path)| path));
+            missing.is_some_and(|path| {
+                ["/lib/tzdb.dat", r"\lib\tzdb.dat"]
+                    .into_iter()
+                    .filter_map(|name| path.split_once(name).map(|(_, rest)| rest))
+                    .any(|rest| rest.is_empty() || rest.starts_with(" ("))
+            })
+        })
+    {
+        return format!(
+            "{error}\nJava at {} cannot load its timezone data (lib/tzdb.dat). \
+             Repair that Java installation or select another compatible Java runtime.",
+            java.display()
+        );
+    }
+    error
 }
 
 /// A classpath with the platform's separator.
@@ -317,7 +383,7 @@ pub fn classpath<'a>(paths: impl IntoIterator<Item = &'a Path>) -> String {
 impl Jdk {
     /// The JDK's home, the folder above `bin` (what `JAVA_HOME` names).
     pub fn home(&self) -> PathBuf {
-        self.javac
+        self.java
             .parent()
             .and_then(Path::parent)
             .map(Path::to_path_buf)
@@ -329,6 +395,7 @@ impl Jdk {
     pub fn javac(&self, major: i64, args: &[String], log: &fs::File) -> Result<(), String> {
         let mut command = command(&self.javac);
         command
+            .args(BATCH_OPTIONS.map(|option| format!("-J{option}")))
             .args(["--release", &major.to_string(), "-proc:none"])
             .args(args);
         run(command, log)
@@ -336,7 +403,7 @@ impl Jdk {
 
     pub fn java(&self, args: &[String], cwd: Option<&Path>, log: &fs::File) -> Result<(), String> {
         let mut command = command(&self.java);
-        command.args(args);
+        command.args(BATCH_OPTIONS).args(args);
         if let Some(dir) = cwd {
             command.current_dir(dir);
         }
@@ -379,6 +446,66 @@ fn run(mut command: Command, log: &fs::File) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_timezone_data_explains_which_java_to_repair() {
+        let dir = std::env::temp_dir().join(format!("horizon-java-tzdb-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("export.log");
+        let java = Path::new("selected-runtime/bin/java");
+        for failure in [
+            r"Caused by: java.io.FileNotFoundException: C:\Java\jdk-25\lib\tzdb.dat (missing)",
+            "Caused by: java.nio.file.NoSuchFileException: /opt/java/lib/tzdb.dat",
+            "Caused by: java.nio.file.NoSuchFileException: /opt/java (25)/lib/tzdb.dat",
+        ] {
+            fs::write(&log, failure).unwrap();
+            let error = export_failure("java failed (-1)".into(), java, &log);
+            assert!(error.contains("java failed (-1)"), "{error}");
+            assert!(error.contains("selected-runtime"), "{error}");
+            assert!(error.contains("timezone data"), "{error}");
+            assert!(error.contains("Repair"), "{error}");
+        }
+        fs::remove_file(log).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn unrelated_export_failures_keep_their_original_diagnostic() {
+        let dir = std::env::temp_dir().join(format!("horizon-java-other-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("export.log");
+        for text in [
+            "Using tzdb.dat\njava.io.FileNotFoundException: missing-pack.json",
+            "java.lang.IllegalStateException: tzdb.dat was mentioned",
+            "java.io.FileNotFoundException: /opt/java/lib/not-tzdb.dat.backup",
+            "java.io.FileNotFoundException: /pack/tzdb.dat (missing)",
+        ] {
+            fs::write(&log, text).unwrap();
+            assert_eq!(
+                export_failure("java failed (-1)".into(), Path::new("java"), &log),
+                "java failed (-1)"
+            );
+        }
+        fs::remove_file(&log).unwrap();
+        assert_eq!(
+            export_failure("java failed (-1)".into(), Path::new("java"), &log),
+            "java failed (-1)"
+        );
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn jvms_ignore_the_players_global_options() {
+        let command = command("java");
+        for var in JVM_OPTION_VARS {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == var && value.is_none()),
+                "{var} reaches the JVM"
+            );
+        }
+    }
 
     #[test]
     fn verbatim_drive_paths_lose_their_prefix() {
@@ -424,6 +551,7 @@ mod tests {
                 dir.join("missing"),
             ],
             25,
+            "javac",
         );
         assert_eq!(
             found,
@@ -445,7 +573,7 @@ mod tests {
         let make = |home: PathBuf, javac: bool| {
             fs::create_dir_all(home.join("bin")).unwrap();
             if javac {
-                fs::write(executable(&home.join("bin"), "javac"), b"").unwrap();
+                fs::write(executable(&home.join("bin"), "java"), b"").unwrap();
             }
             home
         };

@@ -1,7 +1,8 @@
 //! The sample index (`tests/index/index-v1.json`, the one docs/api/mod-index.md
 //! shows) and its files: `coords_hud-0.1.0.hmod`, signed with the throwaway
-//! key `test.pub` by minisign 0.12 (its secret key was deleted), and
-//! `cozy-1.0.0.hpack`, unsigned.
+//! key `test.pub` by minisign 0.12 (its secret key was deleted),
+//! `cozy-1.0.0.hpack`, unsigned, and `glow-1.0.0.hshader`, unsigned
+//! (`horizon-shader new --template post`, then `horizon-shader pack`).
 use super::*;
 use std::path::PathBuf;
 
@@ -25,16 +26,27 @@ fn reads_the_sample_and_keeps_unknown_kinds() {
     let index = sample();
     assert_eq!(index.schema, SCHEMA);
     let kinds: Vec<&str> = index.projects.iter().map(|p| p.kind.name()).collect();
-    assert_eq!(kinds, ["mod", "modpack", "world"]);
-    assert_eq!(index.projects[2].kind, Kind::Other("world".into()));
+    assert_eq!(kinds, ["mod", "modpack", "shader", "world"]);
+    assert_eq!(index.projects[3].kind, Kind::Other("world".into()));
     let hud = index.project("coords_hud").unwrap();
     assert_eq!(
         hud.versions[0].capabilities,
         [Capability::GameRead, Capability::Hud, Capability::Chat]
     );
     // What CI writes reads back the same.
-    let again = Index::parse(&serde_json::to_string(&index).unwrap()).unwrap();
+    let text = serde_json::to_string(&index).unwrap();
+    let again = Index::parse(&text).unwrap();
     assert_eq!(again, index);
+    // Download counts: the publish job adds them; none is left out.
+    assert_eq!(hud.downloads, 0);
+    assert!(!text.contains("downloads"));
+    let counted = text.replacen("\"versions\"", "\"downloads\":12345,\"versions\"", 1);
+    assert_eq!(Index::parse(&counted).unwrap().projects[0].downloads, 12345);
+    // GitHub stars: the same, the source repository's.
+    assert_eq!(hud.stars, 0);
+    assert!(!text.contains("\"stars\""));
+    let starred = text.replacen("\"versions\"", "\"stars\":42,\"versions\"", 1);
+    assert_eq!(Index::parse(&starred).unwrap().projects[0].stars, 42);
 }
 
 #[test]
@@ -44,6 +56,8 @@ fn files_pass_against_their_entries() {
     assert_eq!(check(&index, "coords_hud", &hmod), Ok(Trust::Verified));
     let hpack = fixtures().join("cozy-1.0.0.hpack");
     assert_eq!(check(&index, "cozy", &hpack), Ok(Trust::Unsigned));
+    let hshader = fixtures().join("glow-1.0.0.hshader");
+    assert_eq!(check(&index, "glow", &hshader), Ok(Trust::Unsigned));
     let world = index.project("skyblock_start").unwrap();
     let e = check_file(&index, world, &world.versions[0], &hpack).unwrap_err();
     assert!(e.contains("bytes"), "{e}");
@@ -71,6 +85,20 @@ fn a_changed_file_key_or_manifest_is_refused() {
     let mut more_caps = index.clone();
     more_caps.projects[0].versions[0].capabilities.pop();
     let e = check(&more_caps, "coords_hud", &hmod).unwrap_err();
+    assert!(e.contains("isn't what the index lists"), "{e}");
+
+    let mut other_level = index.clone();
+    other_level.projects[0].versions[0].api_level = Some(1);
+    let e = check(&other_level, "coords_hud", &hmod).unwrap_err();
+    assert!(e.contains("isn't what the index lists"), "{e}");
+    // An index built before levels lists none: the file still passes.
+    let mut no_level = index.clone();
+    no_level.projects[0].versions[0].api_level = None;
+    assert_eq!(check(&no_level, "coords_hud", &hmod), Ok(Trust::Verified));
+    // A native mod's hook points version is listed too: a file naming another is refused.
+    let mut other_hooks = index.clone();
+    other_hooks.projects[0].versions[0].hooks = Some(3);
+    let e = check(&other_hooks, "coords_hud", &hmod).unwrap_err();
     assert!(e.contains("isn't what the index lists"), "{e}");
 
     let mut revoked = index.clone();
@@ -113,7 +141,7 @@ fn refuses_broken_indexes() {
     assert!(e.contains("https"), "{e}");
     // A local test registry may list files on disk; the published one may not.
     let local = text.replace(
-        "https://github.com/ludovic111/horizon-mods/releases/download/coords_hud-0.1.0/",
+        "https://github.com/horizon-rust/horizon-mods/releases/download/coords_hud-0.1.0/",
         "file:///tmp/",
     );
     assert!(Index::parse(&local).unwrap_err().contains("https"));
@@ -162,4 +190,159 @@ fn resource_packs_need_a_pack_mcmeta() {
     let e = check_resource_pack(&pack(&[("pack.mcmeta", meta), ("../x", "")])).unwrap_err();
     assert!(e.contains("plain path"), "{e}");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn data_packs_and_shader_folder_packs_are_read_by_their_content() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("horizon-index-dp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut n = 0;
+    let mut pack = |files: &[&str]| {
+        n += 1;
+        let path = dir.join(format!("{n}.zip"));
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        for name in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            let text = if *name == "pack.mcmeta" {
+                r#"{"pack": {"description": "D", "pack_format": 94}}"#
+            } else {
+                ""
+            };
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    };
+    let data = pack(&["pack.mcmeta", "data/x/function/a.mcfunction"]);
+    assert_eq!(inspect(&Kind::DataPack, &data).unwrap().api, "94");
+    assert_eq!(zip_kind(&data), Kind::DataPack);
+    let looks = pack(&["pack.mcmeta", "assets/x/textures/a.png"]);
+    let e = inspect(&Kind::DataPack, &looks).unwrap_err();
+    assert!(e.contains("data/"), "{e}");
+    assert_eq!(zip_kind(&looks), Kind::ResourcePack);
+    let no_meta = pack(&["data/x/function/a.mcfunction"]);
+    assert!(
+        inspect(&Kind::DataPack, &no_meta)
+            .unwrap_err()
+            .contains("missing")
+    );
+    let shaders = pack(&["shaders/composite.fsh", "shaders/lang/en_us.lang"]);
+    assert_eq!(inspect(&Kind::ShaderPack, &shaders).unwrap().api, "");
+    assert_eq!(zip_kind(&shaders), Kind::ShaderPack);
+    let e = inspect(&Kind::ShaderPack, &looks).unwrap_err();
+    assert!(e.contains("shaders/"), "{e}");
+    let sneaky = pack(&["shaders/a.fsh", "../../x"]);
+    assert!(
+        inspect(&Kind::ShaderPack, &sneaky)
+            .unwrap_err()
+            .contains("plain path")
+    );
+    // Both are zips, and a reader from before them keeps them as unknown kinds.
+    for kind in [Kind::DataPack, Kind::ShaderPack] {
+        assert_eq!(kind.extension(), Some("zip"));
+        assert!(open(&kind).is_ok());
+        assert_eq!(Kind::from(kind.name().to_owned()), kind);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_newest_version_this_horizon_runs_is_installed() {
+    let mut index = sample();
+    let mut newer = index.projects[0].versions[0].clone();
+    newer.version = "0.2.0".into();
+    newer.file.sha256 = "2".repeat(64);
+    newer.api_level = Some(crate::api_level::LEVEL + 1);
+    index.projects[0].versions.insert(0, newer);
+    let p = index.project("coords_hud").unwrap();
+    let pick = |level| {
+        index
+            .installable(p, "26.3", level)
+            .map(|v| v.version.as_str())
+    };
+    assert_eq!(pick(crate::api_level::LEVEL), Some("0.1.0"));
+    assert_eq!(pick(crate::api_level::LEVEL + 1), Some("0.2.0"));
+    assert_eq!(index.installable(p, "26.4", crate::api_level::LEVEL), None);
+    // No level listed: runnable as far as the index knows.
+    index.projects[0].versions[0].api_level = None;
+    let p = index.project("coords_hud").unwrap();
+    let v = index.installable(p, "26.3", 0).unwrap();
+    assert_eq!(v.version, "0.2.0");
+}
+
+#[test]
+fn shader_packs_pass_the_game_s_own_check() {
+    let manifest = "schema = 1\nid = \"glow\"\nname = \"Glow\"\nversion = \"1.0.0\"\napi = \"0.1\"\n\
+                    [[post]]\nfile = \"post.wgsl\"\n";
+    let pack = |post: &str| {
+        let files = [
+            (horizon_shader_api::MANIFEST, manifest),
+            ("post.wgsl", post),
+        ]
+        .map(|(n, t)| (n.to_owned(), t.as_bytes().to_vec()))
+        .into();
+        horizon_shader_api::Pack::from_files(files)
+            .unwrap()
+            .package()
+            .unwrap()
+    };
+    let dir = std::env::temp_dir().join(format!("horizon-mods-shader-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("glow-1.0.0.hshader");
+    std::fs::write(
+        &good,
+        pack("fn post(input: PostInput) -> vec4<f32> { return input.color; }\n"),
+    )
+    .unwrap();
+    let bad = dir.join("bad.hshader");
+    std::fs::write(
+        &bad,
+        pack("fn post(input: PostInput) -> vec4<f32> { return input.color }\n"),
+    )
+    .unwrap();
+    let experimental = dir.join("glow-0.2.hshader");
+    let files = [
+        (
+            horizon_shader_api::MANIFEST,
+            manifest.replace("api = \"0.1\"", "api = \"0.2\""),
+        ),
+        (
+            "post.wgsl",
+            "fn post(input: PostInput) -> vec4<f32> { return input.color; }\n".into(),
+        ),
+    ]
+    .map(|(n, t)| (n.to_owned(), t.into_bytes()))
+    .into();
+    let bytes = horizon_shader_api::Pack::from_files(files)
+        .unwrap()
+        .package()
+        .unwrap();
+    std::fs::write(&experimental, bytes).unwrap();
+    let experimental = inspect(&Kind::Shader, &experimental).unwrap_err();
+    let facts = inspect(&Kind::Shader, &good);
+    let refused = inspect(&Kind::Shader, &bad).unwrap_err();
+    let not_a_pack = inspect(&Kind::Shader, &fixtures().join("cozy-1.0.0.hpack")).unwrap_err();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let facts = facts.unwrap();
+    assert_eq!(
+        (
+            facts.id.as_deref(),
+            facts.version.as_deref(),
+            facts.api.as_str()
+        ),
+        (Some("glow"), Some("1.0.0"), "0.1")
+    );
+    assert!(refused.contains("post.wgsl:1:"), "{refused}");
+    assert!(
+        experimental.contains("shader API 0.2, which is experimental"),
+        "{experimental}"
+    );
+    assert!(
+        not_a_pack.contains(horizon_shader_api::MANIFEST),
+        "{not_a_pack}"
+    );
+    assert_eq!(Kind::Shader.extension(), Some("hshader"));
+    assert!(open(&Kind::Shader).is_ok());
 }

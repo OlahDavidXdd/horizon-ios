@@ -1,13 +1,14 @@
 [package]
 name = "horizon-assets"
-version = "0.1.0"
+version = "0.2.91"
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.90"
 description = "Horizon version-specific model and resource decoding"
 
 [dependencies]
 horizon-core = { path = "../horizon-core" }
+log = "0.4"
 serde = "1.0.229"
 serde_json = { version = "1.0.151", features = ["raw_value"] }
 

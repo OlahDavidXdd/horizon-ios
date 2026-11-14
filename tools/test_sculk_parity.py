@@ -5,7 +5,7 @@ The Java oracle (VanillaSculkOracle) runs each scenario in a real, headless, fla
 level: it builds the blocks, places the player (with a warning level) and entities, and ticks the
 level in ServerLevel.tick's order while scripted game events and block changes happen at given
 ticks. Horizon runs the same scenarios through its game code (`HORIZON_SCULK_FIXTURE`, the
-same functions the game ticks). Both print, per tick, what changed at the watched blocks (state,
+same server phases, with synthetic player and entity state). Both print, per tick, what changed at the watched blocks (state,
 vibration, selector, last frequency, warning level, charge cursors), sounds, level events, the
 player's warden warning level and darkness, new entities, and the level random. The harness
 reports each scenario's first differing tick.
@@ -229,8 +229,31 @@ def catalyst_scenarios(count, seed):
     return out
 
 
+def mob_scenarios():
+    """A mob's own game events: a creeper's fuse (Creeper.tick's PRIME_FUSE once ignited), a mob
+    eating (Mob.ate's EAT), in range of a sensor or not; the fuse ends after the scenario. These run
+    last: their mobs take entity ids from vanilla's global counter, and experience orbs merge by id
+    (ExperienceOrb.canMerge), so mobs added before the catalyst scenarios would change their orbs."""
+    s = []
+
+    def add(name, ticks, lines, opts=''):
+        s.append((name, ticks, opts, lines))
+
+    sensor = f'block 0 {FLOOR} 0 {SENSOR}'
+    watch = f'watch 0 {FLOOR} 0'
+    add('mob_creeper_fuse', 25, [sensor, watch, 'player 6.5 -60 6.5', 'mob minecraft:creeper 2.5 -60 0.5 0 7 noai',
+                                 'at 2 ignite m0'])
+    add('mob_creeper_fuse_far', 25, [sensor, watch, 'player 6.5 -60 6.5', 'mob minecraft:creeper 9.5 -60 0.5 0 7 noai',
+                                     'at 2 ignite m0'])
+    add('mob_sheep_eat', 40, [sensor, watch, 'player 6.5 -60 6.5', 'mob minecraft:sheep 3.5 -60 0.5 90 11 noai',
+                              'at 2 ate m0'])
+    add('mob_calibrated_eat', 40, [f'block 0 {FLOOR} 0 {CALIBRATED}[facing=east]', watch, f'block 1 {FLOOR} 0 minecraft:redstone_block',
+                                   'player 6.5 -60 6.5', 'mob minecraft:sheep 3.5 -60 0.5 90 11 noai', 'at 2 ate m0'])
+    return s
+
+
 def scenarios(count, seed):
-    return handwritten() + random_scenarios(count, seed) + catalyst_scenarios(count // 3, seed)
+    return handwritten() + random_scenarios(count, seed) + catalyst_scenarios(count // 3, seed) + mob_scenarios()
 
 
 def write_scenarios(path, chosen):
@@ -336,9 +359,9 @@ def main():
                                    'dev.horizonlab.parity.VanillaSculkOracle', inputs, build / 'vanilla.txt'],
                                   build, 'vanilla', timeout=3600)
     if not args.java_only:
-        oracle_harness.run_logged(['cargo', 'build', '--locked', '--release', '-p', 'horizon-client', '--bin', 'horizon-client'],
+        oracle_harness.run_logged(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-client', '--bin', 'horizon-client'],
                                   build, 'compile-rust')
-        oracle_harness.run_logged([lab.cargo_target() / 'release/horizon-client', '--resources', resources], build, 'horizon',
+        oracle_harness.run_logged([lab.cargo_target() / 'fast/horizon-client', '--resources', resources], build, 'horizon',
                                   env=lab.game_env(HORIZON_SCULK_FIXTURE=f'{inputs},{build / "horizon.txt"}'))
     if args.java_only:
         return

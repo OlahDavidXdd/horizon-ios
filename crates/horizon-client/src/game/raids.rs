@@ -14,8 +14,12 @@ use horizon_client::{
     },
     patrol::{GameplayAttributes, Member, PatrolLevel, PatrolSpawner},
     raid::{self, Action, BarName, RaidLevel, RaidPlayer, RaiderInfo, RaiderType, Raids, Spawn},
+    random_source,
 };
-use horizon_core::{geometry::Vec3, random::RandomSource};
+use horizon_core::{
+    geometry::Vec3,
+    random::{LegacyRandom, LevelRandom, RandomSource},
+};
 use horizon_world::nbt::Tag;
 use std::collections::{HashMap, HashSet};
 
@@ -23,8 +27,9 @@ use std::collections::{HashMap, HashSet};
 #[derive(Default)]
 pub(super) struct Raiding {
     patrol: PatrolSpawner,
+    siege: Siege,
     /// The raids of the dimension the player is in, and that dimension.
-    raids: Raids,
+    pub(super) raids: Raids,
     loaded: Option<Dim>,
     /// `ServerPlayer.raidOmenPosition` (`raid_omen_position`), read from the
     /// player data on first use.
@@ -36,6 +41,17 @@ pub(super) struct Raiding {
     /// Beds near each raid's centre, rescanned now and then (`HOME` points
     /// of interest for `RaiderMoveThroughVillageGoal`).
     homes: HashMap<i32, (i64, std::sync::Arc<Vec<[i32; 3]>>)>,
+}
+
+/// `VillageSiege`: whether tonight is a siege, whether the spot is chosen,
+/// and the zombies still to spawn there.
+#[derive(Default)]
+struct Siege {
+    tonight: bool,
+    set_up: bool,
+    zombies_to_spawn: i32,
+    next_spawn_time: i32,
+    spot: [i32; 3],
 }
 
 impl Raiding {
@@ -91,8 +107,10 @@ impl RaidLevel for Lvl<'_, '_> {
     fn surface_height(&self, x: i32, z: i32) -> i32 {
         self.game.surface_height(x, z)
     }
+    /// `ServerLevel.isPositionEntityTicking`: a loaded chunk whose entities
+    /// tick (`canPositionTick`) in entity ticking range, not merely loaded.
     fn is_position_entity_ticking(&self, p: [i32; 3]) -> bool {
-        self.has_chunk_at(p)
+        self.has_chunk_at(p) && self.game.tickets.levels().entity_ticking_at(p[0], p[2])
     }
     fn ravager_can_spawn(&self, [x, y, z]: [i32; 3]) -> bool {
         let g = self.game;
@@ -102,11 +120,12 @@ impl RaidLevel for Lvl<'_, '_> {
                 && g.res.facts().is_air(g.world.block(x, y, z))
     }
     fn player(&self) -> Option<RaidPlayer> {
-        let p = self.game.player.as_ref()?;
+        // The first player in the level: a server has no player of its own.
+        let p = self.game.level_players().into_iter().next()?;
         Some(RaidPlayer {
             position: [p.position.x, p.position.y, p.position.z],
             block: block_of(p.position),
-            alive: !p.health.dead_or_dying(),
+            alive: p.alive,
         })
     }
 }
@@ -118,6 +137,9 @@ struct PatrolCx<'a, 'g, 'h> {
     can_spawn: &'h dyn Fn(&Game, [i32; 3]) -> bool,
 }
 impl SpawnLevel for PatrolCx<'_, '_, '_> {
+    fn within_world_border(&self, x: i32, z: i32) -> bool {
+        self.level.within_world_border(x, z)
+    }
     fn state(&self, x: i32, y: i32, z: i32) -> horizon_world::registry::BlockStateId {
         self.level.state(x, y, z)
     }
@@ -154,8 +176,8 @@ impl SpawnLevel for PatrolCx<'_, '_, '_> {
     fn peaceful(&self) -> bool {
         self.level.peaceful()
     }
-    fn dimension(&self) -> spawn_rules::Dimension {
-        self.level.dimension()
+    fn dimension_type(&self) -> &horizon_world::dimension_type::DimensionFacts {
+        self.level.dimension_type()
     }
     fn surface_slime_chance(&self, x: i32, y: i32, z: i32) -> f32 {
         self.level.surface_slime_chance(x, y, z)
@@ -172,14 +194,15 @@ impl PatrolLevel for PatrolCx<'_, '_, '_> {
         self.level.game.ui.rules.bool("spawn_patrols")
     }
     fn bright_outside(&self) -> bool {
-        self.level.game.dim == Dim::Overworld && self.level.game.sky_darken() < 4
+        !self.level.game.dimension_type().has_fixed_time && self.level.game.sky_darken() < 4
     }
+    /// `PatrolSpawner.tick` picks from `level.players()`: the local player
+    /// and every guest in the level.
     fn patrol_players(&self) -> Vec<([i32; 3], bool)> {
-        let g = self.level.game;
-        g.player
-            .as_ref()
-            .map(|p| (block_of(p.position), g.spectator()))
-            .into_iter()
+        self.level
+            .players
+            .iter()
+            .map(|p| (block_of(p.position), p.spectator))
             .collect()
     }
     fn sections_to_village(&self, pos: [i32; 3]) -> i32 {
@@ -212,10 +235,10 @@ impl Game<'_> {
     /// highest non-air one.
     pub(super) fn surface_height(&self, x: i32, z: i32) -> i32 {
         let top = if self.dim == Dim::Nether { 127 } else { 319 };
-        (horizon_client::chunk::MIN_Y..=top)
+        (self.world.bottom_y()..=top)
             .rev()
             .find(|&y| !self.res.facts().is_air(self.world.block(x, y, z)))
-            .map_or(horizon_client::chunk::MIN_Y, |y| y + 1)
+            .map_or(self.world.bottom_y(), |y| y + 1)
     }
     /// Every claimed village point of interest (job sites, beds, bells).
     fn village_pois(&self) -> Vec<[i32; 3]> {
@@ -235,7 +258,7 @@ impl Game<'_> {
         }
         out
     }
-    fn difficulty_id(&self) -> i32 {
+    pub(super) fn difficulty_id(&self) -> i32 {
         use horizon_world::food::Difficulty;
         match self.world.health_rules.difficulty {
             Difficulty::Peaceful => 0,
@@ -264,7 +287,9 @@ impl Game<'_> {
         self.raiding.loaded = Some(self.dim);
         self.raiding.bar_hurts.clear();
         self.raiding.homes.clear();
-        let seed = self.world.random.next_long();
+        // Each loaded raid's own random: the Raid constructor's
+        // `RandomSource.create()`, not the level's.
+        let seed = random_source::unique_seed();
         self.raiding.raids = match horizon_client::save::read_dat(&self.raids_path(self.dim))
             .and_then(|tag| tag.get("data").cloned())
         {
@@ -355,7 +380,7 @@ impl Game<'_> {
                     .clone()
             })
             .unwrap_or_default();
-        attributes.value(key, self.dim.id(), &biome, self.world.day_time)
+        attributes.value(key, &self.dimension_type().id, &biome, self.world.day_time)
     }
 
     /// `BadOmenMobEffect` and `RaidOmenMobEffect.applyEffectTick` for the
@@ -395,11 +420,15 @@ impl Game<'_> {
             _ => OmenTick::Continue,
         }
     }
-    /// The Raid Omen sound when the effect is first added.
+    /// The Raid Omen sound when the effect is first added
+    /// (`MobEffect.onEffectAdded`: at the player's feet).
     pub(super) fn raid_omen_added(&mut self) {
-        let eye = self.eye_position().unwrap_or_default();
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        let at = [p.position.x, p.position.y, p.position.z];
         self.audio
-            .play("minecraft:event.mob_effect.raid_omen", Some(eye), 1.0, 1.0);
+            .play("minecraft:event.mob_effect.raid_omen", Some(at), 1.0, 1.0);
     }
     /// `Raids.createOrExtendRaid`: not for spectators, with the `raids` rule
     /// and where raids may start; the raid centres on the occupied village
@@ -413,24 +442,23 @@ impl Game<'_> {
         }
         self.load_raids();
         let center = raid::raid_center(at, &self.village_pois());
-        let seed = self.world.random.next_long();
+        // The new raid's own random: `RandomSource.create()`, not the level's.
+        let seed = random_source::unique_seed();
         let difficulty = self.difficulty_id();
         let (id, triggered) = self
             .raiding
             .raids
             .create_or_extend(center, difficulty, amplifier, seed);
         if triggered {
-            self.stats.custom("raid_trigger", 1);
+            self.award_custom_stat("raid_trigger", 1);
             self.trigger_player("minecraft:voluntary_exile");
+            self.native_raid_state_change(id, center, "triggered");
         }
         Some(id)
     }
     /// `ServerLevel.getRaidAt`.
     pub(super) fn raiding_nearby(&self, at: [i32; 3]) -> Option<i32> {
         self.raiding.raids.nearby(at).map(|(id, _)| id)
-    }
-    pub(super) fn raid_started(&self, id: i32) -> bool {
-        self.raiding.raids.get(id).is_some_and(|r| r.started)
     }
     /// `/raid start`: a raid in the local village at the given omen level.
     pub(super) fn raid_command_create(&mut self, at: [i32; 3], omen_level: i32) -> bool {
@@ -447,6 +475,8 @@ impl Game<'_> {
     pub(super) fn raid_command_stop(&mut self, id: i32) {
         if let Some(r) = self.raiding.raids.get_mut(id) {
             r.stop();
+            let center = r.center;
+            self.native_raid_state_change(id, center, "stopped");
         }
     }
     pub(super) fn raid_set_omen(&mut self, id: i32, level: i32) -> i32 {
@@ -469,13 +499,14 @@ impl Game<'_> {
         };
         let members: Vec<&Mob> = self.raid_members(id).collect();
         let health: f32 = members.iter().fold(0.0, |a, m| a + m.health);
+        // Java's string concatenation of the floats: `20.0`, not `20`.
         format!(
             "Num groups spawned: {} Raid omen level: {} Num mobs: {} Raid health: {} / {}",
             r.groups_spawned,
             r.omen_level,
             members.len(),
-            health,
-            r.total_health
+            horizon_client::snbt::java_float(health),
+            horizon_client::snbt::java_float(r.total_health)
         )
     }
     /// A raid's members (`groupRaiderMap`): the living raiders it counts.
@@ -583,6 +614,18 @@ impl Game<'_> {
         }
         let centers = self.village_centers();
         let infos = self.raider_infos();
+        let old_states: HashMap<_, _> = self
+            .raiding
+            .raids
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                self.raiding
+                    .raids
+                    .get(id)
+                    .map(|r| (id, (r.status, r.center)))
+            })
+            .collect();
         let mut raids = std::mem::take(&mut self.raiding.raids);
         let actions = {
             let lvl = Lvl {
@@ -594,6 +637,13 @@ impl Game<'_> {
             raids.tick(&lvl, self.ui.rules.bool("raids"), &members)
         };
         self.raiding.raids = raids;
+        for (id, (old, _)) in old_states {
+            if let Some(r) = self.raiding.raids.get(id)
+                && r.status != old
+            {
+                self.native_raid_state_change(id, r.center, r.status.name());
+            }
+        }
         for (id, action) in actions {
             self.apply_raid_action(id, action);
         }
@@ -604,7 +654,7 @@ impl Game<'_> {
     fn apply_raid_action(&mut self, id: i32, action: Action) {
         match action {
             Action::Spawn { pos, wave, spawns } => self.spawn_wave(id, pos, wave, &spawns),
-            Action::Horn { pos, .. } => self.raid_horn(id, pos),
+            Action::Horn { pos, seed } => self.raid_horn(id, pos, seed),
             Action::Remove { id: mob } => {
                 if let Some(m) = self.mobs.iter_mut().find(|m| m.id == mob) {
                     let s = raider::state_mut(m);
@@ -624,26 +674,67 @@ impl Game<'_> {
                         EffectInstance::new("hero_of_the_village", raid::HERO_DURATION, amplifier);
                     effect.visible = false;
                     g.potions.effects.add(effect);
-                    g.stats.custom("raid_win", 1);
+                    g.award_custom_stat("raid_win", 1);
                     g.trigger_player("minecraft:hero_of_the_village");
                 }
             }),
         }
     }
-    /// `Raid.playSound`: the horn, 13 blocks away from the player toward the
-    /// wave, for players within 64 blocks or in the raid.
-    fn raid_horn(&mut self, id: i32, pos: [i32; 3]) {
-        let Some(p) = self.player.as_ref().map(|p| p.position) else {
-            return;
-        };
+    /// `Raid.playSound`: the horn, 13 blocks from each player toward the wave,
+    /// for everyone within 64 blocks or in the raid. One seed for every packet
+    /// (`SoundSource.NEUTRAL`, volume 64, pitch 1).
+    fn raid_horn(&mut self, id: i32, pos: [i32; 3], seed: i64) {
         let in_raid = self.raiding.raids.get(id).is_some_and(|r| r.bar.player);
         let (rx, rz) = (f64::from(pos[0]) + 0.5, f64::from(pos[2]) + 0.5);
-        let distance = ((rx - p.x).powi(2) + (rz - p.z).powi(2)).sqrt();
-        if distance <= 64.0 || in_raid {
-            let k = 13.0 / distance;
-            let at = [p.x + k * (rx - p.x), p.y, p.z + k * (rz - p.z)];
+        // The raid tracks one participant (`bar.player`): the first player in
+        // the level. Everyone else is heard by distance alone.
+        let local_first = self.player.is_some();
+        if let Some(p) = self.player.as_ref()
+            && let Some(at) = raid::horn_at(
+                [p.position.x, p.position.y, p.position.z],
+                rx,
+                rz,
+                in_raid && local_first,
+            )
+        {
+            // This window only. A positioned `play` would be broadcast to
+            // every guest on top of the packet each of them is sent.
+            let capture = self.audio.capture.take();
+            let neutral = horizon_client::settings::SOUND_SOURCES
+                .iter()
+                .position(|s| *s == "neutral")
+                .unwrap_or(0);
             self.audio
-                .play("minecraft:event.raid.horn", Some(at), 64.0, 1.0);
+                .play_on(neutral, "minecraft:event.raid.horn", Some(at), 64.0, 1.0);
+            self.audio.capture = capture;
+        }
+        let Some(host) = self.lan.as_ref() else {
+            return;
+        };
+        let dim = host.hub.config.dimension.clone();
+        let spotted: Vec<(u32, [f64; 3], bool)> = host
+            .hub
+            .guests
+            .iter()
+            .map(|g| (g.conn, g.position, g.placed && g.dimension == dim))
+            .collect();
+        let neutral = horizon_client::settings::SOUND_SOURCES
+            .iter()
+            .position(|s| *s == "neutral")
+            .unwrap_or(0) as i32;
+        let mut first_guest = !local_first;
+        for (conn, position, here) in spotted {
+            if !here {
+                continue;
+            }
+            let participating = std::mem::replace(&mut first_guest, false) && in_raid;
+            let Some(at) = raid::horn_at(position, rx, rz, participating) else {
+                continue;
+            };
+            let packet =
+                host.hub
+                    .sound_packet("minecraft:event.raid.horn", at, 64.0, 1.0, neutral, seed);
+            host.hub.send_to(conn, &packet);
         }
     }
     /// `Raid.spawnGroup`: a wave of raiders at `pos`, the leader wearing the
@@ -669,6 +760,7 @@ impl Game<'_> {
                 self.mount_mob(rider, id);
             }
         }
+        self.native_raid_spawn_wave(raid_id, pos, wave, spawns.len());
     }
     /// `Raid.joinRaid` for a new raider: placed at the block's centre one
     /// above, finalized for an event, its raid buffs applied.
@@ -730,7 +822,9 @@ impl Game<'_> {
         raider::finalize(&mut mob, reason);
         let id = mob.id;
         self.mobs.push(mob);
+        self.native_mobs_joined(self.mobs.len() - 1, false);
         self.enchant_spawn_equipment(id);
+        self.halloween_spawn_head(id);
         Some(id)
     }
 
@@ -762,7 +856,7 @@ impl Game<'_> {
             }
             positions.push((m.id, m.position, s.active_raid));
         }
-        let banners: Vec<(usize, Vec3)> = self
+        let banners: Vec<(usize, u32, Vec3)> = self
             .dropped
             .iter()
             .enumerate()
@@ -771,7 +865,7 @@ impl Game<'_> {
                     && e.stack.data().is_some_and(|d| d.ominous_banner)
                     && e.pickup_delay == 0
             })
-            .map(|(i, e)| (i, e.position))
+            .map(|(i, e)| (i, e.id, e.position))
             .collect();
         let mut taken: Vec<usize> = Vec::new();
         let mut collectors: Vec<(usize, u32)> = Vec::new();
@@ -791,11 +885,13 @@ impl Game<'_> {
             let has_rider = ridden.contains(&m.id);
             let target_golem = matches!(m.ai.target, Some(horizon_client::mobs::Who::Mob(t)) if golems.contains(&t));
             let target_player = m.ai.target == Some(horizon_client::mobs::Who::Player);
-            let (health, age, range) = (m.health, m.age, m.attrs.follow_range);
+            let (health, range) = (m.health, m.attrs.follow_range);
             let raids = &mut self.raiding.raids;
             let s = m.extra.raider.get_or_insert_with(Box::default);
             s.rider = has_rider;
             s.in_village = in_village;
+            // Vindicator.customServerAiStep: `ServerLevel.isRaided`.
+            s.raided = species == Species::Vindicator && raids.nearby(block).is_some();
             if s.raid_id.is_some_and(|id| raids.get(id).is_none()) {
                 s.raid_id = None;
                 s.ticks_outside_raid = 0;
@@ -819,14 +915,11 @@ impl Game<'_> {
             if !alive {
                 continue;
             }
-            // Raider.updateNoActionTime adds two per tick, and a raider
-            // fighting a player or golem in a raid is never idle.
-            if s.raid_id.is_some() {
-                m.ai.no_action_time = if target_player || target_golem {
-                    0
-                } else {
-                    m.ai.no_action_time + 1
-                };
+            // Raider.aiStep: a raider fighting a player or golem in a raid is
+            // never idle. The per-tick growth (+1 serverAiStep, +2
+            // Raider.updateNoActionTime) is added by the mob's own step.
+            if s.raid_id.is_some() && (target_player || target_golem) {
+                m.ai.no_action_time = 0;
             }
             // Raider.aiStep: join the raid the raider stands in.
             if s.raid_id.is_none()
@@ -837,11 +930,9 @@ impl Game<'_> {
             {
                 joins.push((m.id, id, health));
             }
-            // PathfindToRaidGoal.recruitNearby.
-            if s.active_raid
-                && !s.raid_over
-                && !s.in_village
-                && age % 20 == 0
+            // PathfindToRaidGoal.tick: recruitNearby, only while the goal runs.
+            if std::mem::take(&mut s.recruit_due)
+                && s.active_raid
                 && let Some(id) = s.raid_id
             {
                 recruit.push((id, position));
@@ -856,20 +947,33 @@ impl Game<'_> {
                 && raids.get(id).is_some_and(|r| r.leader(s.wave).is_none())
                 && !leaders.contains(&(id, s.wave))
             {
+                let in_reach = |(i, _, p): &&(usize, u32, Vec3)| {
+                    !taken.contains(i)
+                        && (p.x - position.x).abs() <= range
+                        && (p.z - position.z).abs() <= range
+                        && (p.y - position.y).abs() <= 8.0
+                };
+                let by_distance = |a: &&(usize, u32, Vec3), b: &&(usize, u32, Vec3)| {
+                    a.2.distance_squared(position)
+                        .total_cmp(&b.2.distance_squared(position))
+                };
+                // The unreachable cache only picks the navigation target;
+                // a banner next to the raider is still picked up.
                 let near = banners
                     .iter()
-                    .filter(|(i, p)| {
-                        !taken.contains(i)
-                            && (p.x - position.x).abs() <= range
-                            && (p.z - position.z).abs() <= range
-                            && (p.y - position.y).abs() <= 8.0
+                    .filter(in_reach)
+                    .filter(|(_, item, _)| {
+                        !s.unreachable_banners
+                            .iter()
+                            .any(|&(b, until)| b == *item && now < until)
                     })
-                    .min_by(|a, b| {
-                        a.1.distance_squared(position)
-                            .total_cmp(&b.1.distance_squared(position))
-                    });
-                if let Some((i, p)) = near {
+                    .min_by(by_distance);
+                let nearest = banners.iter().filter(in_reach).min_by(by_distance);
+                let adjacent =
+                    nearest.filter(|(_, _, p)| p.distance_squared(position) < 1.414 * 1.414);
+                if let Some((i, item, p)) = adjacent.or(near) {
                     s.banner_at = Some([p.x, p.y, p.z]);
+                    s.banner_item = *item;
                     if p.distance_squared(position) < 1.414 * 1.414 {
                         // pickUpItem: the banner becomes the wave's leader.
                         taken.push(*i);
@@ -879,7 +983,8 @@ impl Game<'_> {
                         s.banner_at = None;
                         s.patrol_leader = true;
                         s.patrolling = true;
-                        m.extra.head = Some(raider::BANNER.into());
+                        // wear_banner: head id + ominous stack for SetEquipment (#4567).
+                        raider::wear_banner(m);
                     }
                 }
             }
@@ -893,7 +998,7 @@ impl Game<'_> {
         }
         taken.sort_unstable();
         for i in taken.into_iter().rev() {
-            self.dropped.remove(i);
+            self.remove_dropped(i);
         }
         for (id, wave, mob) in new_leaders {
             if let Some(r) = self.raiding.raids.get_mut(id) {
@@ -1003,7 +1108,7 @@ impl Game<'_> {
     /// `Raider.die`: the wave loses its leader, the killing player becomes
     /// a hero of the village, and the raider leaves the raid (its health
     /// stays in the bar's total).
-    pub(super) fn raider_died(&mut self, m: &Mob, by_player: bool) {
+    pub(super) fn raider_died(&mut self, m: &Mob, by_player: bool, killer: Option<u32>) {
         let Some(s) = raider::state(m) else {
             return;
         };
@@ -1013,7 +1118,7 @@ impl Game<'_> {
         let (leader, wave) = (s.patrol_leader, s.wave);
         self.flush_raid_bar(id);
         let living = self.raid_living_health(id, Some(m.id));
-        let uuid = self.level.player_uuid;
+        let uuid = self.player_uuid_of(killer);
         if let Some(r) = self.raiding.raids.get_mut(id) {
             if leader {
                 r.remove_leader(wave);
@@ -1034,6 +1139,7 @@ impl Game<'_> {
     /// read it).
     fn sync_villager_raids(&mut self, infos: &HashMap<i32, Vec<RaiderInfo>>) {
         let raids = &self.raiding.raids;
+        let mut ongoing = Vec::new();
         for m in &mut self.mobs {
             if m.species() != Species::Villager {
                 continue;
@@ -1059,7 +1165,27 @@ impl Game<'_> {
             let ext = mobs_villager::ext_mut(m);
             ext.raid = status;
             ext.raid_wave = wave;
+            if !m.no_ai && matches!(status, mobs_villager::PRE_RAID | mobs_villager::RAID) {
+                ongoing.push(m.id);
+            }
         }
+        // Villager.customServerAiStep: a 1 in 100 chance each tick, in an
+        // ongoing raid, of entity event 42 (`handleEntityEvent` splashes).
+        for id in ongoing {
+            if self.particles.random().next_int_bound(100) == Ok(0) {
+                self.mob_raid_splash(id);
+            }
+        }
+    }
+    /// Entity event 42 for villager `id`: the guests get the byte, and this
+    /// game draws `AbstractVillager.addParticlesAroundSelf(SPLASH)` itself.
+    fn mob_raid_splash(&mut self, id: u32) {
+        let Some(m) = self.mobs.iter().find(|m| m.id == id) else {
+            return;
+        };
+        let at = [m.position.x, m.position.y, m.position.z];
+        self.lan_entity_event(id as i32, 42, at);
+        self.particles_around_mob(id, "splash", horizon_client::particles::Burst::VILLAGER);
     }
 
     /// The raid bar a living player at `at` is in (`Raid.getPlayers`): red,
@@ -1088,7 +1214,12 @@ impl Game<'_> {
                 twinkle: false,
             }],
         ));
-        let rocket = self.new_rocket(Vec3::new(at[0], at[1], at[2]), &stack, false);
+        let rocket = self.new_rocket(
+            Vec3::new(at[0], at[1], at[2]),
+            &stack,
+            false,
+            &mut random_source::entity(),
+        );
         self.rockets.push(rocket);
     }
     /// `BehaviorUtils.throwItem`: a hero's gift tossed toward the player.
@@ -1109,14 +1240,19 @@ impl Game<'_> {
     /// bed or bell a villager has taken): `PoiManager.isVillageCenter`.
     pub(super) fn village_centers(&self) -> HashSet<(i32, i32, i32)> {
         let mut out = HashSet::new();
+        let world = self.mob_world_base(&[]);
         for m in &self.mobs {
             if m.species() != Species::Villager || !m.alive() {
                 continue;
             }
-            for p in [m.extra.home, m.extra.bed, m.extra.meeting]
-                .into_iter()
-                .flatten()
-            {
+            // A remembered HOME is no longer an occupied village POI once its
+            // loaded bed head disappears. An unavailable chunk remains unknown.
+            let bed = m.extra.bed.filter(|&[x, y, z]| {
+                !self.world.loaded(x, z)
+                    || horizon_client::mobs::villager_brain::poi_at(&world, x, y, z)
+                        == Some(horizon_client::mobs::villager_brain::Poi::Home)
+            });
+            for p in [m.extra.home, bed, m.extra.meeting].into_iter().flatten() {
                 out.insert(section(p));
             }
         }
@@ -1153,7 +1289,7 @@ impl Game<'_> {
         let enemies = self.ui.rules.bool("spawn_mobs") && self.ui.rules.bool("spawn_monsters");
         let mut random = std::mem::replace(
             &mut self.world.random,
-            horizon_core::random::LegacyRandom::new(0),
+            LevelRandom::for_level(LegacyRandom::new(0)),
         );
         let mut members: Vec<Member> = Vec::new();
         let mut spawner = std::mem::take(&mut self.raiding.patrol);
@@ -1163,15 +1299,14 @@ impl Game<'_> {
                 centers: self.village_centers(),
                 can_spawn: &biome_ok,
             };
-            let mut spawn =
-                |l: &PatrolCx, m: Member, _: &mut horizon_core::random::LegacyRandom| {
-                    // EntityType.create makes no monsters in peaceful.
-                    if l.level.game.difficulty_id() == 0 {
-                        return false;
-                    }
-                    members.push(m);
-                    true
-                };
+            let mut spawn = |l: &PatrolCx, m: Member, _: &mut horizon_core::random::LevelRandom| {
+                // EntityType.create makes no monsters in peaceful.
+                if l.level.game.difficulty_id() == 0 {
+                    return false;
+                }
+                members.push(m);
+                true
+            };
             spawner.tick(&level, enemies, &mut random, &mut spawn);
         }
         self.raiding.patrol = spawner;
@@ -1184,6 +1319,150 @@ impl Game<'_> {
             ];
             self.spawn_event_mob("minecraft:pillager", at, m.leader, raider::Reason::Patrol);
         }
+    }
+    /// `VillageSiege.tick`: at midnight one night in ten, 20 zombies spawn
+    /// two ticks apart near a village 32 blocks from a player standing in it.
+    pub(super) fn tick_village_siege(&mut self) {
+        if self.dim != Dim::Overworld {
+            return;
+        }
+        let enemies = self.ui.rules.bool("spawn_mobs") && self.ui.rules.bool("spawn_monsters");
+        if self.sky_darken() < 4 || !enemies {
+            self.raiding.siege.tonight = false;
+            self.raiding.siege.set_up = false;
+            return;
+        }
+        // ClockTimeMarkers.ROLL_VILLAGE_SIEGE: tick 18000 of the 24000 tick day.
+        if self.world.day_time.rem_euclid(24000) == 18000 {
+            self.raiding.siege.tonight = self.world.random.next_int_bound(10).unwrap_or(1) == 0;
+        }
+        if !self.raiding.siege.tonight {
+            return;
+        }
+        if !self.raiding.siege.set_up {
+            if !self.try_to_setup_siege() {
+                return;
+            }
+            self.raiding.siege.set_up = true;
+        }
+        if self.raiding.siege.next_spawn_time > 0 {
+            self.raiding.siege.next_spawn_time -= 1;
+            return;
+        }
+        self.raiding.siege.next_spawn_time = 2;
+        if self.raiding.siege.zombies_to_spawn > 0 {
+            self.try_spawn_siege_zombie();
+            self.raiding.siege.zombies_to_spawn -= 1;
+        } else {
+            self.raiding.siege.tonight = false;
+        }
+    }
+    /// `ServerLevel.isVillage`: within one section of a village.
+    fn is_village(centers: &HashSet<(i32, i32, i32)>, pos: [i32; 3]) -> bool {
+        sections_to_village(centers, section(pos)) <= 1
+    }
+    /// `VillageSiege.tryToSetupSiege`: the first player standing in a village
+    /// picks a spot 32 blocks away (ten tries); true when one stood in a
+    /// village, even if no spot was found.
+    fn try_to_setup_siege(&mut self) -> bool {
+        let centers = self.village_centers();
+        for player in self.level_players() {
+            if player.spectator {
+                continue;
+            }
+            let center = block_of(player.position);
+            if !Self::is_village(&centers, center)
+                || self.natural_level().biome_tag(
+                    "minecraft:without_zombie_sieges",
+                    center[0],
+                    center[1],
+                    center[2],
+                )
+            {
+                continue;
+            }
+            for _ in 0..10 {
+                let angle = self.world.random.next_float() * std::f32::consts::TAU;
+                let spot = [
+                    center[0] + (angle.cos() * 32.0).floor() as i32,
+                    center[1],
+                    center[2] + (angle.sin() * 32.0).floor() as i32,
+                ];
+                if let Some(attempted_pos) = self.find_siege_spawn_pos(&centers, spot) {
+                    let mut canceled = false;
+                    self.native_village_siege(
+                        self.dim.id(),
+                        player.uuid,
+                        attempted_pos,
+                        &mut canceled,
+                    );
+                    if canceled {
+                        return false;
+                    }
+                    self.raiding.siege.spot = spot;
+                    self.raiding.siege.next_spawn_time = 0;
+                    self.raiding.siege.zombies_to_spawn = 20;
+                    break;
+                }
+            }
+            return true;
+        }
+        false
+    }
+    /// `VillageSiege.trySpawn`: one zombie, in a random yaw.
+    fn try_spawn_siege_zombie(&mut self) {
+        let centers = self.village_centers();
+        let spot = self.raiding.siege.spot;
+        let Some(at) = self.find_siege_spawn_pos(&centers, spot) else {
+            return;
+        };
+        let Some(id) = self.spawn_event_mob("minecraft:zombie", at, false, raider::Reason::Event)
+        else {
+            return;
+        };
+        let yaw = self.world.random.next_float() * 360.0;
+        if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
+            (m.yaw, m.previous_yaw, m.body_yaw, m.previous_body_yaw) = (yaw, yaw, yaw, yaw);
+            (m.head_yaw, m.previous_head_yaw) = (yaw, yaw);
+        }
+        self.spawn_jockeys(id, false);
+    }
+    /// `VillageSiege.findRandomSpawnPos`: ten tries within 8 blocks of the
+    /// spot for a village column where a zombie may spawn.
+    fn find_siege_spawn_pos(
+        &mut self,
+        centers: &HashSet<(i32, i32, i32)>,
+        spot: [i32; 3],
+    ) -> Option<[f64; 3]> {
+        let mut random = std::mem::replace(
+            &mut self.world.random,
+            LevelRandom::for_level(LegacyRandom::new(0)),
+        );
+        let mut found = None;
+        for _ in 0..10 {
+            let x = spot[0] + random.next_int_bound(16).unwrap_or(0) - 8;
+            let z = spot[2] + random.next_int_bound(16).unwrap_or(0) - 8;
+            if !self.world.chunks.contains_key(&(x >> 4, z >> 4)) {
+                continue;
+            }
+            let y = self.surface_height(x, z);
+            if Self::is_village(centers, [x, y, z])
+                && spawn_rules::check_spawn_rules(
+                    Species::Zombie,
+                    &self.natural_level(),
+                    spawn_rules::Reason::Event,
+                    &mut random,
+                    x,
+                    y,
+                    z,
+                )
+            {
+                found = Some([f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5]);
+                break;
+            }
+        }
+        self.world.random = random;
+        found
     }
     /// A raider's ominous banner (drop chance 2.0: always dropped) and a
     /// patrol captain's ominous bottle (`entities/pillager`).
@@ -1201,10 +1480,12 @@ impl Game<'_> {
         let new = self.potions.effects.get("bad_omen").is_none();
         self.potions.effects.add(effect);
         let eye = self.eye_position().unwrap_or_default();
-        // MobEffect.onEffectAdded: Bad Omen's sound when it is new.
-        if new {
+        // MobEffect.onEffectAdded: Bad Omen's sound when it is new, at the
+        // player's feet.
+        if new && let Some(p) = self.player.as_ref() {
+            let at = [p.position.x, p.position.y, p.position.z];
             self.audio
-                .play("minecraft:event.mob_effect.bad_omen", Some(eye), 1.0, 1.0);
+                .play("minecraft:event.mob_effect.bad_omen", Some(at), 1.0, 1.0);
         }
         self.audio
             .play("minecraft:item.ominous_bottle.dispose", Some(eye), 1.0, 1.0);
@@ -1262,5 +1543,134 @@ mod tests {
         assert_eq!(sections_to_village(&centers, (4, 4, 2)), 2);
         assert_eq!(sections_to_village(&centers, (-10, 4, 2)), 7);
         assert_eq!(section([-1, -17, 15]), (-1, -2, 0));
+    }
+}
+
+impl Game<'_> {
+    /// Read-only command-harness observation of the existing raid state and inputs.
+    pub(in crate::game) fn raid_fixture_state(
+        &self,
+        op: &serde_json::Value,
+    ) -> horizon_client::Result<serde_json::Value> {
+        use serde_json::json;
+        let id = op["id"].as_i64().ok_or("raid observation: missing id")? as i32;
+        let mut state = json!({"id":id,"present":self.raiding.raids.get(id).is_some()});
+        if let Some(r) = self.raiding.raids.get(id) {
+            state["status"] = json!(r.status.name());
+            state["started"] = json!(r.started);
+            state["active"] = json!(r.active);
+            state["groups_spawned"] = json!(r.groups_spawned);
+            state["center"] = json!(r.center);
+            // Observe the production answer; never substitute a corrected POI test here.
+            state["village"] = json!(Self::is_village(&self.village_centers(), r.center));
+            if op["members"].as_bool() == Some(true) {
+                state["member_present"] = json!(self.raid_members(id).next().is_some());
+            }
+        }
+        let observe = |m: &Mob| -> horizon_client::Result<serde_json::Value> {
+            let uuid = self
+                .persist
+                .uuids
+                .get(&m.id)
+                .copied()
+                .ok_or("raid observation: actor UUID is not registered")?;
+            let tag = horizon_client::entity_nbt::mob_to_nbt(
+                m,
+                uuid,
+                self.persist.raw.get(&m.id),
+                Some(self.pack.assets.registry),
+                |other| self.persist.uuid_of(other),
+            );
+            Ok(json!({"uuid":uuid,"type":m.kind.id,"health":m.health,
+                "pos":[m.position.x,m.position.y,m.position.z],"noai":m.no_ai,
+                "home":m.extra.bed.map(|p| p.to_vec()).unwrap_or_default(),
+                "raid_id":raider::state(m).and_then(|s|s.raid_id).unwrap_or(-1),
+                "nbt":horizon_client::snbt::to_snbt(&tag)}))
+        };
+        let actors = self
+            .raid_members(id)
+            .map(observe)
+            .collect::<horizon_client::Result<Vec<_>>>()?;
+        let mut villagers = Vec::new();
+        for uuid in op["villagers"]
+            .as_array()
+            .ok_or("raid observation: missing villagers")?
+        {
+            let uuid = u128::from_str_radix(
+                &uuid
+                    .as_str()
+                    .ok_or("raid observation: invalid UUID")?
+                    .replace('-', ""),
+                16,
+            )?;
+            let Some(super::commands::Target::Mob(id)) = self.target_by_uuid(uuid) else {
+                return Err("raid observation: villager UUID missing/wrong type".into());
+            };
+            let m = self
+                .mobs
+                .iter()
+                .find(|m| m.id == id && m.species() == Species::Villager)
+                .ok_or("raid observation: actor is not a villager")?;
+            villagers.push(observe(m)?);
+        }
+        let pos: [i32; 3] =
+            std::array::from_fn(|i| op["poi"][i].as_i64().unwrap_or(i64::MIN) as i32);
+        let loaded = self.world.loaded(pos[0], pos[2]);
+        let live_poi = loaded.then(|| {
+            let w = self.mob_world_base(&[]);
+            format!(
+                "{:?}",
+                horizon_client::mobs::villager_brain::poi_at(&w, pos[0], pos[1], pos[2])
+            )
+        });
+        eprintln!(
+            "raid input raw: {}",
+            json!({"label":op["label"],"id":id,"loaded":loaded,
+            "live_poi":live_poi,"claimed_pois":self.village_pois(),
+            "raid_nbt":horizon_client::snbt::to_snbt(&self.raiding.raids.to_nbt()),
+            "actors":actors,"villagers":villagers})
+        );
+        Ok(state)
+    }
+}
+
+#[cfg(test)]
+#[path = "raids/tests/bed_loss.rs"]
+mod bed_loss_tests;
+
+#[cfg(test)]
+mod entity_ticking_tests {
+    use super::{Lvl, RaidLevel};
+    use crate::game::native_machines::tests::server_game;
+    use horizon_client::{chunk::Chunk, ticket_levels::Sources};
+    use std::{collections::HashSet, sync::Arc};
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_wave_spawns_only_where_entities_tick() {
+        let mut game = server_game();
+        game.world
+            .chunks
+            .insert((6, 0), Arc::new(Chunk::empty(6, 0)));
+        // A player in chunk (0, 0) with a simulation distance of 5: chunk
+        // (6, 0) is loaded but its entities do not tick.
+        game.tickets.update(Some(Sources {
+            players: vec![(0, 0)],
+            view_distance: 10,
+            simulation_distance: 5,
+            ..Sources::default()
+        }));
+        let centers = HashSet::new();
+        let level = Lvl {
+            game: &game,
+            difficulty: 2,
+            centers: &centers,
+        };
+        assert!(level.is_position_entity_ticking([8, 64, 8]));
+        assert!(!level.is_position_entity_ticking([6 * 16 + 8, 64, 8]));
+        assert!(
+            !level.is_position_entity_ticking([-40, 64, 8]),
+            "not loaded"
+        );
     }
 }

@@ -151,7 +151,10 @@ fn installs_with_dependencies_then_updates_and_removes() {
     // An update replaces the old file.
     fake.release("addon", "2", &["base"], b"addon pack v2", false);
     let entry = Installed::load(&home).lookup("addon").cloned().unwrap();
-    assert_eq!(update_for(&fake, &entry).unwrap().unwrap().number, "2");
+    assert_eq!(
+        update_for(&fake, &entry, &home).unwrap().unwrap().number,
+        "2"
+    );
     install(&fake, &addon, false, &home, NONE).unwrap();
     assert!(!home.join("resourcepacks/addon-1.zip").exists());
     assert_eq!(
@@ -163,7 +166,7 @@ fn installs_with_dependencies_then_updates_and_removes() {
         .cloned()
         .unwrap();
     assert_eq!(entry.number, "2");
-    assert!(update_for(&fake, &entry).unwrap().is_none());
+    assert!(update_for(&fake, &entry, &home).unwrap().is_none());
 
     let removed = remove(&home, "addon").unwrap();
     assert_eq!(removed.project, "addon");
@@ -339,4 +342,107 @@ fn shader_packs_older_launchers_installed_are_left_alone() {
     installed.save(&home).unwrap();
     assert!(home.join("shaderpacks/old-pack.zip").is_file());
     fs::remove_dir_all(&home).unwrap();
+}
+
+/// A data pack zip with these files.
+fn datapack_zip(files: &[&str]) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("pack.mcmeta", options).unwrap();
+    zip.write_all(br#"{"pack":{"pack_format":94,"description":"Test"}}"#)
+        .unwrap();
+    for name in files {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(b"{}").unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+fn data_packs_go_into_a_world_when_something_in_them_runs() {
+    let world = home("datapack").join("saves/New World");
+    fs::create_dir_all(&world).unwrap();
+    let mut fake = Fake::default();
+    let mut tools = project("tools", Kind::DataPack);
+    tools.loaders = vec!["datapack".into()];
+    fake.add(tools);
+    let mut terrain = project("terrain", Kind::Mod);
+    terrain.loaders = vec!["datapack".into(), "fabric".into()];
+    fake.add(terrain);
+    let mut jar = project("jar", Kind::Mod);
+    jar.loaders = vec!["fabric".into()];
+    fake.add(jar);
+    let runs = datapack_zip(&[
+        "data/t/function/a.mcfunction",
+        "data/t/function/b.mcfunction",
+        "data/minecraft/tags/function/load.json",
+        "data/t/recipe/r.json",
+    ]);
+    fake.release("tools", "2.0", &[], &runs, false);
+    fake.release(
+        "terrain",
+        "1.0",
+        &[],
+        &datapack_zip(&["data/t/worldgen/world_preset/w.json"]),
+        false,
+    );
+    let tools = fake.project("tools").unwrap();
+    let off = &|_: f32| {};
+
+    let done = install_datapack(&fake, &tools, false, &world, off).unwrap();
+    assert_eq!(done.pack.file, "tools-2.0.zip");
+    assert!(done.pack.enabled);
+    assert_eq!(done.number, "2.0");
+    assert_eq!(
+        done.coverage.summary(),
+        "Runs its 2 functions, 1 function tag, 1 recipe."
+    );
+    assert!(world.join("datapacks/tools-2.0.zip").is_file());
+    // Nothing of it in the browser's own list.
+    assert!(Installed::load(world.parent().unwrap().parent().unwrap())
+        .entries
+        .is_empty());
+    let again = install_datapack(&fake, &tools, false, &world, off).unwrap();
+    assert_eq!(again.pack.file, "tools-2.0 (2).zip");
+
+    let terrain = fake.project("terrain").unwrap();
+    let refused = install_datapack(&fake, &terrain, false, &world, off)
+        .err()
+        .unwrap();
+    assert_eq!(
+        refused,
+        "Pack terrain would change nothing in Horizon yet: Horizon doesn't read its 1 worldgen \
+         world preset."
+    );
+    // A pack of only recipes, or only worldgen, now does something.
+    for (slug, file) in [
+        ("recipes", "data/t/recipe/r.json"),
+        ("biomes", "data/t/worldgen/biome/b.json"),
+    ] {
+        let mut only = project(slug, Kind::DataPack);
+        only.loaders = vec!["datapack".into()];
+        fake.add(only);
+        fake.release(slug, "1", &[], &datapack_zip(&[file]), false);
+        let only = fake.project(slug).unwrap();
+        assert!(
+            install_datapack(&fake, &only, false, &world, off).is_ok(),
+            "{slug}"
+        );
+    }
+    let jar = fake.project("jar").unwrap();
+    assert!(install_datapack(&fake, &jar, false, &world, off).is_err());
+
+    let mut bad = project("bad", Kind::DataPack);
+    bad.loaders = vec!["datapack".into()];
+    fake.add(bad);
+    fake.release("bad", "1", &[], &runs, true);
+    let bad = fake.project("bad").unwrap();
+    assert!(install_datapack(&fake, &bad, false, &world, off).is_err());
+    let names: Vec<String> = fs::read_dir(world.join("datapacks"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 4, "{names:?}");
+    fs::remove_dir_all(world.parent().unwrap().parent().unwrap()).unwrap();
 }

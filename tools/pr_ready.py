@@ -4,15 +4,19 @@
     python3 tools/pr_ready.py                       # on this machine, against origin/main
     python3 tools/pr_ready.py --base upstream/main  # a fork: against the main repository's main
     python3 tools/pr_ready.py --host macmini        # builds and harnesses on a fleet machine (~/fleet/rbuild)
-    python3 tools/pr_ready.py --quick               # without running the vanilla harnesses
+    python3 tools/pr_ready.py --harnesses           # also run the affected vanilla harnesses here
+    python3 tools/pr_ready.py --quick               # never run the vanilla harnesses
 
 From the files the branch changes since its merge base with --base (committed or not) it decides what to run:
-rustfmt, clippy with warnings denied and the tests of the touched crates; the launcher (its own workspace) the
-same way when it, horizon-prepare or horizon-theme changed; website/src/tokens.css against horizon-theme;
-Cargo.lock changing only with a Cargo.toml; the Python tests and the public-tree check; and the vanilla
-harnesses the changes can affect, picked as CI's parity job picks them (tools/parity.py --changed). Harnesses run
-where the vanilla data is (a prepared .local/ here, or the Mac mini); elsewhere they are listed for CI.
-Clippy checks all targets of touched crates and their transitive workspace dependents, including examples.
+rustfmt, and clippy with warnings denied exactly as CI's verify job runs it (the whole workspace with the game's code
+mods, plus the server build when horizon-client is affected); the tests of the touched crates, with the features
+CI's workspace-wide run gives them; the launcher (its own workspace) the same way when CI's launcher job would run
+(tools/ci/rust_changes.py --launcher); crates/horizon-theme/tokens.css against horizon-theme; Cargo.lock changing
+only with a Cargo.toml; the Python tests (always, as in CI) and the public-tree check; and the vanilla harnesses the
+changes can affect, picked as CI's parity job picks them (tools/parity.py --changed). As in CI (parity-scope in
+.github/workflows/ci.yml), the harnesses run only when the branch changes a harness, an oracle, a probe or the
+runner; otherwise they are listed and left to parity-main, which runs them on main. --harnesses runs them anyway.
+Harnesses run where the vanilla data is (a prepared .local/ here, or the Mac mini); elsewhere they are listed for CI.
 Tests select library, binary and integration targets explicitly, followed by doc tests, so unrelated example
 executables are not built and linked again.
 
@@ -21,6 +25,7 @@ Progress, and the end of a failed check's output, go to stderr (--verbose: all o
 """
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -30,6 +35,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 if os.name == "nt":
@@ -42,16 +48,15 @@ FLEET_SHARED = Path.home() / "code" / "horizon-parity" / "shared-local" / "parit
 if "PARITY_SHARED" not in os.environ and not (ROOT / ".local" / "minecraft").exists() and FLEET_SHARED.is_dir():
     # A fleet worktree without vanilla data still knows each harness's dependencies.
     os.environ["PARITY_SHARED"] = str(FLEET_SHARED)
-from tools import parity, release_train  # noqa: E402
+from tools import parity, process_tree, release_train  # noqa: E402
+from tools.ci import rust_changes  # noqa: E402
 
 RBUILD = Path.home() / "fleet" / "rbuild"
 LINE_LIMIT = 500
-# What rbuild's login shell needs on each fleet machine before cargo (it adds sccache itself). The ThinkPad hosts
-# the Claude account pool: three jobs at most.
+# What rbuild's login shell needs on each fleet machine before cargo (it adds sccache itself). The ThinkPad no
+# longer builds (2026-10-26: it keeps the AI pool and a few services; Linux work goes to playhorizon's runner).
 HOST_SETUP = {
     "macmini": "source ~/.cargo/env; export PATH=/opt/homebrew/bin:$PATH CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-10}",
-    "thinkpad": 'export CARGO_BUILD_JOBS=3 PKG_CONFIG_PATH="$(ls -d /nix/store/*-alsa-lib-*-dev/lib/pkgconfig | tail -1):'
-                '$(ls -d /nix/store/*-systemd-*-dev/lib/pkgconfig | tail -1)"',
     "local": "",
 }
 # Hosts that hold the vanilla data, and how a run there gets it: CI's own runner scripts on the parity runner's
@@ -68,12 +73,14 @@ mkdir -p "$state/parity-runner" "$state/parity-target"
 ln -sfn "$state/parity-runner" .local/parity-runner && ln -sfn "$state/parity-target" .local/parity-target""",
 }
 ROOT_RUST = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml"}
-TOKENS = "website/src/tokens.css"
 LAUNCHER_FEATURES = """export features=""
-if [ "$(uname)" = Darwin ] && ! xcrun metal --version > /dev/null 2>&1; then features="--features gpui/runtime_shaders"; fi
+if [ "$(uname)" = Darwin ] && ! xcrun metal --version > /dev/null 2>&1; then features="--features gpui_platform/runtime_shaders"; fi
 in_shell() { if [ "$(uname)" = Linux ] && ! pkg-config --exists xkbcommon 2>/dev/null && command -v nix-shell > /dev/null; then
   nix-shell shell.nix --run "$1"; else bash -c "$1"; fi; }"""
 
+
+# Build-script inputs outside the crates: catalog-only edits still need to build and test their consumers.
+MOD_API_INPUTS = ("native-hooks.json", "tools/native-hook-fragments/")
 
 def is_doc(path):
     return path.endswith(".md")
@@ -81,13 +88,13 @@ def is_doc(path):
 
 def workspace_rust(path):
     """Whether a change to path is built by the main Cargo workspace."""
-    return not is_doc(path) and (path.startswith(("crates/", "xtask/", ".cargo/")) or path in ROOT_RUST)
+    return not is_doc(path) and (path.startswith(("crates/", "xtask/", ".cargo/", *MOD_API_INPUTS))
+                                 or path in ROOT_RUST)
 
 
 def launcher_rust(path):
-    """Whether a change to path is built into the launcher (its own workspace)."""
-    return not is_doc(path) and any(path.startswith(p) for p in release_train.LAUNCHER_PATHS) and \
-        path != "launcher/links.json" and not path.startswith("launcher/docs/")
+    """Whether a change to path is built into the launcher (its own workspace): CI's launcher job's own rule."""
+    return rust_changes.needs_launcher([path])
 
 
 def touched_crates(paths, packages):
@@ -96,9 +103,17 @@ def touched_crates(paths, packages):
         return None
     crates = set()
     for path in paths:
-        if path == TOKENS:
-            path = packages.get("horizon-theme", "crates/horizon-theme") + "/"
         if is_doc(path):
+            continue
+        if path.startswith(MOD_API_INPUTS):
+            crates.update({"horizon-client", "horizon-client-render", "horizon-mod-api-gen"})
+            continue
+        if "horizon-client-lib" in packages and path.startswith("crates/horizon-client/"):
+            relative = path.removeprefix("crates/horizon-client/")
+            gameplay = relative in {"Cargo.toml", "build.rs", "windows-segment-heap.manifest",
+                                    "src/lib.rs", "src/main.rs", "src/entry.rs", "src/game.rs", "tests/launch_api.rs"} \
+                or relative.startswith("src/game/")
+            crates.add("horizon-client" if gameplay else "horizon-client-lib")
             continue
         owners = [name for name, directory in packages.items() if path.startswith(directory.rstrip("/") + "/")]
         if owners:
@@ -113,12 +128,10 @@ def area(path):
         return None
     if path.startswith(("launcher/", "crates/horizon-prepare/")):
         return "launcher"
-    if path.startswith("website/"):
-        return "website"
     if path.startswith((".github/", "tools/ci/")):
         return "CI"
     if path.startswith("crates/horizon-theme/"):
-        return None  # the design system feeds the game, the launcher and the website alike
+        return None  # the design system feeds the game, the launcher and the website (its tokens.css) alike
     return "game"
 
 
@@ -151,6 +164,19 @@ def suggested_label(paths, exporter_paths=frozenset()):
     return "`skip-release`"
 
 
+# CI's parity-scope (.github/workflows/ci.yml): a pull request runs its harnesses itself only when it changes a
+# harness, an oracle, a probe or the runner. parity-main runs the others on main, a batch of merges at a time.
+PARITY_SCOPE = re.compile(
+    r"^(tools/test_[a-z0-9_]+_parity\.py|tools/(parity[a-z_]*|lab)\.py|tools/parity_hosts\.json|mods/horizon/src/test/"
+    r"|crates/[^/]+/examples/|crates/horizon-client/src/game/[a-z_]*(fixture|harness)\.rs"
+    r"|\.github/workflows/parity[a-z-]*\.yml)")
+
+
+def runs_parity(changed):
+    """Whether CI's parity job would run for a pull request that changes these files."""
+    return any(PARITY_SCOPE.match(path) for path in changed)
+
+
 def harness_names(names):
     """Harness names without shard suffixes, in order."""
     return list(dict.fromkeys(parity.base_name(name) for name in names))
@@ -164,7 +190,8 @@ def affected_here(changed):
                 (parity.SHARED / "dependencies" / f"{name}.json").exists() for name in found)
     if not known and not changed & parity.SHARED_INPUTS:
         return None
-    return harness_names(name for name in found if name in parity.affected_harnesses(found, records, changed))
+    affected = parity.affected_harnesses(found, records, changed)
+    return harness_names(name for name in found if name in affected)
 
 
 def short_list(names, limit=12):
@@ -178,17 +205,17 @@ def duration(seconds):
 
 
 def git(*arguments):
-    return subprocess.run(["git", *arguments], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    return subprocess.run(["git", *arguments], cwd=ROOT, capture_output=True, check=True).stdout.decode("utf-8")
 
 
 def line_counts(base, changed):
     """Lines added and removed in each changed path since base, untracked files included: {path: (added, removed)}."""
     counts = {}
-    for row in git("diff", "--numstat", base).splitlines():
+    for row in filter(None, git("diff", "--numstat", "--no-renames", "-z", base).split("\0")):
         plus, minus, path = row.split("\t", 2)
         if plus != "-":
             counts[path] = (int(plus), int(minus))
-    for path in git("ls-files", "--others", "--exclude-standard").splitlines():
+    for path in git("ls-files", "--others", "--exclude-standard", "-z").split("\0"):
         if path in changed:
             try:
                 counts[path] = (len((ROOT / path).read_text(encoding="utf-8").splitlines()), 0)
@@ -274,14 +301,65 @@ def parity_summary(output):
     return text
 
 
+# CI's verify job (.github/workflows/ci.yml): clippy over the whole workspace, and over the server build (the game
+# without sound or controllers).
+CI_CLIPPY = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+CI_CLIPPY_SERVER = "cargo clippy -p horizon-client --all-targets --locked --no-default-features -- -D warnings"
+
+
+# CI installs the current stable each run (rustup toolchain install stable), and Rust ships one every six weeks
+# since 1.85.0 on 2025-02-20: so CI's version follows from the date, without the network.
+RUST_TRAIN = (85, datetime.date(2025, 2, 20))
+
+
+def ci_rust(today):
+    """The minor version of the stable Rust CI runs on this date."""
+    minor, released = RUST_TRAIN
+    return minor + (today - released).days // 42
+
+
+def rust_version():
+    """The rustc the checks here run with, as (major, minor, patch), or None."""
+    try:
+        output = subprocess.run(["rustc", "--version"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    match = re.match(r"rustc (\d+)\.(\d+)\.(\d+)", output)
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def old_rust(version, today):
+    """A warning when this Rust is older than CI's: an older clippy flags lints CI's no longer does."""
+    if version is None or version[:1] != (1,) or version[1] >= ci_rust(today):
+        return None
+    return (f"{'.'.join(map(str, version))} is older than CI's stable (1.{ci_rust(today)}): clippy may flag lints "
+            "CI doesn't, update with `rustup update`")
+
+
+def mark_old_rust(steps, warning):
+    """A ⚠️ Rust row above the first clippy that runs, and failed clippy rows point at it. Never fails the run."""
+    clippy = [step for step in steps if step.name.endswith("clippy") and step.skip is None]
+    if not warning or not clippy:
+        return
+    for step in clippy:
+        if step.status == "fail":
+            step.detail += "; likely the old Rust above"
+    rust = Step("Rust", where="git")
+    rust.status, rust.detail = "warn", warning
+    steps.insert(steps.index(clippy[0]), rust)
+
+
 def mod_features(crates):
-    """Code mods are off by default (docs/mods.md): on wherever horizon-mods is checked, as in CI."""
-    if crates is not None and "horizon-mods" not in crates:
-        return ""
-    features = ["horizon-mods/runtime", "horizon-mods/pack"]
-    if crates is None or "horizon-client" in crates:
-        features.append("horizon-client/mods")
-    return f" --features {','.join(features)}"
+    """The features CI's workspace-wide test run gives these crates. Cargo unifies features over the packages it
+    builds, so a crate tested alone needs the ones the workspace would have turned on for it: horizon-mods' index."""
+    return " --features horizon-mods/index" if crates is not None and "horizon-mods" in crates else ""
+
+
+# What horizon-client's full content-root tests load (mod_content_tests.rs). They take minutes on prepared data, so
+# they are #[ignore]d and run here only when one of these changes.
+CONTENT_ROOT = ("crates/horizon-client/src/mod_content", "crates/horizon-client-render/src/assets.rs", "crates/horizon-items/",
+                "crates/horizon-mods/", "crates/horizon-assets/")
+CONTENT_ROOT_TESTS = "cargo test --locked -p horizon-client-lib --lib mod_content::tests:: -- --ignored"
 
 
 def plan(args, base, changed, crates_of, libraries, dependencies):
@@ -289,16 +367,18 @@ def plan(args, base, changed, crates_of, libraries, dependencies):
     rust = any(workspace_rust(path) for path in changed)
     launcher = any(launcher_rust(path) for path in changed)
     # The Python tests also hold ROADMAP.md to roadmap/roadmap.toml (tests/test_roadmap.py).
-    python = any(path.endswith(".py") or path.startswith(("tests/", "tools/", "roadmap/")) or path == "ROADMAP.md"
-                 for path in changed)
-    crates = touched_crates(changed, crates_of) if rust or TOKENS in changed else []
+    crates = touched_crates(changed, crates_of) if rust else []
     # An unrecognised Rust path must not silently skip validation.
     if rust and crates == []:
         crates = None
     selection = "--workspace" if crates is None else " ".join(f"-p {shlex.quote(c)}" for c in crates)
+    # CI's own clippy commands: a crate checked alone gets other features than in CI's workspace-wide run, and an
+    # unused import behind a feature passed here and failed in CI (#1895). Warm, the workspace run costs about what
+    # the touched crates and their dependents did (14-32 s against 14-17 s on the Mac mini, 2026-10-26).
     clippy_crates = dependent_crates(crates, dependencies)
-    clippy_selection = "--workspace" if clippy_crates is None else " ".join(
-        f"-p {shlex.quote(c)}" for c in clippy_crates)
+    clippy = CI_CLIPPY
+    if clippy_crates is None or "horizon-client" in clippy_crates:
+        clippy += f" && {CI_CLIPPY_SERVER}"
     test_skip = None if crates is None or crates else "no crate touched"
     doc_crates = sorted(libraries if crates is None else libraries.intersection(crates))
     doc_selection = "--workspace" if crates is None else " ".join(f"-p {shlex.quote(c)}" for c in doc_crates)
@@ -306,30 +386,47 @@ def plan(args, base, changed, crates_of, libraries, dependencies):
     steps = [
         Step("Cargo.lock", where="git"),
         Step("Public tree", "python3 tools/check_public_tree.py", where="here"),
-        Step("Python tests", "python3 -m unittest discover -s tests", where="here",
-             skip=None if python else "no Python change", summary=unittest_passed),
+        # docs/layers.md: a crate depends only on its own layer or a lower one, and the exceptions only shrink.
+        Step("Layers", f"python3 tools/check_layers.py --base {shlex.quote(base)}", where="here"),
+        Step("Addresses", f"python3 tools/check_addresses.py --base {shlex.quote(base)}", where="here"),
+        Step("File size", f"python3 tools/check_file_size.py --base {shlex.quote(base)}", where="here"),
+        # Always, as in CI: some read the crates, the roadmap or the workflows.
+        Step("Python tests", "python3 -m unittest discover -s tests", where="here", summary=unittest_passed),
         Step("rustfmt", "cargo fmt --all -- --check", skip=None if rust else no_rust),
-        Step("clippy", f"cargo clippy {clippy_selection}{mod_features(clippy_crates)} --all-targets --locked -- -D warnings",
-             skip=None if rust else no_rust),
+        Step("clippy", clippy, skip=None if rust else no_rust),
         Step("tests" + (": workspace" if crates is None else f": {', '.join(crates)}" if crates else ""),
              f"cargo test --locked {selection}{mod_features(crates)} --tests",
              skip=test_skip, summary=tests_passed),
         Step("doc tests", f"cargo test --locked {doc_selection} --doc",
              skip=test_skip or (None if doc_crates else "no library touched"), summary=tests_passed),
-        Step("tokens.css up to date", "cargo test --locked -p horizon-theme --lib website_tokens_are_up_to_date",
-             skip=None if any(p.startswith(("crates/horizon-theme/", "xtask/")) or p == TOKENS for p in changed)
+        Step("content root tests", CONTENT_ROOT_TESTS, summary=tests_passed,
+             skip=None if crates is None or any(p.startswith(CONTENT_ROOT) for p in changed)
+             else "content root untouched"),
+        Step("tokens.css up to date", "cargo test --locked -p horizon-theme --lib tokens_css_is_up_to_date",
+             skip=None if any(p.startswith(("crates/horizon-theme/", "xtask/")) for p in changed)
              else "theme untouched"),
     ]
     launcher_skip = None if launcher else "launcher untouched"
     for name, command in [("launcher rustfmt", "cargo fmt --check"),
                           ("launcher clippy", "cargo clippy --all-targets --locked $features -- -D warnings"),
-                          ("launcher tests", "cargo test --locked --lib $features")]:
+                          ("launcher tests", "cargo test --locked --lib --bins $features")]:
         steps.append(Step(name, f"cd launcher && {LAUNCHER_FEATURES}\nin_shell {shlex.quote(command)}", skip=launcher_skip,
                           summary=tests_passed if name == "launcher tests" else None))
     harness = Step("Parity", summary=parity_summary)
     affected = affected_here(changed)
     local_data = (ROOT / ".local" / "minecraft").exists() and (ROOT / ".local" / "horizon-client").exists()
-    if args.quick or (args.host == "local" and not local_data) or (args.host != "local" and args.host not in HARNESS_SETUP):
+    in_scope = args.harnesses or runs_parity(changed)
+    if not args.quick and not in_scope:
+        # What CI does with this pull request: nothing here, parity-main on main.
+        harness.status = "list"
+        why = "no harness, oracle, probe or runner change; --harnesses runs them here"
+        if affected is None:
+            harness.detail = f"not run ({why}): parity-main checks this on main"
+        elif not affected:
+            harness.detail = "no harness affected"
+        else:
+            harness.detail = f"{len(affected)} affected, left to parity-main on main ({why}): {short_list(affected)}"
+    elif args.quick or (args.host == "local" and not local_data) or (args.host != "local" and args.host not in HARNESS_SETUP):
         harness.status = "list"
         why = "--quick" if args.quick else "no vanilla data here"
         if affected is None:
@@ -397,7 +494,8 @@ def run_script(steps, host, verbose):
 
 
 def run_windows(steps, verbose):
-    """Run local checks directly on Windows without requiring a Unix shell."""
+    """Run local checks directly on Windows without requiring a Unix shell. Each runs in its own job
+    (tools/process_tree.py): what a check starts, a harness's game say, ends with it, or with this process."""
     for step in steps:
         command = shlex.split(step.command)
         cwd = ROOT
@@ -405,12 +503,18 @@ def run_windows(steps, verbose):
         env["PYTHONUTF8"] = "1"
         if step.name == "Public tree":
             command = [sys.executable, "tools/check_public_tree.py"]
+        elif step.name == "Layers":
+            command = [sys.executable, "tools/check_layers.py", *command[2:]]
+        elif step.name == "Addresses":
+            command = [sys.executable, "tools/check_addresses.py", *command[2:]]
+        elif step.name == "File size":
+            command = [sys.executable, "tools/check_file_size.py", *command[2:]]
         elif step.name == "Python tests":
             command = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
         elif step.name == "rustfmt":
             command = ["cargo", "fmt", "--all", "--", "--check"]
         elif step.name == "clippy":
-            command = ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]
+            command = shlex.split(CI_CLIPPY)  # the server build's clippy runs in CI (Linux)
         elif step.name.startswith("tests"):
             command = shlex.split(step.command)
         elif step.name == "tokens.css up to date":
@@ -422,7 +526,7 @@ def run_windows(steps, verbose):
             command = ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"]
             cwd = ROOT / "launcher"
         elif step.name == "launcher tests":
-            command = ["cargo", "test", "--locked", "--lib"]
+            command = ["cargo", "test", "--locked", "--lib", "--bins"]
             cwd = ROOT / "launcher"
         elif step.name == "Parity":
             command = shlex.split(step.command)
@@ -437,18 +541,51 @@ def run_windows(steps, verbose):
         print(f"  {step.name}...", file=sys.stderr, flush=True)
         started = time.monotonic()
         try:
-            with subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, text=True, errors="replace") as process:
+            with process_tree.popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, errors="replace") as process:
+                def release(process):
+                    # The check's exit ends what it left running, which would otherwise hold the output open.
+                    process.wait()
+                    process_tree.ended(process)
+                # A daemon: interrupted, this process exits at once, and its jobs end the checks with it.
+                reaper = threading.Thread(target=release, args=(process,), daemon=True)
+                reaper.start()
                 for line in process.stdout:
                     step.output += line
                     if verbose:
                         print("    " + line, end="", file=sys.stderr)
-                status = process.wait()
+                reaper.join()
+                status = process.returncode
             step.status = "pass" if status == 0 else "fail"
         except OSError as error:
             step.status, step.detail = "fail", str(error)
         step.seconds = int(time.monotonic() - started)
         finish(step, verbose)
+
+
+def run_checks(steps, host, verbose):
+    """Runs the checks: the Python ones here beside the cargo ones on host, then the harnesses.
+
+    The Python tests and the public-tree check only read files, and they took about two minutes of a warm run that
+    waited for them before cargo started (114 of 213 s, 2026-11-03). Side by side, the run takes about as long as the
+    longer of the two. The harnesses build with cargo, so they still come after it. With --verbose, every check's
+    output is shown, and the checks run one after another so that it doesn't interleave.
+    """
+    here = [step for step in steps if step.where == "here" and step.status is None]
+    beside = [step for step in here if step.name != "Parity"]
+    after = [step for step in here if step.name == "Parity"]
+    on_host = [step for step in steps if step.where == "host" and step.status is None]
+    if verbose:
+        run_script(beside + after, "local", verbose)
+        run_script(on_host, host, verbose)
+        return
+    python = threading.Thread(target=run_script, args=(beside, "local", verbose))
+    python.start()
+    try:
+        run_script(on_host, host, verbose)
+    finally:
+        python.join()
+    run_script(after, "local", verbose)
 
 
 def finish(step, verbose):
@@ -467,7 +604,7 @@ MARK = {"pass": "✅", "fail": "❌", "skip": "➖", "list": "➖", "warn": "⚠
 
 def block(args, base, merge_base, changed, counts, steps, label, elapsed):
     where = socket.gethostname().split(".")[0] if args.host == "local" else args.host
-    flags = "".join(f" --{flag}" for flag in ("quick",) if getattr(args, flag)) + \
+    flags = "".join(f" --{flag}" for flag in ("quick", "harnesses") if getattr(args, flag)) + \
         ("" if args.host == "local" else f" --host {args.host}") + ("" if base == "origin/main" else f" --base {base}")
     added, removed = (sum(count[i] for count in counts.values()) for i in (0, 1))
     warnings = scope_warnings(changed, sum(sum(count) for path, count in counts.items() if reviewed(path)))
@@ -489,6 +626,8 @@ def main():
     parser.add_argument("--host", default="local", choices=sorted(HOST_SETUP),
                         help="where builds, tests and harnesses run: local, or a fleet machine through ~/fleet/rbuild")
     parser.add_argument("--quick", action="store_true", help="list the affected harnesses instead of running them")
+    parser.add_argument("--harnesses", action="store_true",
+                        help="run the affected harnesses even when the branch changes no harness, oracle, probe or runner")
     parser.add_argument("--verbose", action="store_true", help="show every check's output")
     args = parser.parse_args()
     if args.host != "local" and not RBUILD.exists():
@@ -499,8 +638,7 @@ def main():
         parser.error(f"no merge base with {args.base} (git fetch?)")
     merge_base = git("merge-base", "HEAD", args.base).strip()
     counts = line_counts(merge_base, changed)
-    crates_of, libraries, dependencies = packages() if any(workspace_rust(p) for p in changed) or TOKENS in changed \
-        else ({}, set(), {})
+    crates_of, libraries, dependencies = packages() if any(workspace_rust(p) for p in changed) else ({}, set(), {})
     steps = plan(args, args.base, changed, crates_of, libraries, dependencies)
     print(f"pr_ready: {len(changed)} files changed since {args.base}; checks on {args.host}", file=sys.stderr, flush=True)
 
@@ -508,8 +646,11 @@ def main():
     problem = lock_problem(changed)
     lock.status, lock.detail = ("fail", problem) if problem else ("pass", "unchanged" if not any(
         p.endswith("Cargo.lock") for p in changed) else "changes with a Cargo.toml")
-    run_script([step for step in steps if step.where == "here" and step.status is None], "local", args.verbose)
-    run_script([step for step in steps if step.where == "host" and step.status is None], args.host, args.verbose)
+    run_checks(steps, args.host, args.verbose)
+    warning = old_rust(rust_version(), datetime.date.today()) if args.host == "local" else None
+    if warning and any(step.name.endswith("clippy") and step.skip is None for step in steps):
+        print(f"pr_ready: Rust {warning}", file=sys.stderr)
+    mark_old_rust(steps, warning)
 
     label = suggested_label(changed, release_train.exporters())
     print(block(args, args.base, merge_base, sorted(changed), counts, steps, label,

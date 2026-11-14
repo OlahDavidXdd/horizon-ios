@@ -21,6 +21,7 @@
 .DS_Store
 # What the client writes to its working directory when run from the repo root.
 /options.txt
+/debug-profile.json
 /horizon.txt
 /horizon-graphics.txt
 /horizon-controller.txt
@@ -35,6 +36,7 @@
 
 /packaging/ios/HorizonIOS.xcodeproj/
 /third_party/winit/target/
+/crates/horizon-android/target/
 # Local iOS exports, signing material, and per-user Xcode state.
 *.ipa
 *.xcarchive/
@@ -47,3 +49,12 @@
 !.env.example
 !.env.sample
 !.env.template
+
+# Release-only compiled original exporter bundle.
+/exporters/
+
+# Generated simulator-only launcher preview project.
+/packaging/ios/Preview/LauncherPreview.xcodeproj/
+
+# Xcode intermediate products generated beside the iOS project.
+/packaging/ios/build/

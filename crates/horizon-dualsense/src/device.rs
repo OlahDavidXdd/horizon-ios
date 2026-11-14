@@ -1,14 +1,21 @@
 //! The pad over hidapi, and the thread that writes to it: writes block (a Bluetooth report can
 //! take milliseconds), so the game only hands over what the pad should do.
-use crate::{
-    DEFAULT_LIGHTBAR, Output, PLAYER_1, TRIGGER_OFF, TriggerEffect, Vibration, is_dualsense,
-};
+#[cfg(not(target_os = "ios"))]
+use crate::{DEFAULT_LIGHTBAR, Output, PLAYER_1, Vibration, is_dualsense};
+use crate::{TRIGGER_OFF, TriggerEffect};
+#[cfg(not(target_os = "ios"))]
 use hidapi::{BusType, HidApi, HidDevice, HidResult};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+#[cfg(not(target_os = "ios"))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::Sender;
+#[cfg(not(target_os = "ios"))]
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_os = "ios"))]
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
@@ -17,6 +24,7 @@ pub enum Transport {
 }
 
 /// An open DualSense.
+#[cfg(not(target_os = "ios"))]
 pub struct DualSense {
     device: HidDevice,
     transport: Transport,
@@ -34,6 +42,7 @@ pub fn bluetooth_allowed() -> bool {
     cfg!(target_os = "linux") || std::env::var_os("HORIZON_DUALSENSE_BT").is_some_and(|v| v == "1")
 }
 
+#[cfg(not(target_os = "ios"))]
 impl DualSense {
     /// The first DualSense hidapi lists, USB before Bluetooth (as SDL); `None` when there is
     /// none, an error when it can't be opened (Linux without access to its hidraw node).
@@ -119,13 +128,17 @@ impl Default for State {
 /// A vibration: the motors' levels (left, right), each for a while, in order.
 pub type Rumble = Vec<([u8; 2], Duration)>;
 
+// On iOS no thread reads the queue (the Link never opens); the variants stay so the
+// Link's API is the same everywhere.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 enum Message {
     State(State),
     Rumble(Rumble),
     Scan,
 }
 
-/// The writer thread. Dropping it frees the triggers and stops the motors before it ends.
+/// The output thread. Dropping it frees the triggers and stops the motors before it ends; on
+/// iOS there is none (no hidapi backend) and the Link stays closed.
 pub struct Link {
     tx: Option<Sender<Message>>,
     /// 0: no pad open, else 1 + the transport.
@@ -135,6 +148,7 @@ pub struct Link {
 
 impl Link {
     /// Start the thread and look for a DualSense.
+    #[cfg(not(target_os = "ios"))]
     pub fn start() -> Link {
         let (tx, rx) = mpsc::channel();
         let open = Arc::new(AtomicU8::new(0));
@@ -148,6 +162,16 @@ impl Link {
             tx: Some(tx),
             open,
             thread,
+        }
+    }
+
+    /// No output on iOS: hidapi has no backend there. The Link never opens.
+    #[cfg(target_os = "ios")]
+    pub fn start() -> Link {
+        Link {
+            tx: None,
+            open: Arc::new(AtomicU8::new(0)),
+            thread: None,
         }
     }
 
@@ -194,11 +218,13 @@ impl Drop for Link {
 
 /// Looks for the pad this many more times, a second apart, after a scan finds nothing (its
 /// hidraw node may appear after the controller does).
+#[cfg(not(target_os = "ios"))]
 const SCAN_TRIES: u32 = 5;
 
+#[cfg(not(target_os = "ios"))]
 struct Writer {
     api: Option<HidApi>,
-    pad: Option<DualSense>,
+    pad: Option<Box<dyn Handle>>,
     open: Arc<AtomicU8>,
     state: State,
     /// What the pad was last sent; `None` after (re)opening.
@@ -213,6 +239,7 @@ struct Writer {
     next_scan: Instant,
 }
 
+#[cfg(not(target_os = "ios"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Lights {
     /// Over Bluetooth, until the pad's clock says its animation is over (or this long after
@@ -225,11 +252,13 @@ enum Lights {
 
 /// The pad's sensor clock once its Bluetooth connection animation is over (SDL_hidapi_ps5.c's
 /// `HIDAPI_DriverPS5_CheckPendingLEDReset`).
+#[cfg(not(target_os = "ios"))]
 const ANIMATION_OVER: u32 = 10_200_000;
 
 /// The sensor clock of a Bluetooth input report 0x31: its state block starts at byte 2 and
 /// holds the clock at 27..31, little-endian (SDL's `PS5StatePacketCommon_t`, the kernel's
 /// `dualsense_input_report`).
+#[cfg(not(target_os = "ios"))]
 fn bluetooth_clock(report: &[u8]) -> Option<u32> {
     match report {
         [0x31, _, state @ ..] if state.len() >= 31 => {
@@ -239,6 +268,27 @@ fn bluetooth_clock(report: &[u8]) -> Option<u32> {
     }
 }
 
+/// What the writer needs from an open pad. It is a trait so the state machine can be tested
+/// without hardware: hidapi's Windows back end can crash inside `hid_write` once the device is
+/// gone, so every failure has to drop the handle.
+#[cfg(not(target_os = "ios"))]
+trait Handle: Send {
+    fn write(&mut self, out: &Output) -> HidResult<()>;
+    fn read(&self, buf: &mut [u8], millis: i32) -> HidResult<usize>;
+}
+
+#[cfg(not(target_os = "ios"))]
+impl Handle for DualSense {
+    fn write(&mut self, out: &Output) -> HidResult<()> {
+        DualSense::write(self, out)
+    }
+
+    fn read(&self, buf: &mut [u8], millis: i32) -> HidResult<usize> {
+        DualSense::read(self, buf, millis)
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
 impl Writer {
     fn new(open: Arc<AtomicU8>) -> Self {
         Writer {
@@ -283,13 +333,8 @@ impl Writer {
                 }
                 Ok(Message::Scan) => {
                     // A pad that was unplugged while idle fails to read.
-                    let mut buf = [0; 80];
-                    if self
-                        .pad
-                        .as_ref()
-                        .is_some_and(|pad| pad.read(&mut buf, 0).is_err())
-                    {
-                        self.lost("unplugged");
+                    if self.pad.is_some() {
+                        self.probe();
                     }
                     if self.pad.is_none() {
                         self.scans_left = SCAN_TRIES;
@@ -304,14 +349,16 @@ impl Writer {
             self.advance_rumble();
             self.flush();
         }
-        if let Some(pad) = self.pad.as_mut() {
+        if self.pad.is_some() && self.probe() {
             // The lights go back to a host's defaults, if they were changed.
             let release = Output {
                 lightbar: self.state.lightbar.map(|_| DEFAULT_LIGHTBAR),
                 player_leds: self.state.player_leds.map(|_| PLAYER_1),
                 ..Output::release()
             };
-            let _ = pad.write(&release);
+            if let Some(pad) = self.pad.as_mut() {
+                let _ = pad.write(&release);
+            }
         }
     }
 
@@ -340,7 +387,7 @@ impl Writer {
                         Lights::Waiting(Instant::now() + Duration::from_secs(1))
                     }
                 };
-                self.pad = Some(pad);
+                self.pad = Some(Box::new(pad));
                 self.sent = None;
                 self.scans_left = 0;
                 self.flush();
@@ -361,10 +408,20 @@ impl Writer {
         };
         let mut buf = [0; 80];
         let mut clock = None;
-        while let Ok(n) = pad.read(&mut buf, 0)
-            && n > 0
-        {
-            clock = bluetooth_clock(&buf[..n]).or(clock);
+        let mut failed = None;
+        loop {
+            match pad.read(&mut buf, 0) {
+                Ok(0) => break,
+                Ok(n) => clock = bluetooth_clock(&buf[..n]).or(clock),
+                Err(e) => {
+                    failed = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(why) = failed {
+            self.lost(&why);
+            return;
         }
         let over = match clock {
             Some(clock) => clock >= ANIMATION_OVER,
@@ -391,9 +448,9 @@ impl Writer {
 
     /// Send what changed; a failed write means the pad is gone.
     fn flush(&mut self) {
-        let Some(pad) = self.pad.as_mut() else {
+        if self.pad.is_none() {
             return;
-        };
+        }
         let motors = self.rumble.last().map_or([0, 0], |(m, _)| *m);
         let mut state = self.state;
         if matches!(self.lights, Lights::Waiting(_)) {
@@ -418,10 +475,8 @@ impl Writer {
             self.lights = Lights::Reset;
         }
         // The reset goes alone, before any colour (hid-playstation.c).
-        if first.full_power || first.release_leds {
-            if let Err(e) = pad.write(&first) {
-                return self.lost(&e.to_string());
-            }
+        if (first.full_power || first.release_leds) && !self.write(&first) {
+            return;
         }
         let mut out = Output {
             rumble: motors,
@@ -438,22 +493,156 @@ impl Writer {
         if old.is_none_or(|s| s.player_leds != state.player_leds) {
             out.player_leds = state.player_leds;
         }
-        match pad.write(&out) {
-            Ok(()) => self.sent = Some((state, motors)),
-            Err(e) => self.lost(&e.to_string()),
+        if self.write(&out) {
+            self.sent = Some((state, motors));
         }
     }
 
+    /// Whether the pad still answers. hidapi's Windows back end can crash inside `hid_write`
+    /// once the device has gone (Bluetooth sleep, unplug), so a write reads first; a failed
+    /// read drops the handle and the thread looks for the pad again.
+    fn probe(&mut self) -> bool {
+        let Some(pad) = self.pad.as_ref() else {
+            return false;
+        };
+        let mut buf = [0; 80];
+        let failed = match pad.read(&mut buf, 0) {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        };
+        match failed {
+            Some(why) => {
+                self.lost(&why);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Write a report, dropping the pad on any hidapi error: a handle that failed is never
+    /// written through again.
+    fn write(&mut self, out: &Output) -> bool {
+        if !self.probe() {
+            return false;
+        }
+        let result = match self.pad.as_mut() {
+            Some(pad) => pad.write(out),
+            None => return false,
+        };
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                self.lost(&e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Drop a handle that hidapi failed on, and look for the pad again: one that slept or was
+    /// unplugged may come back. Nothing is written through the old handle.
     fn lost(&mut self, why: &str) {
         log::info!("DualSense output closed: {why}");
         self.pad = None;
+        self.sent = None;
+        self.lights = Lights::Ready;
         self.open.store(0, Ordering::Relaxed);
+        self.scans_left = SCAN_TRIES;
+        self.next_scan = Instant::now();
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "ios")))]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A pad whose reads and writes can fail, so the writer's state machine runs without
+    /// hardware (the crash itself is inside hidapi's C on Windows).
+    struct FakePad {
+        writes: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        read_fails: bool,
+        write_fails: bool,
+    }
+
+    impl Handle for FakePad {
+        fn write(&mut self, _out: &Output) -> HidResult<()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            if self.write_fails {
+                Err(hidapi::HidError::HidApiError {
+                    message: "gone".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+
+        fn read(&self, _buf: &mut [u8], _millis: i32) -> HidResult<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.read_fails {
+                Err(hidapi::HidError::HidApiError {
+                    message: "gone".into(),
+                })
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
+    fn writer(
+        open: &Arc<AtomicU8>,
+        read_fails: bool,
+        write_fails: bool,
+    ) -> (Writer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut writer = Writer::new(open.clone());
+        writer.pad = Some(Box::new(FakePad {
+            writes: writes.clone(),
+            reads: reads.clone(),
+            read_fails,
+            write_fails,
+        }));
+        (writer, writes, reads)
+    }
+
+    #[test]
+    fn a_failed_read_drops_the_pad_without_writing() {
+        let open = Arc::new(AtomicU8::new(1));
+        let (mut writer, writes, reads) = writer(&open, true, false);
+        writer.flush();
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(writes.load(Ordering::Relaxed), 0);
+        assert!(writer.pad.is_none());
+        assert_eq!(open.load(Ordering::Relaxed), 0);
+        assert_eq!(writer.scans_left, SCAN_TRIES);
+    }
+
+    #[test]
+    fn a_failed_write_drops_the_pad_and_schedules_a_rescan() {
+        let open = Arc::new(AtomicU8::new(1));
+        let (mut writer, writes, _) = writer(&open, false, true);
+        writer.flush();
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
+        assert!(writer.pad.is_none());
+        assert_eq!(open.load(Ordering::Relaxed), 0);
+        assert!(writer.sent.is_none());
+        assert_eq!(writer.scans_left, SCAN_TRIES);
+        // The handle that failed is not written through again.
+        writer.flush();
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_live_pad_stays_open() {
+        let open = Arc::new(AtomicU8::new(1));
+        let (mut writer, writes, _) = writer(&open, false, false);
+        writer.flush();
+        assert_eq!(writes.load(Ordering::Relaxed), 2);
+        assert!(writer.pad.is_some());
+        assert!(writer.sent.is_some());
+        assert_eq!(open.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn bluetooth_clock_offset() {

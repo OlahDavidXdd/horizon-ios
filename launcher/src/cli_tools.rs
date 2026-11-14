@@ -7,15 +7,24 @@ use clap::{ArgAction, Command};
 use serde_json::{json, Map, Value};
 
 /// CLI commands that are not generated tools: the MCP server itself; No AI, the player's switch
-/// and never an agent's; and the ones mcp.rs runs in the session.
+/// and never an agent's; trusting native mods' code, the player's decision too; the ones
+/// mcp.rs runs in the session; and the game's session handoff, a file holding a token.
 const NOT_TOOLS: &[&str] = &[
     "mcp",
+    "completions",
     "agent-config",
     "no-ai",
+    "native-build",
+    // It installs a program nothing signed: the player's decision.
+    "import-build",
+    // They install native code nobody reviewed, and say it first: the player's decision.
+    "mods add-github",
+    "mods update-github",
     "play",
     "server",
     "account sign-in",
     "account list",
+    "account session",
 ];
 
 /// Commands that delete the player's things: their tools need `confirm: true`.
@@ -26,6 +35,14 @@ pub const DESTRUCTIVE: &[&str] = &[
     "servers forget",
     "account sign-out",
     "data delete",
+    "worlds delete",
+    "multiplayer remove",
+    "screenshots delete",
+    "packs remove",
+    "worlds datapack-remove",
+    "unshare-log",
+    // It sets shell commands the next Play runs: the player says yes first.
+    "instance launch",
 ];
 
 /// Commands that send something or reach other people: only when the player asks.
@@ -35,6 +52,7 @@ pub const OPEN_WORLD: &[&str] = &[
     "data bug",
     "data benchmark",
     "servers create",
+    "share-log",
 ];
 
 /// A generated tool: its name, the CLI words it runs and the clap command behind them.
@@ -243,6 +261,7 @@ fn session_tool(words: &str) -> &'static str {
         "account list" => "`account_list`",
         "mcp" => "none: this command is the MCP server",
         "agent-config" => "none: it prints how to connect a client to `mcp`",
+        "account session" => "none: the game's own session handoff",
         _ => "none: the player's switch",
     }
 }
@@ -381,7 +400,14 @@ mod tests {
         ] {
             assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
         }
-        for not in ["mcp", "no_ai", "play", "server", "account_sign_in"] {
+        for not in [
+            "mcp",
+            "no_ai",
+            "play",
+            "server",
+            "account_sign_in",
+            "account_session",
+        ] {
             assert!(!names.iter().any(|n| n == not), "{not}");
         }
     }
@@ -394,7 +420,7 @@ mod tests {
         let kinds = &schema["inputSchema"]["properties"]["kind"]["enum"];
         assert!(
             kinds.as_array().unwrap().contains(&json!("modpack"))
-                && !kinds.as_array().unwrap().contains(&json!("shader")),
+                && kinds.as_array().unwrap().contains(&json!("shader")),
             "{kinds}"
         );
         assert_eq!(

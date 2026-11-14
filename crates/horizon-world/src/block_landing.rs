@@ -137,6 +137,15 @@ pub trait BlockLandingWorld: BlockPushWorld {
     ) -> Result<(), Self::Error>;
     fn level_event(&mut self, event: i32, position: BlockPos, data: i32)
     -> Result<(), Self::Error>;
+    /// Whether the farmland at `position` may turn to dirt under the entity that fell
+    /// `distance` onto it (NeoForge's `FarmlandTrampleEvent`), once vanilla's checks let it.
+    fn trample_allowed(
+        &mut self,
+        _position: BlockPos,
+        _distance: f64,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
 }
 #[derive(Debug)]
 pub enum LandingError<E> {
@@ -266,6 +275,66 @@ impl BlockLandingRegistry {
         }
         Ok(())
     }
+    /// `TurtleEggBlock.stepOn`: a step that is not careful breaks an egg one
+    /// time in 100.
+    pub fn step_on<W: BlockLandingWorld>(
+        &self,
+        world: &mut W,
+        state: BlockStateId,
+        position: BlockPos,
+        entity: LandingEntityKind,
+    ) -> Result<(), LandingError<W::Error>> {
+        if let Rule::TurtleEgg { remaining } = self.state(state)?.rule {
+            self.destroy_egg(world, remaining, state, position, entity, 100)?;
+        }
+        Ok(())
+    }
+    /// `TurtleEggBlock.destroyEgg`: one egg breaks with chance 1 in `randomness`.
+    fn destroy_egg<W: BlockLandingWorld>(
+        &self,
+        world: &mut W,
+        remaining: Option<BlockStateId>,
+        state: BlockStateId,
+        position: BlockPos,
+        entity: LandingEntityKind,
+        randomness: i32,
+    ) -> Result<(), LandingError<W::Error>> {
+        if !world.is_server_level()
+            || matches!(entity, LandingEntityKind::Turtle | LandingEntityKind::Bat)
+        {
+            return Ok(());
+        }
+        let allowed = if entity == LandingEntityKind::Player {
+            !world
+                .under_spawn_protection(position)
+                .map_err(LandingError::World)?
+        } else {
+            entity.living() && world.mob_griefing().map_err(LandingError::World)?
+        };
+        if allowed && world.random_int(randomness).map_err(LandingError::World)? == 0 {
+            let sound = world.known_sound(LandingSound::TurtleEggBreak);
+            let pitch = 0.9f32 + world.random_float().map_err(LandingError::World)? * 0.2f32;
+            world
+                .block_sound(position, sound, 0.7, pitch)
+                .map_err(LandingError::World)?;
+            if let Some(next) = remaining {
+                world
+                    .set_block(position, next, 2)
+                    .map_err(LandingError::World)?;
+                world
+                    .block_event(LandingEvent::BlockDestroy, position, state, false)
+                    .map_err(LandingError::World)?;
+                world
+                    .level_event(2001, position, state.0 as i32)
+                    .map_err(LandingError::World)?;
+            } else {
+                world
+                    .destroy_block(position, false)
+                    .map_err(LandingError::World)?;
+            }
+        }
+        Ok(())
+    }
     pub fn fall_on<W: BlockLandingWorld>(
         &self,
         world: &mut W,
@@ -359,7 +428,11 @@ impl BlockLandingRegistry {
                     };
                     if allowed {
                         let (width, height) = world.entity_dimensions();
-                        if width * width * height > 0.512f32 {
+                        if width * width * height > 0.512f32
+                            && world
+                                .trample_allowed(position, distance)
+                                .map_err(LandingError::World)?
+                        {
                             let next = push_entities_up(world, state, base, position)
                                 .map_err(LandingError::Push)?;
                             world
@@ -373,41 +446,8 @@ impl BlockLandingRegistry {
                 }
             }
             Rule::TurtleEgg { remaining } => {
-                if !matches!(
-                    entity,
-                    LandingEntityKind::Zombie | LandingEntityKind::Turtle | LandingEntityKind::Bat
-                ) && world.is_server_level()
-                {
-                    let allowed = if entity == LandingEntityKind::Player {
-                        !world
-                            .under_spawn_protection(position)
-                            .map_err(LandingError::World)?
-                    } else {
-                        entity.living() && world.mob_griefing().map_err(LandingError::World)?
-                    };
-                    if allowed && world.random_int(3).map_err(LandingError::World)? == 0 {
-                        let sound = world.known_sound(LandingSound::TurtleEggBreak);
-                        let pitch =
-                            0.9f32 + world.random_float().map_err(LandingError::World)? * 0.2f32;
-                        world
-                            .block_sound(position, sound, 0.7, pitch)
-                            .map_err(LandingError::World)?;
-                        if let Some(next) = remaining {
-                            world
-                                .set_block(position, next, 2)
-                                .map_err(LandingError::World)?;
-                            world
-                                .block_event(LandingEvent::BlockDestroy, position, state, false)
-                                .map_err(LandingError::World)?;
-                            world
-                                .level_event(2001, position, state.0 as i32)
-                                .map_err(LandingError::World)?;
-                        } else {
-                            world
-                                .destroy_block(position, false)
-                                .map_err(LandingError::World)?;
-                        }
-                    }
+                if entity != LandingEntityKind::Zombie {
+                    self.destroy_egg(world, remaining, state, position, entity, 3)?;
                 }
             }
         }

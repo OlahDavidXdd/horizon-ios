@@ -1,9 +1,11 @@
-//! The extras' HUD overlays (FPS counter, keystrokes): small boxes in the
-//! vanilla font, in GUI pixels, stacked per corner (`docs/extras.md`).
+//! HUD boxes in the corners: the minimap's place and mods' panels, small
+//! boxes in GUI pixels stacked per corner (`docs/extras.md`), and the layers crates above the
+//! engine register (`horizon_hooks::hud`).
 use crate::{
-    extras::{Corner, FpsReading},
+    extras::Corner,
     hud::{HudAtlas, HudBatch, Rect, rgba},
 };
+use horizon_hooks::hud;
 
 /// The gap between an overlay and the screen edge or the next overlay.
 const MARGIN: f32 = 2.0;
@@ -99,36 +101,6 @@ pub fn draw_minimap(
     }
 }
 
-/// The FPS counter's text.
-pub fn fps_text(r: FpsReading, lows: bool) -> String {
-    if lows {
-        format!("{} fps  min {}  1% {}", r.fps, r.min, r.low)
-    } else {
-        format!("{} fps", r.fps)
-    }
-}
-pub fn draw_fps(
-    batch: &mut HudBatch,
-    atlas: &HudAtlas,
-    corners: &mut Corners,
-    corner: Corner,
-    reading: FpsReading,
-    lows: bool,
-) {
-    let text = fps_text(reading, lows);
-    let w = HudBatch::text_width(atlas, &text) + 4.0;
-    let (x, y) = corners.place(corner, w, 12.0);
-    batch.fill(atlas, x, y, w, 12.0, BACKGROUND);
-    batch.text(
-        atlas,
-        &text,
-        x + 2.0,
-        y + 2.0,
-        rgba(255, 255, 255, 255),
-        true,
-    );
-}
-
 /// A box of text lines (a mod's HUD panel): `(text, 0xRRGGBB)` each.
 pub fn draw_lines(
     batch: &mut HudBatch,
@@ -155,93 +127,66 @@ pub fn draw_lines(
     }
 }
 
-/// What the keystroke overlay shows.
-pub struct Keystrokes {
-    /// Forward, left, back, right: held, and the bound key's name.
-    pub moves: [(bool, String); 4],
-    pub jump: bool,
-    pub attack: bool,
-    pub use_: bool,
-    /// Clicks per second of the left and right buttons, when shown.
-    pub cps: Option<(usize, usize)>,
-}
-const KEY: f32 = 22.0;
-const GAP: f32 = 2.0;
-/// The overlay's size.
-pub fn keystrokes_size() -> (f32, f32) {
-    (3.0 * KEY + 2.0 * GAP, 3.0 * KEY + 3.0 * GAP + 10.0)
-}
-fn key_box(batch: &mut HudBatch, atlas: &HudAtlas, rect: [f32; 4], held: bool, lines: &[&str]) {
-    let [x, y, w, h] = rect;
-    let (fill, ink) = if held {
-        (rgba(255, 255, 255, 176), rgba(20, 20, 20, 255))
-    } else {
-        (BACKGROUND, rgba(255, 255, 255, 255))
-    };
-    batch.fill(atlas, x, y, w, h, fill);
-    let total = lines.len() as f32 * 9.0 - 1.0;
-    for (i, line) in lines.iter().enumerate() {
-        let tw = HudBatch::text_width(atlas, line);
-        let tx = (x + (w - tw) / 2.0).round();
-        let ty = (y + (h - total) / 2.0).round() + i as f32 * 9.0;
-        batch.text(atlas, line, tx, ty, ink, !held);
-    }
-}
-pub fn draw_keystrokes(
+/// Draws the HUD layers crates registered, after the extras' and mods' boxes, which they stack
+/// with. `shown`: whether each corner of `Corner::ALL` shows (the debug screen covers some).
+pub fn draw_layers(
+    layers: &[&dyn hud::Layer],
     batch: &mut HudBatch,
     atlas: &HudAtlas,
     corners: &mut Corners,
-    corner: Corner,
-    k: &Keystrokes,
+    shown: [bool; 4],
 ) {
-    let (w, h) = keystrokes_size();
-    let (x, y) = corners.place(corner, w, h);
-    let step = KEY + GAP;
-    let [forward, left, back, right] = &k.moves;
-    key_box(
+    let mut canvas = Canvas {
         batch,
         atlas,
-        [x + step, y, KEY, KEY],
-        forward.0,
-        &[&forward.1],
-    );
-    for (i, key) in [left, back, right].into_iter().enumerate() {
-        key_box(
-            batch,
-            atlas,
-            [x + i as f32 * step, y + step, KEY, KEY],
-            key.0,
-            &[&key.1],
-        );
-    }
-    let mw = (w - GAP) / 2.0;
-    let my = y + 2.0 * step;
-    for (i, (held, label, cps)) in [
-        (k.attack, "LMB", k.cps.map(|c| c.0)),
-        (k.use_, "RMB", k.cps.map(|c| c.1)),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let rate = cps.map(|n| format!("{n} CPS"));
-        let lines: Vec<&str> = std::iter::once(label).chain(rate.as_deref()).collect();
-        key_box(
-            batch,
-            atlas,
-            [x + i as f32 * (mw + GAP), my, mw, KEY],
-            held,
-            &lines,
-        );
-    }
-    // The space bar: a line in a short key.
-    let sy = my + step;
-    key_box(batch, atlas, [x, sy, w, 10.0], k.jump, &[]);
-    let ink = if k.jump {
-        rgba(20, 20, 20, 255)
-    } else {
-        rgba(255, 255, 255, 255)
+        corners,
+        shown,
     };
-    batch.fill(atlas, x + w / 2.0 - 12.0, sy + 4.0, 24.0, 2.0, ink);
+    for layer in layers {
+        layer.draw(&mut canvas);
+    }
+}
+
+struct Canvas<'a> {
+    batch: &'a mut HudBatch,
+    atlas: &'a HudAtlas,
+    corners: &'a mut Corners,
+    shown: [bool; 4],
+}
+
+/// `0xAARRGGBB` as the batch's colour.
+fn argb_color(argb: u32) -> u32 {
+    let [a, r, g, b] = argb.to_be_bytes();
+    rgba(r, g, b, a)
+}
+
+impl hud::Canvas for Canvas<'_> {
+    fn size(&self) -> (f32, f32) {
+        (self.batch.width, self.batch.height)
+    }
+    fn tr(&self, key: &str) -> String {
+        crate::lang::get(key)
+    }
+    fn text_width(&self, text: &str) -> f32 {
+        HudBatch::text_width(self.atlas, text)
+    }
+    fn text(&mut self, x: f32, y: f32, text: &str, argb: u32, shadow: bool) {
+        self.batch
+            .text(self.atlas, text, x, y, argb_color(argb), shadow);
+    }
+    fn fill(&mut self, x: f32, y: f32, w: f32, h: f32, argb: u32) {
+        self.batch.fill(self.atlas, x, y, w, h, argb_color(argb));
+    }
+    fn place(&mut self, corner: hud::Corner, w: f32, h: f32) -> Option<(f32, f32)> {
+        let corner = match corner {
+            hud::Corner::TopLeft => Corner::TopLeft,
+            hud::Corner::TopRight => Corner::TopRight,
+            hud::Corner::BottomLeft => Corner::BottomLeft,
+            hud::Corner::BottomRight => Corner::BottomRight,
+        };
+        let i = Corner::ALL.iter().position(|c| *c == corner)?;
+        self.shown[i].then(|| self.corners.place(corner, w, h))
+    }
 }
 
 #[cfg(test)]
@@ -260,14 +205,62 @@ mod tests {
         assert_eq!(c.place(Corner::BottomLeft, 10.0, 10.0), (2.0, 288.0));
     }
 
+    /// Draws a box of one line in a corner and keeps where it went.
+    struct Panel {
+        corner: hud::Corner,
+        at: std::sync::Mutex<Vec<Option<(f32, f32)>>>,
+    }
+
+    impl hud::Layer for Panel {
+        fn draw(&self, canvas: &mut dyn hud::Canvas) {
+            let w = canvas.text_width("12 CPS") + 4.0;
+            let at = canvas.place(self.corner, w, 12.0);
+            if let Some((x, y)) = at {
+                canvas.fill(x, y, w, 12.0, 0x7800_0000);
+                canvas.text(x + 2.0, y + 2.0, "12 CPS", 0xFFFF_FFFF, true);
+            }
+            self.at.lock().unwrap().push(at);
+        }
+    }
+
     #[test]
-    fn fps_text_with_and_without_lows() {
-        let r = FpsReading {
-            fps: 144,
-            min: 61,
-            low: 98,
+    fn layers_stack_with_the_extras_and_skip_hidden_corners() {
+        let atlas =
+            HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets")).unwrap();
+        let mut batch = HudBatch::new([800, 600]);
+        let (width, height) = (batch.width, batch.height);
+        let mut corners = Corners::new(width, height, 0.0);
+        // The minimap already took the top right.
+        corners.place(Corner::TopRight, 64.0, 64.0);
+        let right = Panel {
+            corner: hud::Corner::TopRight,
+            at: Default::default(),
         };
-        assert_eq!(fps_text(r, false), "144 fps");
-        assert_eq!(fps_text(r, true), "144 fps  min 61  1% 98");
+        let left = Panel {
+            corner: hud::Corner::TopLeft,
+            at: Default::default(),
+        };
+        let layers: [&dyn hud::Layer; 2] = [&right, &left];
+        let empty = batch.vertices.len();
+        draw_layers(
+            &layers,
+            &mut batch,
+            &atlas,
+            &mut corners,
+            [false, true, true, true],
+        );
+        let (_, y) = right.at.lock().unwrap()[0].expect("the top right shows");
+        assert_eq!(y, 2.0 + 64.0 + 2.0, "under the minimap");
+        assert_eq!(
+            *left.at.lock().unwrap(),
+            [None],
+            "the debug screen covers the top left"
+        );
+        assert!(batch.vertices.len() > empty, "the shown box is drawn");
     }
 }
+
+#[cfg(target_os = "ios")]
+mod native_ios;
+#[cfg(target_os = "ios")]
+pub use native_ios::{Keystrokes, draw_fps, draw_keystrokes, fps_text, keystrokes_size};

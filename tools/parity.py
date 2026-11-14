@@ -11,6 +11,9 @@
     python3 tools/parity.py --list          # what would run, without running it
     python3 tools/parity.py --status        # last result of every harness
 
+Harnesses in parity_hosts.json's "named_only" run only when named or with --all
+(the nightly audit): no automatic selection picks them.
+
 Each harness runs unmodified, in parallel, under a tracer that records what it
 read: its Python modules, Java oracle sources, other repository files, and the
 Rust sources of every probe it executed (from Cargo's dep-info). A harness
@@ -23,6 +26,11 @@ change costs only the Rust side. A harness that fails while reusing oracle
 results is rerun fresh, and stops reusing them if it then passes. --all and
 --fresh never reuse them.
 
+A harness listed in parity_hosts.json's "known_flaky" (each with its reason)
+that fails runs once more from scratch instead, and a pass then counts. Every
+retry is printed as a RETRIED line in the summary and in the CI job's summary.
+Fix the cause, then take the harness off the list: nothing else gets this retry.
+
 Harness probes build into .local/parity-target with release optimisations but
 without LTO and with 16 codegen units (`PROFILE` below), which builds in
 seconds instead of minutes. Rust does not let those settings change results:
@@ -30,7 +38,9 @@ there is no fast-math, and overflow checks stay as in release. Probes built in
 the dev profile are optimised too, keeping their overflow checks. The probes the
 selected harnesses built last time are built before they start, so parallel
 harnesses don't queue on Cargo's lock, with each harness's own package and
-feature flags so that its Cargo run then finds them fresh.
+feature flags so that its Cargo run then finds them fresh. On Windows, two
+harnesses that build one program with different flags don't run at once:
+the second build would replace the program the first is running.
 """
 
 import argparse
@@ -40,10 +50,20 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import time
+
+try:
+    from . import parity_reach
+    from . import file_lock
+    from . import process_tree
+except ImportError:
+    import parity_reach
+    import file_lock
+    import process_tree
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / ".local"
@@ -197,7 +217,7 @@ def inside(path, root):
 
 def dep_info(binary):
     """Source files Cargo recorded for a built binary (its .d file, spaces escaped as "\\ ")."""
-    info = Path(str(binary) + ".d")
+    info = Path(str(binary).removesuffix(".exe") + ".d")  # client_probe.exe's is client_probe.d
     if not info.exists():
         return []
     sources = []
@@ -550,7 +570,7 @@ def dependencies(trace, scope=None):
         path = Path(path) if os.path.isabs(path) else ROOT / path
         if inside(path, ROOT) and not inside(path, LOCAL) and not inside(path, ROOT / "target") and path.is_file() \
                 and "__pycache__" not in path.parts:  # bytecode caches vary; their sources are dependencies already
-            kept.add(str(path.resolve().relative_to(ROOT)))
+            kept.add(path.resolve().relative_to(ROOT).as_posix())
     unique = []
     for artifact in artifacts:
         if artifact not in unique:
@@ -580,8 +600,9 @@ def java_sources(arguments):
 def run_environment(reuse_oracles=False):
     environment = dict(os.environ, CARGO_TARGET_DIR=str(TARGET), PYTHONDONTWRITEBYTECODE="1", HORIZON_NO_AUDIO="1", **PROFILE)
     environment.pop("CARGO_BUILD_JOBS", None)
-    if reuse_oracles:
-        # tools/parity_shim.py stands in for java and javac and replays unchanged oracle runs.
+    # tools/parity_shim.py stands in for java and javac and replays unchanged oracle runs. Not on Windows: a
+    # program started without a shell is found there only as an .exe, and the shim's execv returns before the program.
+    if reuse_oracles and os.name != "nt":
         SHIM.mkdir(parents=True, exist_ok=True)
         for name in ("java", "javac"):
             link = SHIM / name
@@ -614,13 +635,37 @@ def target_packages():
 
 def prebuild_commands(artifacts, packages=None):
     """The Cargo runs that build the recorded probes exactly as their harnesses do: one per profile, package and
-    feature selection, and whether examples are among the command's targets (see artifacts_of).
+    feature selection, and whether examples are among the command's targets (see artifacts_of)."""
+    groups = {}
+    for kind, name, profile, selection, examples in selected_builds(artifacts, packages):
+        targets = groups.setdefault((profile, tuple(selection), examples), [])
+        target = [f"--{kind}", name] if name else [f"--{kind}"]
+        if target not in targets:
+            targets.append(target)
+    return [["cargo", "build", "--locked", "--profile", profile, *selection, *(part for target in targets for part in target)]
+            for (profile, selection, _), targets in sorted(groups.items())]
+
+
+def executables(artifacts, packages):
+    """{(kind, name, profile): (selection, examples)}: the programs recorded Cargo runs build, and how (see
+    LocalExecutor.clashes). A run naming every bin or example (--bins) builds those of the packages it selects."""
+    built = {}
+    for kind, name, profile, selection, examples in selected_builds(artifacts, packages):
+        kind = kind.removesuffix("s")
+        selected = {value for flag, value in zip(selection, selection[1:]) if flag == "-p"}
+        for target in [name] if name else [target for (other, target), package in (packages or {}).items()
+                                           if other == kind and (package in selected or "--workspace" in selection)]:
+            built[(kind, target, profile)] = (tuple(selection), examples)
+    return built
+
+
+def selected_builds(artifacts, packages=None):
+    """Recorded artifacts as [kind, name, profile, selection, examples], each with the selection that builds it now.
 
     packages: target_packages(). Records of targets that no longer exist (a probe renamed or deleted since a harness
     ran it) are left out, since one unknown target fails its whole Cargo run. A [kind, name, profile] record from
     before selections were kept is taken as built with `-p` and its own crate, as nearly every harness does; the
     harness's next run records the real one."""
-    groups = {}
     for artifact in artifacts:
         if packages and artifact[1] and tuple(artifact[:2]) not in packages:
             continue
@@ -630,12 +675,16 @@ def prebuild_commands(artifacts, packages=None):
         if len(artifact) < 5:
             continue
         kind, name, profile, selection, examples = artifact
-        targets = groups.setdefault((profile, tuple(selection), examples), [])
-        target = [f"--{kind}", name] if name else [f"--{kind}"]
-        if target not in targets:
-            targets.append(target)
-    return [["cargo", "build", "--locked", "--profile", profile, *selection, *(part for target in targets for part in target)]
-            for (profile, selection, _), targets in sorted(groups.items())]
+        owner = (packages or {}).get((kind, name))
+        selected = [value for flag, value in zip(selection, selection[1:]) if flag == "-p"]
+        if not name and kind in ("bins", "examples") and "horizon-client" in selected \
+                and "horizon-client-lib" in (packages or {}).values():
+            # Broad records predate the client package split too.
+            owner = "horizon-client-lib"
+        if owner and selected and owner not in selected:
+            # A recorded target may have moved packages; retain its feature flags and old selections.
+            selection = [*selection, "-p", owner]
+        yield kind, name, profile, selection, examples
 
 
 def prebuild(artifacts, jobs):
@@ -652,6 +701,9 @@ def prebuild(artifacts, jobs):
 
 
 LARGE_OUTPUT = 64 << 20
+# Vanilla outputs above this are deleted after a pass too: rerunning those few oracles (12 harnesses on the Mac
+# mini's runner) costs less than the 26 GB they held in every checkout; smaller ones stay for oracle reuse.
+KEPT_ORACLE_OUTPUT = 256 << 20
 OWN_DIRECTORIES = {"parity-target", "parity-runner", "rea", "logs", "gate"}
 
 
@@ -667,11 +719,12 @@ def clear_large_outputs(name, trace):
     """After a pass, delete the large files a harness regenerates on every run.
 
     Harness outputs reach gigabytes and used to stay in every worktree. Vanilla
-    oracle outputs are kept, since reusing an oracle run needs them in place;
-    everything else large under the harness's .local directories is rebuilt on
-    its next run."""
+    oracle outputs under KEPT_ORACLE_OUTPUT are kept, since reusing an oracle
+    run needs them in place; everything else large under the harness's .local
+    directories (`<name>...` or `rust-<name>-parity`) is rebuilt on its next run."""
     local = LOCAL.resolve()
     keep = {os.path.realpath(line) for line in outputs_listing(name).read_text(encoding="utf-8").splitlines() if line}
+    own = name.split("#")[0].replace("_", "-")
     directories = set()
     for command in trace["commands"]:
         for argument in command[1:]:
@@ -683,12 +736,13 @@ def clear_large_outputs(name, trace):
             # Only the harness's own directory: another harness running beside it may be writing
             # large files in a directory this one merely read (decorated_region compiles its oracle
             # into chunk-generation-parity while chunk_generation writes its dumps there).
-            if top not in OWN_DIRECTORIES and top.startswith(name.replace("_", "-")):
+            if top not in OWN_DIRECTORIES and (top.startswith(own) or top == f"rust-{own}-parity"):
                 directories.add(local / top)
     for directory in directories:
         for file in (directory.rglob("*") if directory.is_dir() else []):
             try:
-                if file.is_file() and not file.is_symlink() and file.stat().st_size >= LARGE_OUTPUT and str(file) not in keep:
+                size = file.stat().st_size if file.is_file() and not file.is_symlink() else 0
+                if size >= LARGE_OUTPUT and (str(file) not in keep or size > KEPT_ORACLE_OUTPUT):
                     file.unlink()
             except OSError:
                 pass
@@ -708,16 +762,13 @@ def publish(name, record):
 
 def machine_slot():
     """One of MACHINE_JOBS lock files shared by every runner on this machine, or None if all are taken."""
-    import fcntl
     slots = SHARED / "slots"
     slots.mkdir(parents=True, exist_ok=True)
     for index in range(MACHINE_JOBS):
         handle = open(slots / f"{index}.lock", "w")
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if file_lock.lock(handle, wait=False):
             return handle
-        except OSError:
-            handle.close()
+        handle.close()
     return None
 
 
@@ -764,7 +815,8 @@ def outcome(name, script, passed, elapsed, trace_path, hasher=None):
         trace = None  # killed before writing it, or the disk was full: the pass can't be keyed
     if trace:
         record["dependencies"], record["artifacts"] = dependencies(trace, harness_settings(script).get("PARITY_RUST_SCOPE"))
-        record["peak_bytes"] = trace["peak_bytes"]
+        if "peak_bytes" in trace:
+            record["peak_bytes"] = trace["peak_bytes"]
         if passed:
             clear_large_outputs(name, trace)
         if hasher is not None:
@@ -781,16 +833,31 @@ class LocalExecutor:
         self.name, self.jobs, self.memory_budget, self.timeout = HOST, jobs, memory_budget, timeout
         self.max_peak = max_peak  # set while other machines can take heavier harnesses
         self.running = {}
+        self.solo = set()  # harnesses that run alone here (solo_harnesses)
+        self.builds = {}  # Windows: {harness: executables(...)}, see clashes
         self.dead = False  # this machine never drops out, unlike a remote host
         self.available, self.measured = 0, 0.0
         (STATE_DIR / "logs").mkdir(parents=True, exist_ok=True)
         (STATE_DIR / "traces").mkdir(parents=True, exist_ok=True)
 
     def free(self):
+        if any(harness_of(label) in self.solo for label in self.running):
+            return 0
         return self.jobs - len(self.running)
 
     def accepts(self, name):
-        return True
+        # A solo harness waits until nothing else runs here; the others fill the slots meanwhile, so solo ones
+        # run last, alone.
+        return (name not in self.solo or not self.running) and not self.clashes(name)
+
+    def clashes(self, name):
+        """Whether the harness builds a program a running harness built too, with another package or feature
+        selection. Cargo on Windows names a program in deps/ without the hash that keeps such builds apart elsewhere,
+        so the second build relinks the very file the first harness runs, and Windows refuses ("Access is denied").
+        Builds with the same selection find it fresh and leave it alone."""
+        mine = self.builds.get(name, {})
+        return any(mine.get(program, how) != how for label in self.running
+                   for program, how in self.builds.get(harness_of(label), {}).items())
 
     def fits(self, expected, only_here=True):
         """Admission by recorded peak, within the budget and leaving MEMORY_RESERVE of what is free now.
@@ -823,8 +890,12 @@ class LocalExecutor:
         environment.pop("PARITY_SHARD", None)
         if shard:
             environment["PARITY_SHARD"] = shard
-        process = subprocess.Popen([sys.executable, str(Path(__file__)), "--trace", str(trace), str(script)],
-                                   cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        # stdin from /dev/null: tools/parity_shim.py never reuses an oracle run that reads a pipe, and CI runners
+        # (and --worker's ssh) give the runner one, which kept oracle reuse off on CI. Whatever the harness starts
+        # ends with it (tools/process_tree.py).
+        process = process_tree.popen([sys.executable, str(Path(__file__)), "--trace", str(trace), str(script)],
+                                     cwd=ROOT, env=environment, stdin=subprocess.DEVNULL, stdout=log,
+                                     stderr=subprocess.STDOUT)
         self.running[name] = {"process": process, "started": time.monotonic(), "log": log, "expected": expected,
                               "slot": slot, "script": script}
         return True
@@ -834,11 +905,12 @@ class LocalExecutor:
         finished = []
         for name, item in list(self.running.items()):
             process, elapsed = item["process"], time.monotonic() - item["started"]
-            if process.poll() is None and elapsed < self.timeout:
+            if not process_tree.ended(process) and elapsed < self.timeout:
                 continue
-            if process.poll() is None:
-                os.killpg(process.pid, 9)
+            if process.returncode is None:
+                process_tree.kill(process)
                 process.wait()
+                process_tree.ended(process)
                 print(f"--- {name}: timed out after {self.timeout}s", file=item["log"])
             item["log"].close()
             item["slot"].close()
@@ -848,10 +920,7 @@ class LocalExecutor:
 
     def stop(self):
         for item in self.running.values():
-            try:
-                os.killpg(item["process"].pid, 9)
-            except ProcessLookupError:
-                pass
+            process_tree.kill(item["process"])
 
 
 def host_config():
@@ -887,15 +956,25 @@ class RemoteExecutor:
         ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30", self.config["ssh"]]
         started = time.monotonic()
         shared = f"{self.config['root']}/shared-local"
-        mkdir = subprocess.run([*ssh, f"mkdir -p {shlex.quote(self.mirror)}"], capture_output=True, text=True)
+        try:
+            mkdir = subprocess.run([*ssh, f"mkdir -p {shlex.quote(self.mirror)}"], capture_output=True, text=True)
+        except OSError as error:
+            self._log(f"unreachable, running everything here: {error}")
+            self.dead = True
+            return
         if mkdir.returncode:
             self._log(f"unreachable, running everything here: {mkdir.stderr.strip()[-300:]}")
             self.dead = True
             return
-        sync = subprocess.run(
-            ["rsync", "-a", "--delete", "--filter=:- .gitignore", "--exclude=/.git", "--exclude=/.local", "--exclude=/target",
-             "--exclude=__pycache__", "-e", " ".join(ssh[:-1]), f"--rsync-path={self.config.get('rsync', 'rsync')}",
-             f"{ROOT}/", f"{self.config['ssh']}:{self.mirror}/"], capture_output=True, text=True)
+        try:
+            sync = subprocess.run(
+                ["rsync", "-a", "--delete", "--filter=:- .gitignore", "--exclude=/.git", "--exclude=/.local", "--exclude=/target",
+                 "--exclude=__pycache__", "-e", " ".join(ssh[:-1]), f"--rsync-path={self.config.get('rsync', 'rsync')}",
+                 f"{ROOT}/", f"{self.config['ssh']}:{self.mirror}/"], capture_output=True, text=True)
+        except OSError as error:
+            self._log(f"sync failed, running everything here: {error}")
+            self.dead = True
+            return
         if sync.returncode:
             self._log(f"sync failed, running everything here: {sync.stderr.strip()[-300:]}")
             self.dead = True
@@ -904,8 +983,13 @@ class RemoteExecutor:
         command = (f"{self.config.get('setup', 'true')} && cd {shlex.quote(self.mirror)} && "
                    f"exec nice -n {int(self.config.get('nice', 0))} env PARITY_MACHINE_JOBS={self.config.get('jobs', 8)} "
                    f"{environment} {self.config.get('python', 'python3')} tools/parity.py --worker {shlex.quote(shared)}")
-        self.process = subprocess.Popen([*ssh, f"{self.config.get('shell', 'sh -c')} {shlex.quote(command)}"],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        try:
+            self.process = subprocess.Popen([*ssh, f"{self.config.get('shell', 'sh -c')} {shlex.quote(command)}"],
+                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        except OSError as error:
+            self._log(f"worker failed to start, running everything here: {error}")
+            self.dead = True
+            return
         self._send({"prebuild": artifacts, "timeout": self.timeout})
         self._log(f"synced in {time.monotonic() - started:.0f}s, building probes...")
         for line in self.process.stdout:
@@ -998,11 +1082,26 @@ def harness_of(label):
     return label.split("~")[0]
 
 
-def run(selected, state, hasher, environment_digest, executors, reuse_oracles, rounds=None):
+def keep_first_log(label):
+    """Move a harness's log aside before its retry writes a new one; returns where it went."""
+    log = STATE_DIR / "logs" / f"{label}.log"
+    kept = log.with_name(f"{label}.first-run.log")
+    try:
+        log.replace(kept)
+    except OSError:
+        return log  # a remote host's run: its log stays on that machine
+    return kept
+
+
+def run(selected, state, hasher, environment_digest, executors, reuse_oracles, rounds=None, known_flaky=None):
     """Run the selected harnesses on the executors. rounds: how many times each must run (default once); its runs
-    must agree, and a harness that both passes and fails is reported as flaky and recorded as failing."""
+    must agree, and a harness that both passes and fails is reported as flaky and recorded as failing.
+    known_flaky ({name: reason}, tools/parity_hosts.json): a harness listed there that fails its single round runs
+    once more, from scratch; its record keeps `retried` (the first run's log is kept beside its own)."""
     records = state["harnesses"]
     rounds = rounds or {}
+    known_flaky = known_flaky or {}
+    second_chance = set()  # known flaky harnesses that already failed once in this run
     # Longest first, so the slow harnesses don't start last; a harness's later rounds after its first.
     queue = sorted((name if index == 1 else f"{name}~{index}" for name in selected for index in range(1, rounds.get(name, 1) + 1)),
                    key=lambda label: (-records.get(harness_of(label), {}).get("seconds", 1e9), label))
@@ -1025,7 +1124,9 @@ def run(selected, state, hasher, environment_digest, executors, reuse_oracles, r
                 if pick is None:
                     break
                 name = harness_of(pick)
-                reuse = reuse_oracles and records.get(name, {}).get("oracle_reuse", True) and pick not in retried
+                # A retry runs the oracle again too: it may be the side that failed (mob_ai's heap).
+                reuse = reuse_oracles and records.get(name, {}).get("oracle_reuse", True) and pick not in retried \
+                    and name not in second_chance
                 if not executor.start(pick, selected[name], reuse, records.get(name, {}).get("peak_bytes", DEFAULT_MEMORY),
                                       SHARDS.get(name)):
                     break
@@ -1050,9 +1151,12 @@ def run(selected, state, hasher, environment_digest, executors, reuse_oracles, r
                 queue.insert(0, label)
                 continue
             passed = record["status"] == "pass"
-            if not passed and reused and label == name and records.get(name, {}).get("status") != "fail":
+            flaky_retry = rounds.get(name, 1) == 1 and base_name(name) in known_flaky
+            if not passed and reused and label == name and records.get(name, {}).get("status") != "fail" \
+                    and not flaky_retry:
                 # A new failure might come from a reused oracle result: run it again from scratch. Later rounds reuse
-                # what the first just validated, so their failures count (a flaky harness).
+                # what the first just validated, so their failures count (a flaky harness). A known flaky harness
+                # gets its own retry below instead, which keeps reusing oracle results afterwards.
                 retried.add(label)
                 queue.insert(0, label)
                 print(f"retry {label} without reused oracle results", flush=True)
@@ -1070,8 +1174,19 @@ def run(selected, state, hasher, environment_digest, executors, reuse_oracles, r
             if len(done[name]) < rounds.get(name, 1):
                 continue
             runs = done.pop(name)
+            if runs[0]["status"] != "pass" and flaky_retry and name not in second_chance:
+                second_chance.add(name)
+                first_log = keep_first_log(label)
+                print(f"RETRIED {name}: failed, and it is a known flaky harness ({known_flaky[base_name(name)]}): "
+                      f"running it once more (first run's log: {first_log})", flush=True)
+                queue.insert(0, label)
+                continue
             record = dict(runs[0], status="pass" if all(run["status"] == "pass" for run in runs) else "fail",
                           rounds=len(runs))
+            if name in second_chance:
+                record["retried"] = "known flaky"
+            elif label in retried:
+                record["retried"] = "reused oracle results"
             if len({run["status"] for run in runs}) > 1:
                 record["flaky"] = [run["status"] for run in runs]
                 print(f"FLAKY {name}: {', '.join(record['flaky'])} in {len(runs)} runs", flush=True)
@@ -1080,6 +1195,16 @@ def run(selected, state, hasher, environment_digest, executors, reuse_oracles, r
             save_state(state)
             publish(name, record)
     return results, time.monotonic() - started_all
+
+
+def exit_on_termination():
+    """SIGTERM and SIGHUP (a cancelled CI job, a dropped ssh) end this process through its finally blocks, which stop
+    the running harnesses. Each runs in its own session, so without that they, and the vanilla servers they started,
+    outlive it (orphans of days were found on the Mac mini's runners, 2026-10-26). Windows has no SIGHUP; there each
+    harness's job ends with this process however it ends (tools/process_tree.py)."""
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), lambda received, _frame: sys.exit(128 + received))
 
 
 def worker_main(shared_local):
@@ -1114,16 +1239,24 @@ def worker_main(shared_local):
         return 0
     state = load_state()
     hasher = Hasher(state["hashes"])
+    process_tree.start_build_server()  # before any build here: the probe build's would start it otherwise
     built, errors = prebuild(first["prebuild"], default_build_jobs()) if first["prebuild"] else (True, "")
     executor = LocalExecutor(MACHINE_JOBS, int(memory_available() * 0.75), first["timeout"])
     send({"hello": {"jobs": MACHINE_JOBS, "memory": executor.memory_budget, "built": built, "errors": errors[-4000:]}})
+    try:
+        return serve(executor, inbox, queues.Empty, send, state, hasher)
+    finally:
+        executor.stop()
+
+
+def serve(executor, inbox, empty, send, state, hasher):
+    """The worker's loop: start what the coordinating runner sends, report what finished, until its stdin ends."""
     while True:
         try:
             message = inbox.get(timeout=0.2)
-        except queues.Empty:
+        except empty:
             message = False
         if message is None:
-            executor.stop()
             save_state(state)
             return 0
         if message:
@@ -1157,11 +1290,31 @@ def stale(name, state, hasher, environment):
     return True
 
 
+def command_line_arguments(line):
+    """A Windows command line split as programs split it (CommandLineToArgvW): list2cmdline's inverse."""
+    import ctypes
+    from ctypes import wintypes
+    shell32 = ctypes.WinDLL("shell32")
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    count = ctypes.c_int()
+    argv = shell32.CommandLineToArgvW(line, ctypes.byref(count))
+    if not argv:
+        return [line]
+    try:
+        return [argv[index] for index in range(count.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
+
+
 def trace_main(output, script, arguments):
     """Run one harness and record what it read and executed."""
     import atexit
-    import resource
     import runpy
+    try:
+        import resource
+    except ImportError:  # Windows: no peak to report, the scheduler assumes DEFAULT_MEMORY
+        resource = None
     read, commands = set(), []
 
     def audit(event, details):
@@ -1171,19 +1324,24 @@ def trace_main(output, script, arguments):
                 read.add(os.fsdecode(path))
         elif event == "subprocess.Popen":
             arguments_ = details[1]
+            if os.name == "nt" and isinstance(arguments_, str):
+                # Windows audits the command line Popen built from the list (list2cmdline), not the list.
+                arguments_ = command_line_arguments(arguments_)
             arguments_ = [arguments_] if isinstance(arguments_, (str, bytes, os.PathLike)) else list(arguments_ or [])
             commands.append([os.fsdecode(a) if isinstance(a, (bytes, os.PathLike)) else str(a) for a in arguments_])
 
     def write():
         modules = [getattr(module, "__file__", None) for module in list(sys.modules.values())]
-        peak = max(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
-        peak //= 1024 if sys.platform == "darwin" else 1  # bytes on macOS, KiB elsewhere
-        Path(output).write_text(json.dumps({
+        trace = {
             "modules": sorted({m for m in modules if m and inside(m, ROOT)}),
             "read": sorted(path for path in read if os.path.isabs(path) or not path.startswith("<")),
             "commands": commands,
-            "peak_bytes": peak * 1024,
-        }))
+        }
+        if resource:
+            peak = max(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+            peak //= 1024 if sys.platform == "darwin" else 1  # bytes on macOS, KiB elsewhere
+            trace["peak_bytes"] = peak * 1024
+        Path(output).write_text(json.dumps(trace))
 
     atexit.register(write)
     sys.addaudithook(audit)
@@ -1194,18 +1352,122 @@ def trace_main(output, script, arguments):
 
 # Files every harness's result depends on (part of environment_key): a change to one affects them all.
 SHARED_INPUTS = {"research-lock.json", "Cargo.lock"}
+# Manifest sections that say what a crate is and where its targets are, not what it builds with.
+MANIFEST_SECTION_KEPT = re.compile(r"\[\[?(?:package|lib|bin|example|test|bench|lints|badges)\b[^\]]*\]\]?$")
+WORKSPACE_CRATE = r"(horizon[\w-]*|cargo-horizon-mod|xtask)"
+# A workspace crate named as a dependency (by path, or from the workspace's own table) without choosing its features,
+# or listed as a member.
+WORKSPACE_LINE = re.compile(WORKSPACE_CRATE + r'\s*=\s*(?:\{(?![^}]*\bfeatures\b)[^}]*\b(?:path|workspace)\s*=[^}]*\}|true)'
+                            r'|' + WORKSPACE_CRATE + r'\.workspace\s*=\s*true|"crates/[^"]+",?')
+# A workspace crate named as a dependency with some of its features turned on.
+WORKSPACE_FEATURES = re.compile(WORKSPACE_CRATE + r'\s*=\s*\{(?=[^}]*\b(?:path|workspace)\s*=)(?![^}]*default-features)'
+                                r'[^}]*\bfeatures\s*=\s*\[([^\]]*)\][^}]*\}')
+
+
+def git_show(base, path):
+    """path's content at commit base, or None where it didn't exist."""
+    result = subprocess.run(["git", "show", f"{base}:{path}"], cwd=ROOT, capture_output=True, text=True)
+    return result.stdout if result.returncode == 0 else None
+
+
+def manifest_lines(text):
+    """A Cargo.toml's lines that decide what is built: (section, line) pairs, without its package's identity and
+    targets, comments, or workspace crates (whose code counts through its own sources)."""
+    lines, section = set(), ""
+    name = re.search(r'^\[package\][^\[]*?^name\s*=\s*"([^"]+)"', text or "", re.M | re.S)
+    for raw in (text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw.split("#", 1)[0]).strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            # A crate's features are its own: the same line in two crates means two things.
+            section = f"[features] of {name.group(1) if name else '?'}" if line == "[features]" else line
+            continue
+        if MANIFEST_SECTION_KEPT.match(section) or WORKSPACE_LINE.fullmatch(line) or \
+                section == "[workspace]" and (line.startswith("members =") or line.startswith('"') or line == "]"):
+            continue
+        lines.add((section, line))
+    return lines
+
+
+def lock_packages(text):
+    """Cargo.lock's packages from a registry or git (with their versions and checksums); workspace crates' entries
+    only list what their manifests say."""
+    return {block.strip() for block in (text or "").split("[[package]]") if "\nsource = " in block}
+
+
+def workspace_only_manifests(changed, base):
+    """The changed Cargo.lock and Cargo.toml files whose changes only add, remove or move workspace crates (a crate
+    split): no external package, version, feature, or build setting changed across them. Their crates' code counts
+    through its own sources, so these files don't make every harness linking the crates rerun."""
+    manifests = sorted(path for path in changed if path == "Cargo.lock" or path.endswith("Cargo.toml"))
+    if not manifests or base is None:
+        return set()
+    if "Cargo.lock" in manifests and \
+            lock_packages(git_show(base, "Cargo.lock")) != lock_packages((ROOT / "Cargo.lock").read_text(encoding="utf-8")):
+        return set()
+    tomls = [path for path in manifests if path != "Cargo.lock"]
+    before = set().union(*(manifest_lines(git_show(base, path)) for path in tomls)) if tomls else set()
+    after = set().union(*(manifest_lines((ROOT / path).read_text(encoding="utf-8") if (ROOT / path).exists() else None)
+                          for path in tomls)) if tomls else set()
+    # Workspace crates' features that a changed line defines or turns on: they change what compiles of that crate's
+    # sources, which is fine only where every source naming them changed too (a split: the crate's files are new).
+    gated = set()
+    for section, line in before ^ after:
+        wanted = WORKSPACE_FEATURES.fullmatch(line)
+        if wanted:
+            gated |= {(wanted.group(1), feature) for feature in re.findall(r'"([^"]+)"', wanted.group(2))}
+        elif section.startswith("[features] of ") and re.fullmatch(r'[\w-]+ = \[(?: ?"[\w-]+",?)*\s*\]', line):
+            gated.add((section[len("[features] of "):], line.split(" ", 1)[0]))
+        else:
+            return set()  # an external package, a feature reaching one ("dep:", "crate/feature"), a build setting
+    return set(manifests) if all(feature_sources_changed(crate, feature, changed) for crate, feature in gated) else set()
+
+
+def feature_sources_changed(crate, feature, changed):
+    """Whether every Rust source of workspace crate `crate` that names `feature`, or a feature it turns on, is in
+    changed (False where the crate isn't found)."""
+    listed = subprocess.run(["git", "ls-files", "*Cargo.toml"], cwd=ROOT, capture_output=True, text=True)
+    manifests = [ROOT / path for path in listed.stdout.split()] if listed.returncode == 0 else list(ROOT.rglob("Cargo.toml"))
+    for manifest in manifests:
+        text = manifest.read_text(encoding="utf-8") if manifest.exists() else ""
+        if re.search(r'^\[package\][^\[]*?^name\s*=\s*"' + re.escape(crate) + '"', text, re.M | re.S):
+            break
+    else:
+        return False
+    if any(not root.is_relative_to(manifest.parent.resolve()) for root in parity_reach.crate_roots(manifest.parent)):
+        # A directory-only scan cannot prove that shared external sources changed too.
+        return False
+    table = re.search(r"^\[features\]\n(.*?)(?=^\[|\Z)", text, re.M | re.S)
+    implies = {name: re.findall(r'"([^"]+)"', value) for name, value in
+               re.findall(r'^([\w-]+)\s*=\s*\[([^\]]*)\]', table.group(1) if table else "", re.M)}
+    names, todo = set(), [feature]
+    while todo:
+        name = todo.pop()
+        if name not in names:
+            names.add(name)
+            todo += [implied for implied in implies.get(name, []) if "/" not in implied and ":" not in implied]
+    named = re.compile(r'feature\s*=\s*"(?:' + "|".join(map(re.escape, sorted(names))) + r')"')
+    return all(path.relative_to(ROOT).as_posix() in changed for path in manifest.parent.rglob("*.rs")
+               if named.search(path.read_text(encoding="utf-8", errors="replace")))
 
 
 def changed_files(ref):
-    """Files changed between the merge base of HEAD and ref and HEAD (committed or not), or None without a merge base."""
+    """Changed files since the merge base (committed or not), including both sides of renames; None without a base."""
     def git(*arguments):
-        result = subprocess.run(["git", *arguments], cwd=ROOT, capture_output=True, text=True)
-        return result.stdout.split("\n") if result.returncode == 0 else None
+        result = subprocess.run(["git", *arguments], cwd=ROOT, capture_output=True)
+        return result.stdout.decode("utf-8") if result.returncode == 0 else None
     base = git("merge-base", "HEAD", ref)
-    if not base or not base[0]:
+    if not base:
         return None
-    return set(filter(None, git("diff", "--name-only", base[0]) or [])) | \
-        set(filter(None, git("ls-files", "--others", "--exclude-standard") or []))
+    return set(filter(None, (git("diff", "--name-only", "--no-renames", "-z", base.strip()) or "").split("\0"))) | \
+        set(filter(None, (git("ls-files", "--others", "--exclude-standard", "-z") or "").split("\0")))
+
+
+def canonical_dependency_path(path: str) -> str:
+    """Normalize legacy Windows paths without changing their narrowed-root annotation."""
+    prefix, separator, suffix = path.partition(KEEP)
+    return prefix.replace("\\", "/") + separator + suffix
 
 
 def changed_harnesses(found, records, ref):
@@ -1217,35 +1479,130 @@ def changed_harnesses(found, records, ref):
         return set()
     found_changed = set()
     for name, script in found.items():
-        specific = [path for path in records.get(name, {}).get("dependencies", [])
+        dependencies = map(canonical_dependency_path, records.get(name, {}).get("dependencies", []))
+        specific = [path.split(KEEP)[0] for path in dependencies
                     if path.startswith("mods/horizon/src/test/") or "/examples/" in path or "/src/bin/" in path]
         if Path(script).relative_to(ROOT).as_posix() in changed or any(path in changed for path in specific):
             found_changed.add(name)
     return found_changed
 
 
-def affected_harnesses(found, records, changed):
+def affected_harnesses(found, records, changed, reach=True, base=None):
     """Harnesses the changed files can affect: their script or a recorded dependency (here, or in the shared
-    dependency lists) changed, a file every harness depends on changed, or nothing is recorded about them yet."""
+    dependency lists) changed, a file every harness depends on changed, or nothing is recorded about them yet.
+    With reach, a harness's workspace Rust sources count only if its probes can reach them (tools/parity_reach.py);
+    a harness whose probes can't be placed keeps them all. A changed file counts unless, compared with base (a
+    commit), only declarations of modules the harness doesn't reach changed (tools/parity_reach.py)."""
     if changed & SHARED_INPUTS:
         return set(found)
+    graph, stop = None, frozenset()
+    # Parses are keyed by content, so every worktree sharing the vanilla data shares them.
+    cache_path = (SHARED if SHARED.is_dir() else STATE_DIR) / "reach-cache.json"
+    if reach and any(path.startswith("crates/") for path in changed):
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cache = {}
+        graph = parity_reach.SourceGraph(ROOT, rust_code, cache)
+        # A changed file that differs in more than its `mod` declarations counts as soon as a harness reaches it,
+        # so the search for that harness can stop there.
+        stop = frozenset(path for path in changed if parity_reach.is_workspace_rust(path)
+                         and parity_reach.declarations_changed(ROOT, path, (), base, True))
+    budget, started, over = float(os.environ.get("PARITY_REACH_BUDGET") or 180), time.monotonic(), False
     affected = set()
     for name, script in found.items():
-        dependencies = records.get(name, {}).get("dependencies")
+        record = records.get(name) or {}
+        dependencies = record.get("dependencies")
         template = SHARED / "dependencies" / f"{name}.json"
         if dependencies is None and template.exists():
-            dependencies = json.loads(template.read_text(encoding="utf-8")).get("dependencies")
-        if dependencies is None or Path(script).relative_to(ROOT).as_posix() in changed or \
-                any(path.split(KEEP)[0] in changed for path in dependencies):
+            record = json.loads(template.read_text(encoding="utf-8"))
+            dependencies = record.get("dependencies")
+        if dependencies is None or Path(script).relative_to(ROOT).as_posix() in changed:
             affected.add(name)
+            continue
+        dependencies = [canonical_dependency_path(path) for path in dependencies]
+        plain = {path.split(KEEP)[0] for path in dependencies}
+        hit = (plain & changed) | parity_reach.unrecorded(ROOT, plain, changed)
+        if not hit:
+            continue
+        if graph is None or any(not path.startswith("crates/") for path in hit):
+            affected.add(name)  # no narrowing, or a file narrowing always keeps (tools/, Java oracles)
+            continue
+        if not over and time.monotonic() - started > budget:
+            over = True
+            print(f"note: choosing harnesses took over {budget:.0f} s (PARITY_REACH_BUDGET): the rest count every "
+                  "source their probes link", flush=True)
+        if over:
+            affected.add(name)
+            continue
+        narrowed = parity_reach.narrow(dependencies, recorded_artifacts(dict(record, dependencies=dependencies)),
+                                      graph, changed, stop)
+        if any(path.split(KEEP)[0] in changed and (children is None or parity_reach.declarations_changed(
+                ROOT, path.split(KEEP)[0], children, base, whole)) for path, (whole, children) in narrowed.items()):
+            affected.add(name)
+    if graph is not None:
+        saved = graph.saved_cache()
+        if len(cache) + len(saved) < 4 * max(len(saved), 1):
+            saved = {**cache, **saved}  # other worktrees' versions of the files too, within bounds
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(saved), encoding="utf-8")
+        temporary.replace(cache_path)
     return affected
 
 
-def platform_skips(config):
-    """Harnesses tools/parity_hosts.json marks as giving different results on this platform: {name: reason}."""
-    if sys.platform == "linux":
-        return {}
-    return dict(config.get("linux_only", {}))
+def platform_skips(config, host=None):
+    """Harnesses tools/parity_hosts.json marks as giving different results on this platform, and those this host's
+    entry excludes (playhorizon's CI runner runs its own pull request jobs here, not only workers sent to it):
+    {name: reason}."""
+    skips = {} if sys.platform == "linux" else dict(config.get("linux_only", {}))
+    skips.update(config.get("hosts", {}).get(HOST if host is None else host, {}).get("exclude", {}))
+    return skips
+
+
+def known_flaky(config):
+    """Harnesses tools/parity_hosts.json lists as failing now and then for a cause not fixed yet: one that fails runs
+    once more, and passing then counts, reported as RETRIED. {name: reason}"""
+    return dict(config.get("known_flaky", {}))
+
+
+def solo_harnesses(config):
+    """Harnesses tools/parity_hosts.json's "solo" lists ({name: reason}: those driving game windows, whose frames
+    are drawn on the CPU on Linux runners) run alone on a machine with SOLO_CPUS CPUs or fewer for this process
+    (playhorizon's runner has 4): beside other harnesses there they lose ticks between control requests. The set,
+    or an empty one on a bigger machine. PARITY_SOLO=1 or 0 forces it on or off."""
+    forced = os.environ.get("PARITY_SOLO")
+    cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+    if forced == "0" or forced != "1" and cpus > SOLO_CPUS:
+        return set()
+    return set(config.get("solo", {}))
+
+
+SOLO_CPUS = 4
+
+
+def named_only(config):
+    """Harnesses tools/parity_hosts.json keeps out of every automatic selection (--changed, --failed, the default,
+    --flake-check): they run only when named or with --all, the nightly audit. {name: reason}"""
+    return dict(config.get("named_only", {}))
+
+
+def report_retries(results, flaky):
+    """Say loudly which harnesses needed their one retry (a known flaky one, or one that failed with reused oracle
+    results), here and in the CI job's summary: a pass on the retry counts, so this is where flakes stay visible."""
+    def why(name, record):
+        if record["retried"] == "known flaky":
+            return (f"known flaky: {flaky.get(base_name(name), '?')}; first run's log: "
+                    f"{STATE_DIR / 'logs' / (name + '.first-run.log')}")
+        return "its first run reused oracle results; it no longer reuses them" if record["status"] == "pass" else \
+            "its first run reused oracle results"
+    lines = [f"RETRIED {name}: failed, then {'passed' if record['status'] == 'pass' else 'failed again'} on its one "
+             f"retry ({why(name, record)})" for name, record in sorted(results.items()) if record.get("retried")]
+    for line in lines:
+        print(line, flush=True)
+    if lines and os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+            summary.write("### Harnesses that failed once, then ran again\n" + "".join(f"- {line}\n" for line in lines))
 
 
 def finished_run(failed):
@@ -1257,6 +1614,7 @@ def finished_run(failed):
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--trace":
         return trace_main(sys.argv[2], sys.argv[3], sys.argv[4:])
+    exit_on_termination()
     if len(sys.argv) > 1 and sys.argv[1] == "--worker":
         return worker_main(sys.argv[2])
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1280,6 +1638,8 @@ def main():
     parser.add_argument("--flake-rounds", type=int, default=3, help="runs required by --flake-check (default 3)")
     parser.add_argument("--changed", metavar="REF", help="only harnesses the changes since the merge base with REF can "
                         "affect (and that have not passed with their current inputs): the pull-request check")
+    parser.add_argument("--by-crate", action="store_true", help="with --changed: count every Rust source a probe "
+                        "links, not only those it can reach (tools/parity_reach.py)")
     parser.add_argument("--changed-files", metavar="FILE", help="like --changed, for the changed paths listed in FILE, "
                         "one per line: for a copy without Git history (tools/pr_ready.py on another machine)")
     args = parser.parse_args()
@@ -1316,7 +1676,15 @@ def main():
             changed, since = changed_files(args.changed), f" since the merge base with {args.changed}"
         if changed is None:
             parser.error(f"no merge base with {args.changed}")
-        affected = affected_harnesses(found, records, changed)
+        base = None
+        if args.changed:
+            merge_base = subprocess.run(["git", "merge-base", "HEAD", args.changed], cwd=ROOT, capture_output=True, text=True)
+            base = merge_base.stdout.strip() or None
+        moved = workspace_only_manifests(changed, base) if not args.by_crate else set()
+        if moved:
+            print(f"{', '.join(sorted(moved))}: only workspace crates added, removed or moved; their sources count "
+                  "instead", flush=True)
+        affected = affected_harnesses(found, records, changed - moved, reach=not args.by_crate, base=base)
         chosen = [name for name in found if name in affected and stale(name, state, hasher, environment)]
         print(f"{len(changed)} files changed{since}: {len(affected)} harnesses "
               f"depend on them, {len(chosen)} without a pass for their current inputs.", flush=True)
@@ -1324,11 +1692,15 @@ def main():
         chosen = [name for name in found if stale(name, state, hasher, environment)]
     skips = platform_skips(host_config())
     for name in [name for name in chosen if base_name(name) in skips and not args.names]:
-        print(f"skipped on {sys.platform}: {name}: {skips[base_name(name)]}", flush=True)
+        print(f"skipped on {HOST} ({sys.platform}): {name}: {skips[base_name(name)]}", flush=True)
+        chosen.remove(name)
+    manual = {} if args.names or args.all else named_only(host_config())
+    for name in [name for name in chosen if base_name(name) in manual]:
+        print(f"not selected (runs when named, and nightly): {name}: {manual[base_name(name)]}", flush=True)
         chosen.remove(name)
     rounds = {name: args.repeat for name in chosen} if args.repeat > 1 else {}
     if args.flake_check:
-        changed = changed_harnesses(found, records, args.flake_check)
+        changed = {name for name in changed_harnesses(found, records, args.flake_check) if base_name(name) not in manual}
         for name in sorted(changed):
             # A pass counts for a changed harness only if it held over enough runs.
             if name not in chosen and records.get(name, {}).get("rounds", 1) < args.flake_rounds:
@@ -1349,13 +1721,14 @@ def main():
 
     # The probes the selected harnesses built last time, here or (for those that never ran here) in another
     # worktree. A harness with no record builds its own: building every probe for it would be ~275 binaries.
-    artifacts = []
+    artifacts, built_by = [], {}
     for name in selected:
         record = records.get(name)
         if not record or "artifacts" not in record:
             template = SHARED / "dependencies" / f"{name}.json"
             record = json.loads(template.read_text(encoding="utf-8")) if template.exists() else {}
-        for artifact in recorded_artifacts(record):
+        built_by[name] = recorded_artifacts(record)
+        for artifact in built_by[name]:
             if artifact not in artifacts:
                 artifacts.append(artifact)
     config = host_config()
@@ -1372,8 +1745,10 @@ def main():
         jobs = 1  # harnesses that can only run here still need a slot
     remotes = [RemoteExecutor(host, config["hosts"][host], artifacts, config.get("local_only", {}), args.timeout)
                for host in hosts]
+    local = None
     try:
         if jobs:
+            process_tree.start_build_server()  # before any build here: the probe build's would start it otherwise
             print("Building probes...", flush=True)
             started = time.monotonic()
             built, errors = prebuild(artifacts, default_build_jobs())
@@ -1384,16 +1759,25 @@ def main():
         where = "".join(f", plus {host}" for host in hosts)
         print(f"Running {len(selected)} harnesses, {jobs} at a time here{where}...", flush=True)
         reuse_oracles = not (args.fresh or args.all)
-        executors = [*remotes, LocalExecutor(jobs, int(memory_available() * 0.75), args.timeout,
-                                             REMOTE_LOCAL_PEAK if remotes and args.jobs is None else None)]
-        results, elapsed = run(selected, state, hasher, environment_key(hasher), executors, reuse_oracles, rounds)
+        local = LocalExecutor(jobs, int(memory_available() * 0.75), args.timeout,
+                              REMOTE_LOCAL_PEAK if remotes and args.jobs is None else None)
+        local.solo = solo_harnesses(config)
+        if os.name == "nt":
+            packages = target_packages()
+            local.builds = {name: executables(built, packages) for name, built in built_by.items()}
+        if local.solo & {harness_of(name) for name in selected}:
+            print(f"Alone on this machine ({SOLO_CPUS} CPUs or fewer), after the others: "
+                  f"{', '.join(sorted(local.solo & {harness_of(name) for name in selected}))}", flush=True)
+        results, elapsed = run(selected, state, hasher, environment_key(hasher), [*remotes, local], reuse_oracles,
+                               rounds, known_flaky(config))
     finally:
-        for executor in remotes:
+        for executor in [*remotes, *([local] if local else [])]:
             executor.stop()
     save_state(state)
     failed = sorted(name for name, record in results.items() if record["status"] != "pass")
     finished_run(failed)
     print(f"\n{len(results) - len(failed)} passed, {len(failed)} failed in {elapsed / 60:.1f} min.")
+    report_retries(results, known_flaky(config))
     for index, name in enumerate(failed):
         log = STATE_DIR / 'logs' / (name + '.log')
         print(f"  {name}: {log}")

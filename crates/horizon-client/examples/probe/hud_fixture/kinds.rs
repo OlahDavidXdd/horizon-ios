@@ -319,6 +319,7 @@ fn chat(c: &Value, h: i32, atlas: &HudAtlas) -> Vec<GuiDraw> {
             atlas,
             comp(&m["text"]),
             indicator,
+            horizon_client::chat::ChatSource::Client,
             m["at"].as_u64().unwrap_or(0),
             false,
         );
@@ -327,5 +328,5 @@ fn chat(c: &Value, h: i32, atlas: &HudAtlas) -> Vec<GuiDraw> {
     if let Some(n) = c["scroll"].as_i64() {
         chat.scroll_by(n as i32, focused);
     }
-    chat.layout(h, c["now"].as_u64().unwrap_or(0), focused)
+    chat.layout(h, c["now"].as_f64().unwrap_or(0.0) as f32, focused)
 }

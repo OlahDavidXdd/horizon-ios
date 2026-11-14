@@ -132,7 +132,9 @@ struct OsFeatures;
 impl OsFeatures {
     fn display_sync() -> bool {
         // https://developer.apple.com/documentation/quartzcore/cametallayer/displaysyncenabled
-        available!(macos = 10.13) || cfg!(target_abi = "macabi")
+        // iOS has had the property since 8.0; without it the adapter offers Fifo
+        // only, so VSync off could never present immediately on an iPhone.
+        available!(macos = 10.13, ios = 8.0) || cfg!(target_abi = "macabi")
     }
 }
 
@@ -228,6 +230,7 @@ bitflags!(
 #[allow(dead_code)]
 struct CapabilitiesQuery {
     msl_version: MTLLanguageVersion,
+    legacy_intel: bool,
     fragment_rw_storage: bool,
     read_write_texture_tier: MTLReadWriteTextureTier,
     msaa_desktop: bool,
@@ -337,6 +340,8 @@ struct CapabilitiesQuery {
 #[derive(Debug)]
 struct PrivateCapabilities {
     msl_version: MTLLanguageVersion,
+    /// Haswell-era Intel Metal drivers need conservative shader and draw paths.
+    legacy_intel: bool,
     low_power: bool,
     headless: bool,
     has_unified_memory: Option<bool>,

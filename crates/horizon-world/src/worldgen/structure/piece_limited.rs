@@ -201,7 +201,7 @@ impl Counts {
         let PoolElement::Single { template, .. } = element else {
             return None;
         };
-        self.0.iter().position(|t| Arc::ptr_eq(t, template))
+        self.0.iter().position(|t| Arc::ptr_eq(t, template.arc()))
     }
 }
 
@@ -690,7 +690,7 @@ struct Assembler<'a> {
 /// Where a child goes: the parent's jigsaw and what it needs.
 struct Slot<'s> {
     source: usize,
-    jigsaw: &'s super::jigsaw::Jigsaw,
+    jigsaw: &'s super::jigsaw::Jigsaw<'s>,
     target_pos: [i32; 3],
     free: Rc<RefCell<Free>>,
     depth: i32,
@@ -794,7 +794,7 @@ impl Assembler<'_> {
                 let need_template = &self.counted.0[need_index];
                 let found = candidates.iter().position(|(e, _)| {
                     matches!(e.as_ref(), PoolElement::Single { template, .. }
-                        if Arc::ptr_eq(template, need_template))
+                        if Arc::ptr_eq(template.arc(), need_template))
                 });
                 if let Some(i) = found {
                     if slot.depth >= (self.config.max_depth - 1).min(need.min_depth) {
@@ -910,6 +910,8 @@ impl Assembler<'_> {
                         source_x: slot.target_pos[0],
                         source_ground_y: junction_y - local_y + source_ground,
                         source_z: slot.target_pos[2],
+                        delta_y,
+                        dest_projection: target.projection(),
                     });
                     slot.free.borrow_mut().removed.push(target_box);
                     self.pieces.push(PoolPiece {
@@ -922,6 +924,12 @@ impl Assembler<'_> {
                             source_x: jigsaw.pos[0],
                             source_ground_y: junction_y - target_local[1] + target_ground,
                             source_z: jigsaw.pos[2],
+                            delta_y: -delta_y,
+                            dest_projection: if source_rigid {
+                                Projection::Rigid
+                            } else {
+                                Projection::TerrainMatching
+                            },
                         }],
                         waterlogging: self.config.waterlogging,
                     });
@@ -1020,12 +1028,12 @@ mod tests {
     fn repurposed_moves_junctions_as_its_code_does() {
         let template = Arc::new(StructureTemplate::empty());
         let element = Arc::new(PoolElement::Single {
-            template,
+            template: crate::worldgen::structure::LazyTemplate::loaded(template),
             processors: Default::default(),
+            processors_source: serde_json::Value::Null,
             legacy: false,
             projection: Projection::Rigid,
             waterlogging: None,
-            yung: None,
             enhanced_terrain: None,
             ground_level: 1,
         });
@@ -1039,6 +1047,8 @@ mod tests {
                 source_x: 1,
                 source_ground_y: 2,
                 source_z: 3,
+                delta_y: 0,
+                dest_projection: Projection::Rigid,
             }],
             waterlogging: true,
         };

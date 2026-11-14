@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 
@@ -32,8 +33,7 @@ except ImportError:
     import lab
 
 # Classes whose decompiled source a generator parses: (side, class).
-SOURCES = [("client", "net/minecraft/world/entity/EntityTypes"),
-           ("server", "net/minecraft/util/datafix/fixes/BlockStateData")]
+SOURCES = [("client", "net/minecraft/world/entity/EntityTypes")]
 PARITY = "mods/horizon/src/test/java/dev/horizonlab/parity"
 
 
@@ -124,8 +124,23 @@ def prepare_local(root, version, found, store):
         run([python(), "tools/lab.py", "prepare", "--minecraft-dir", tree, "--server-jar", found["server"]], root)
 
 
+_PYTHON = None
+
+
 def python():
-    return shutil.which("python3") or "python3"
+    """The interpreter to run the other tools with. Git for Windows puts a
+    `python3` on PATH that is only the Store stub: it prints "Python" and exits
+    49, so probe the names and keep the first one that runs Python 3."""
+    global _PYTHON
+    if _PYTHON is None:
+        _PYTHON = "python3"
+        for name in ("python3", "python", "py"):
+            found = shutil.which(name)
+            probe = [found, "-c", "import sys; sys.exit(sys.version_info < (3,))"] if found else None
+            if probe and subprocess.run(probe, capture_output=True).returncode == 0:
+                _PYTHON = found
+                break
+    return _PYTHON
 
 
 class Failed(RuntimeError):
@@ -229,7 +244,7 @@ def gen_vanilla_order(root, version, store, build):
          "dev.horizonlab.parity.VanillaCommandParseOracle", "tree", build], build)
     env = dict(os.environ, CARGO_TARGET_DIR=str(root / ".local" / "port-target"))
     jobs = os.environ.get("FLEET_LOAD_JOBS")
-    run(["cargo", "build", "-p", "horizon-client", "--example", "client_probe",
+    run(["cargo", "build", "-p", 'horizon-client-lib', "--example", "client_probe",
          *(["-j", jobs] if jobs else [])], root, env=env)
     fixture = root / ".local/port-target/debug/examples/client_probe"
     run([fixture, "command_parse_fixture", "tree", build / "rust_tree.json"], root)
@@ -245,13 +260,10 @@ GENERATORS = [
     ("entity_tracking", ["crates/horizon-client/src/lan/tracking.rs"],
      lambda root, version, store, build: [python(), "tools/generate_entity_tracking.py", "--sources",
                                           store / "sources" / "client"]),
-    ("block_state_data", ["crates/horizon-world/src/datafix/block_state_data.txt"],
-     lambda root, version, store, build: [python(), "tools/gen_block_state_data.py",
-                                          store / "sources/server" / f"{SOURCES[1][1]}.java"]),
     ("lan_command_order", ["crates/horizon-client/src/lan/command_order.rs"],
      lambda root, version, store, build: [python(), "tools/generate_lan_command_order.py"]),
     ("command_suggestions", ["crates/horizon-client/src/lan/command_suggestions.rs"], gen_suggestions),
-    ("vanilla_command_order", ["crates/horizon-client/src/command/vanilla_order.rs"], gen_vanilla_order),
+    ("vanilla_command_order", ["crates/horizon-command/src/vanilla_order.rs"], gen_vanilla_order),
 ]
 
 
@@ -309,3 +321,9 @@ def regen(version, found, store, base, path, names=None):
     results = run_generators(root, version, store, names)
     return {"old": old, "new": version, "candidate": str(root), "commit": commit(root, version, results),
             "generators": results}
+
+
+if __name__ == "__main__":
+    # A module, not a command: say how it is used instead of doing nothing at all.
+    print(__doc__, file=sys.stderr)
+    raise SystemExit(2)

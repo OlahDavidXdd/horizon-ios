@@ -1,4 +1,9 @@
+import subprocess
+from pathlib import Path
+import sys
 import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
 
 from tools import port_regen as regen
 
@@ -46,6 +51,24 @@ class CompileErrorTests(unittest.TestCase):
 
     def test_nothing_from_other_failures(self):
         self.assertEqual(regen.compile_errors("expected the root's order to differ"), [])
+
+
+class InterpreterTests(unittest.TestCase):
+    def test_python_is_an_interpreter_that_runs(self):
+        found = regen.python()
+        done = subprocess.run([found, "-c", "import sys; sys.exit(sys.version_info < (3,))"],
+                              capture_output=True)
+        self.assertEqual(done.returncode, 0, f"{found} is not a Python 3 that runs")
+
+
+class UsedThroughVersionPortTests(unittest.TestCase):
+    """The module is used through `tools/version_port.py`; run on its own it says so."""
+
+    def test_it_says_how_it_is_used(self):
+        result = subprocess.run([sys.executable, str(ROOT / "tools/port_regen.py"), "--help"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("version_port.py", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
