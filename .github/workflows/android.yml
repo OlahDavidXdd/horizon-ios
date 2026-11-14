@@ -1,31 +1,25 @@
 name: android
-# The game for Android: crates/horizon-android (horizon-client's bin as a NativeActivity library) cross-compiled
-# for arm64 with the runner's NDK, packed with packaging/android/AndroidManifest.xml by aapt2 (no Gradle: the app
-# has no Java), signed, and uploaded as Horizon.apk. No tests run here.
-#
-# Signing: set the repository secrets ANDROID_KEYSTORE (a base64 .jks/.keystore holding the alias `horizon`) and
-# ANDROID_KEYSTORE_PASSWORD, so every build updates the installed app. Without them each run signs with a new
-# throwaway key, and installing it means uninstalling the last one first, which deletes the app's files.
 on:
-  # Off the push and pull-request paths on purpose: an Android run that fails turned every commit red and
-  # mailed it out even when the iOS build passed. Build it by hand from the Actions tab when it is wanted.
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the verified APK as a GitHub prerelease
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
-  group: android-${{ github.sha }}
+  group: android-${{ github.ref }}
   cancel-in-progress: false
 env:
-  HORIZON_TELEMETRY_URL: "off"
+  HORIZON_TELEMETRY_URL: 'off'
   ANDROID_TARGET: aarch64-linux-android
-  # The manifest's minSdkVersion.
-  ANDROID_API: "26"
-  CARGO_INCREMENTAL: "0"
-
+  ANDROID_API: '26'
+  CARGO_INCREMENTAL: '0'
 jobs:
   apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -33,6 +27,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.ANDROID_TARGET }}
@@ -40,7 +41,7 @@ jobs:
         with:
           workspaces: crates/horizon-android
           shared-key: android-${{ env.ANDROID_TARGET }}
-      - name: Build the game
+      - name: Build shared game and launcher bridge
         env:
           HORIZON_MSA_CLIENT_ID: 331e08f8-172d-43b9-835a-3108c2fcdbf3
         run: |
@@ -52,45 +53,75 @@ jobs:
           export AR_aarch64_linux_android="$bin/llvm-ar"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
           cargo build --release --locked --manifest-path crates/horizon-android/Cargo.toml --target "$ANDROID_TARGET"
-      - name: Pack and sign the .apk
+          so="crates/horizon-android/target/$ANDROID_TARGET/release/libhorizon_android.so"
+          "$bin/llvm-nm" -D --defined-only "$so" > /tmp/horizon-symbols.txt
+          grep -q ' ANativeActivity_onCreate$' /tmp/horizon-symbols.txt
+          grep -q ' Java_dev_horizon_android_HorizonActivity_submit$' /tmp/horizon-symbols.txt
+          mkdir -p packaging/android/app/src/main/jniLibs/arm64-v8a
+          cp "$so" packaging/android/app/src/main/jniLibs/arm64-v8a/
+      - name: Build and verify launcher APK
         env:
-          # PR code is unmerged: always use the throwaway key, even for same-repository PRs.
-          KEYSTORE: ${{ github.event_name != 'pull_request' && secrets.ANDROID_KEYSTORE || '' }}
-          KEYSTORE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          HORIZON_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          HORIZON_ANDROID_BUILD: ${{ github.run_number }}
         run: |
           set -euo pipefail
-          sdk="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          tools="$(find "$sdk/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
-          platform="$(find "$sdk/platforms" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
-          work=$(mktemp -d)
-          mkdir -p "$work/res/mipmap-xxxhdpi" "$work/apk/lib/arm64-v8a"
-          cp packaging/icons/hicolor/256x256/apps/horizon.png "$work/res/mipmap-xxxhdpi/ic_launcher.png"
-          "$tools/aapt2" compile --dir "$work/res" -o "$work/res.zip"
-          "$tools/aapt2" link -o "$work/base.apk" -I "$platform/android.jar" \
-            --manifest packaging/android/AndroidManifest.xml "$work/res.zip"
-          so="crates/horizon-android/target/$ANDROID_TARGET/release/libhorizon_android.so"
-          cp "$so" "$work/apk/lib/arm64-v8a/"
-          ( cd "$work/apk" && zip -qr "$work/base.apk" lib )
-          "$tools/zipalign" -f -p 4 "$work/base.apk" "$work/aligned.apk"
+          export HORIZON_KEYSTORE="$RUNNER_TEMP/horizon.jks"
+          trap 'rm -f "$HORIZON_KEYSTORE"' EXIT
           if [ -n "$KEYSTORE" ]; then
-            echo "$KEYSTORE" | base64 -d > "$work/key.jks"
-            pass="$KEYSTORE_PASSWORD"
+            printf '%s' "$KEYSTORE" | base64 --decode > "$HORIZON_KEYSTORE"
           else
-            echo "::warning::no ANDROID_KEYSTORE secret: signed with a throwaway key, so this .apk cannot update the last one"
-            pass=throwaway
-            keytool -genkeypair -keystore "$work/key.jks" -alias horizon -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$pass" -keypass "$pass" -dname "CN=Horizon debug"
+            echo '::warning::No repository signing key configured. This prerelease uses a development key and cannot update an existing installation.'
+            export HORIZON_KEYSTORE_PASSWORD="$(openssl rand -hex 24)"
+            echo "::add-mask::$HORIZON_KEYSTORE_PASSWORD"
+            keytool -genkeypair -keystore "$HORIZON_KEYSTORE" -alias horizon -keyalg RSA -keysize 2048 -validity 10000 -storepass:env HORIZON_KEYSTORE_PASSWORD -keypass:env HORIZON_KEYSTORE_PASSWORD -dname 'CN=Horizon Android Development'
           fi
-          "$tools/apksigner" sign --ks "$work/key.jks" --ks-key-alias horizon --ks-pass "pass:$pass" \
-            --out Horizon.apk "$work/aligned.apk"
-          "$tools/apksigner" verify Horizon.apk
-          # The library must really export the entry point NativeActivity calls.
-          "${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D --defined-only "$so" \
-            | grep -q ' ANativeActivity_onCreate$'
-          unzip -l Horizon.apk
+          gradle -p packaging/android --no-daemon assembleRelease lintRelease
+          cp packaging/android/app/build/outputs/apk/release/app-release.apk Horizon-Android.apk
+          tools=$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$tools/apksigner" verify --verbose Horizon-Android.apk
+          "$tools/aapt" dump badging Horizon-Android.apk | tee /tmp/horizon-badging.txt
+          grep -q "launchable-activity: name='dev.horizon.android.HorizonActivity'" /tmp/horizon-badging.txt
+          unzip -l Horizon-Android.apk | grep 'lib/arm64-v8a/libhorizon_android.so'
+          sha256sum Horizon-Android.apk > Horizon-Android.apk.sha256
+          printf '%s\n' "$GITHUB_SHA" > source-commit.txt
       - uses: actions/upload-artifact@v4
         with:
           name: horizon-android
-          path: Horizon.apk
-          retention-days: 7
+          path: |
+            Horizon-Android.apk
+            Horizon-Android.apk.sha256
+            source-commit.txt
+          retention-days: 14
           if-no-files-found: error
+  release:
+    needs: apk
+    if: inputs.publish_release && github.repository == 'OlahDavidXdd/horizon-ios' && github.ref == 'refs/heads/android-port'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: horizon-android
+      - name: Publish APK from this successful build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$(cat source-commit.txt)" = "$GITHUB_SHA"
+          sha256sum --check Horizon-Android.apk.sha256
+          tag="android-v0.2.92-build-${GITHUB_RUN_NUMBER}"
+          cat > notes.md <<'NOTES'
+          Android port of the modified Horizon iOS fork, with a native launcher and MIT-licensed AndroidLiquidGlassView 1.1.0.
+
+          Builds without repository signing secrets use a development key: back up saves before replacing an existing installation.
+
+          ARM64 Android 8+ with Vulkan. Liquid glass refraction requires Android 13+; older versions use a solid material. Import prepared game files from your own copy of Minecraft. This APK contains no Mojang game assets.
+
+          Includes worlds, servers, game-file import/download, resource and shader packs, content mods, settings, screenshots, and Microsoft device-code sign-in. Online sign-in requires Microsoft/Mojang application approval. This is a prerelease; physical-device gameplay and complete iOS feature parity are still being validated.
+          NOTES
+          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.92 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
+          gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt
+          gh release edit "$tag" --draft=false

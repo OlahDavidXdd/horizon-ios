@@ -17,6 +17,9 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
+#[cfg(target_os = "android")]
+mod android;
+
 /// One line from the launcher, and the way back to it.
 pub struct Request {
     pub line: String,
@@ -285,7 +288,9 @@ pub fn waiting() -> bool {
 fn bundled() -> bool {
     #[cfg(target_os = "ios")]
     return ENABLED && ios::framework().is_some();
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    return true;
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     false
 }
 
@@ -309,7 +314,12 @@ pub fn present() -> bool {
 pub fn show() -> bool {
     #[cfg(target_os = "ios")]
     return ENABLED && ios::present();
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    {
+        set_covered(true);
+        return true;
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     false
 }
 

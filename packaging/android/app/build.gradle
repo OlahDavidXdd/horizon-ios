@@ -1,0 +1,25 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'dev.horizon.android'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'dev.horizon.android'
+        minSdk 26
+        targetSdk 35
+        versionCode Integer.parseInt(System.getenv('HORIZON_ANDROID_BUILD') ?: '2')
+        versionName '0.2.92-android'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    signingConfigs {
+        release {
+            storeFile file(System.getenv('HORIZON_KEYSTORE') ?: '../horizon-release.jks')
+            storePassword System.getenv('HORIZON_KEYSTORE_PASSWORD')
+            keyAlias 'horizon'
+            keyPassword System.getenv('HORIZON_KEYSTORE_PASSWORD')
+        }
+    }
+    buildTypes { release { signingConfig signingConfigs.release; minifyEnabled false } }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_21; targetCompatibility JavaVersion.VERSION_21 }
+    packaging { jniLibs { useLegacyPackaging = true } }
+}
+dependencies { implementation 'com.qmdeve.liquidglass:core:1.1.0' }

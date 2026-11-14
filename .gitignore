@@ -58,3 +58,11 @@
 
 # Xcode intermediate products generated beside the iOS project.
 /packaging/ios/build/
+
+# Android launcher build products and local signing configuration.
+packaging/android/.gradle/
+packaging/android/**/build/
+packaging/android/local.properties
+packaging/android/app/src/main/jniLibs/
+*.jks
+*.keystore
