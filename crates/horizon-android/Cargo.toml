@@ -18,6 +18,12 @@ crate-type = ["cdylib"]
 
 # Keep shared gameplay dependencies in step with horizon-client.
 [dependencies]
+# Shared gameplay uses these directly; keep this workspace aligned with horizon-client.
+horizon-hooks = { path = "../horizon-hooks" }
+horizon-perf-format = { path = "../horizon-perf-format" }
+horizon-system = { path = "../horizon-system" }
+crc32fast = "1"
+toml = "1.1"
 horizon-client-lib = { path = "../horizon-client-lib", default-features = false }
 horizon-assets = { path = "../horizon-assets" }
 horizon-client-core = { path = "../horizon-client-core" }
