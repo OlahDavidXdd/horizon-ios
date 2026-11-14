@@ -1502,6 +1502,7 @@ dependencies = [
 name = "horizon-gamecontroller"
 version = "0.2.91"
 dependencies = [
+ "jni 0.21.1",
  "objc2 0.6.5",
  "objc2-foundation 0.3.2",
  "objc2-game-controller",

@@ -178,11 +178,16 @@ mod ios {
     }
 }
 
+#[cfg(target_os = "android")]
+mod android;
+
 /// Every controller iOS has paired.
 pub fn controllers() -> Vec<Controller> {
     #[cfg(target_os = "ios")]
     return ios::controllers();
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    return android::controllers();
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     Vec::new()
 }
 
@@ -191,7 +196,9 @@ pub fn controllers() -> Vec<Controller> {
 pub fn snapshots() -> Vec<ConnectedController> {
     #[cfg(target_os = "ios")]
     return ios::snapshots();
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    return android::snapshots();
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     Vec::new()
 }
 
@@ -199,7 +206,9 @@ pub fn snapshots() -> Vec<ConnectedController> {
 pub fn active_controller() -> Option<ConnectedController> {
     #[cfg(target_os = "ios")]
     return ios::active_controller();
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    return android::active_controller();
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     None
 }
 
@@ -208,7 +217,9 @@ pub fn active_controller() -> Option<ConnectedController> {
 pub fn active() -> Option<Snapshot> {
     #[cfg(target_os = "ios")]
     return ios::active();
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    return android::active();
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     None
 }
 

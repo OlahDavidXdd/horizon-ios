@@ -22,6 +22,17 @@ public final class HorizonActivity extends NativeActivity {
     private static native void abandon(long id);
     private static native boolean isCovered();
     private static native boolean keyboardWanted();
+    private static native void controllerChanged(int device,String name,float[] axes,int buttons);
+    private static native void controllerRemoved(int device);
+    private final android.util.SparseArray<Pad> controllers=new android.util.SparseArray<>();
+    private android.hardware.input.InputManager inputManager;
+    private final android.hardware.input.InputManager.InputDeviceListener deviceListener=new android.hardware.input.InputManager.InputDeviceListener(){
+        public void onInputDeviceAdded(int id){}
+        public void onInputDeviceChanged(int id){}
+        public void onInputDeviceRemoved(int id){controllers.remove(id);controllerRemoved(id);}
+    };
+    private static final class Pad {final float[] axes=new float[8];int buttons;}
+
     private View inputBridge;
     private boolean keyboardVisible;
     private static native void setTouchPreferences(float[] values, int flags);
@@ -119,6 +130,8 @@ public final class HorizonActivity extends NativeActivity {
         };
         inputBridge.setFocusable(true);inputBridge.setFocusableInTouchMode(true);
         addContentView(inputBridge,new ViewGroup.LayoutParams(1,1));
+        inputManager=(android.hardware.input.InputManager)getSystemService(INPUT_SERVICE);
+        inputManager.registerInputDeviceListener(deviceListener,ui);
         render(); ui.post(watch);
     }
     int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
@@ -523,6 +536,26 @@ public final class HorizonActivity extends NativeActivity {
             thumbnail.setContentDescription(image.getName()); page.addView(thumbnail,new LinearLayout.LayoutParams(-1,dp(180)));
         }
     }
+    @Override public boolean dispatchGenericMotionEvent(android.view.MotionEvent event) {
+        if(!visible && (event.getSource()&InputDevice.SOURCE_JOYSTICK)==InputDevice.SOURCE_JOYSTICK) {
+            Pad pad=controllers.get(event.getDeviceId());if(pad==null){pad=new Pad();controllers.put(event.getDeviceId(),pad);}
+            int[] axes={android.view.MotionEvent.AXIS_X,android.view.MotionEvent.AXIS_Y,android.view.MotionEvent.AXIS_Z,android.view.MotionEvent.AXIS_RZ,android.view.MotionEvent.AXIS_LTRIGGER,android.view.MotionEvent.AXIS_RTRIGGER,android.view.MotionEvent.AXIS_HAT_X,android.view.MotionEvent.AXIS_HAT_Y};
+            for(int i=0;i<axes.length;i++)pad.axes[i]=event.getAxisValue(axes[i]);
+            InputDevice device=event.getDevice();controllerChanged(event.getDeviceId(),device==null?"Gamepad":device.getName(),pad.axes,pad.buttons);return true;
+        }
+        return super.dispatchGenericMotionEvent(event);
+    }
+    @Override public boolean dispatchKeyEvent(android.view.KeyEvent event) {
+        if(!visible && (event.getSource()&InputDevice.SOURCE_GAMEPAD)==InputDevice.SOURCE_GAMEPAD) {
+            int[] keys={android.view.KeyEvent.KEYCODE_BUTTON_A,android.view.KeyEvent.KEYCODE_BUTTON_B,android.view.KeyEvent.KEYCODE_BUTTON_X,android.view.KeyEvent.KEYCODE_BUTTON_Y,android.view.KeyEvent.KEYCODE_BUTTON_L1,android.view.KeyEvent.KEYCODE_BUTTON_R1,android.view.KeyEvent.KEYCODE_BUTTON_SELECT,android.view.KeyEvent.KEYCODE_BUTTON_START,android.view.KeyEvent.KEYCODE_BUTTON_THUMBL,android.view.KeyEvent.KEYCODE_BUTTON_THUMBR,android.view.KeyEvent.KEYCODE_DPAD_UP,android.view.KeyEvent.KEYCODE_DPAD_DOWN,android.view.KeyEvent.KEYCODE_DPAD_LEFT,android.view.KeyEvent.KEYCODE_DPAD_RIGHT};
+            for(int i=0;i<keys.length;i++)if(event.getKeyCode()==keys[i]){
+                Pad pad=controllers.get(event.getDeviceId());if(pad==null){pad=new Pad();controllers.put(event.getDeviceId(),pad);}
+                if(event.getAction()==android.view.KeyEvent.ACTION_DOWN)pad.buttons|=1<<i;else if(event.getAction()==android.view.KeyEvent.ACTION_UP)pad.buttons&=~(1<<i);
+                InputDevice device=event.getDevice();controllerChanged(event.getDeviceId(),device==null?"Gamepad":device.getName(),pad.axes,pad.buttons);return true;
+            }
+        }
+        return super.dispatchKeyEvent(event);
+    }
     private void share(File file,String type) {
         if(!file.isFile()){error(t("file_unavailable"));return;}
         Uri uri=androidx.core.content.FileProvider.getUriForFile(this,getPackageName()+".files",file);
@@ -538,5 +571,5 @@ public final class HorizonActivity extends NativeActivity {
         } else if (!visible) ask("launcher-visible true", v -> setLauncherVisible(true));
         else { tab = "play"; render(); }
     }
-    @Override protected void onDestroy() { destroyed = true; ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { destroyed = true; if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
 }

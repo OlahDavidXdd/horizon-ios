@@ -23,8 +23,8 @@ AARs require compile SDK 37, unavailable in the current build environment.
 
 This is a developing Android port, **not yet verified as a complete 1:1 replacement
 for the SwiftUI launcher**. iOS-specific features (AirPlay, UIKit gesture recognizers,
-GameController, advanced UIKit gesture parity) still need Android parity work. The Android touch
-editor, in-game IME bridge, pack priorities and screenshot/log sharing need device
+advanced UIKit gesture parity) still need Android parity work. The Android touch
+editor, in-game IME bridge, Android gamepad adapter, pack priorities and screenshot/log sharing need device
 validation.
 Physical-device input, rendering, authentication and background/resume must be
 validated before calling the port stable. Microsoft sign-in also depends on the

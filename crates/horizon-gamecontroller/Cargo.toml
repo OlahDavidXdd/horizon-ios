@@ -16,3 +16,6 @@ objc2-game-controller = { version = "0.3.2", default-features = false, features 
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21.1"
