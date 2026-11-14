@@ -255,7 +255,7 @@ public final class HorizonActivity extends NativeActivity {
     void ask(String line, Reply reply) { request(line, reply, this::error); }
     private void request(String line, Reply reply, java.util.function.Consumer<String> failed) {
         long id = submit(line);
-        final long deadline = SystemClock.uptimeMillis() + 120000;
+        final long deadline = SystemClock.uptimeMillis() + (line.startsWith("import-game-files ") ? 20 * 60000L : 120000L);
         ui.post(new Runnable() { public void run() {
             if (destroyed) { abandon(id); return; }
             String result = poll(id);
@@ -484,28 +484,38 @@ public final class HorizonActivity extends NativeActivity {
         boolean resources = kind.equals("resources");
         int attempt = resources ? beginSetup(true) : -1;
         workers.execute(() -> {
+            File destination = null;
             try {
                 String name = "import-" + UUID.randomUUID() + (kind.equals("mod") ? ".hmod" : ".zip");
                 File dir = new File(homeDir(), kind.equals("shader") ? "shaderpacks" : ".horizon-import");
                 if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException(t("cannot_import"));
-                File destination = new File(dir, name);
+                destination = new File(dir, name);
                 try (InputStream in = getContentResolver().openInputStream(uri); OutputStream out = new FileOutputStream(destination)) {
                     if (in == null) throw new IOException(t("cannot_import"));
-                    byte[] buffer = new byte[65536]; int n;
-                    while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
+                    byte[] buffer = new byte[65536]; int n; long copied = 0;
+                    while ((n = in.read(buffer)) != -1) {
+                        if(destroyed) throw new java.io.InterruptedIOException();
+                        copied += n; if(copied > (2L << 30)) throw new IOException("Archive too large");
+                        out.write(buffer, 0, n);
+                    }
                 }
+                File staged = destination;
                 ui.post(() -> {
+                    if(destroyed) { staged.delete(); return; }
                     if (kind.equals("shader")) { render(); return; }
-                    String line = kind.equals("mod") ? "mods-install " + object("path", destination.getAbsolutePath()) : (resources ? "import-game-files " : "import ") + destination.getAbsolutePath();
+                    String line = kind.equals("mod") ? "mods-install " + object("path", staged.getAbsolutePath()) : (resources ? "import-game-files " : "import ") + staged.getAbsolutePath();
                     request(line, v -> {
-                        destination.delete();
+                        staged.delete();
                         if (resources) finishSetup(attempt, null); else render();
                     }, failure -> {
-                        destination.delete();
+                        staged.delete();
                         if (resources) finishSetup(attempt, failure); else error(failure);
                     });
                 });
-            } catch (Exception e) { ui.post(() -> { if(resources) finishSetup(attempt, e.toString()); else error(t("cannot_import")); }); }
+            } catch (Exception e) {
+                if(destination != null) destination.delete();
+                ui.post(() -> { if(resources) finishSetup(attempt, e.toString()); else error(t("cannot_import")); });
+            }
         });
     }
     private void settings() {
@@ -584,6 +594,7 @@ public final class HorizonActivity extends NativeActivity {
         if(setupBusy) status.setText(t(installingResources ? "installing_files" : "downloading"));
     }
     private int beginSetup(boolean installing) {
+        automaticSetupAttempted = true;
         launcherWindow.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setupBusy = true; installingResources = installing; setupMessage = null; setupReceived = 0; setupTotal = 0;
         int attempt = ++setupAttempt; render(); return attempt;
@@ -636,6 +647,7 @@ public final class HorizonActivity extends NativeActivity {
             File zip = new File(homeDir(), ".horizon-import/download-" + UUID.randomUUID() + ".zip");
             java.net.HttpURLConnection connection = null;
             try {
+                if(attempt != setupAttempt || destroyed) return;
                 java.net.URL url = new java.net.URL(address);
                 if (!"https".equalsIgnoreCase(url.getProtocol())) throw new IOException("HTTPS required");
                 if(!zip.getParentFile().isDirectory() && !zip.getParentFile().mkdirs()) throw new IOException("Cannot create import folder");
