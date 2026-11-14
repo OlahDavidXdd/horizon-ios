@@ -252,7 +252,9 @@ pub fn clipboard_text() -> Option<String> {
         // is converted to owned text before returning to the caller.
         Some(unsafe { board.string() }.map_or_else(String::new, |s| s.to_string()))
     }
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    return android::clipboard_text();
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     None
 }
 
@@ -266,6 +268,8 @@ pub fn set_clipboard_text(text: &str) {
         // the call and UIPasteboard copies its value.
         unsafe { board.setString(Some(&text)) };
     }
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    android::set_clipboard_text(text);
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     let _ = text;
 }

@@ -19,7 +19,7 @@ horizon-theme = { path = "../horizon-theme" }
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 
-[target.'cfg(target_os = "ios")'.dependencies]
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 horizon-gamecontroller = { path = "../horizon-gamecontroller" }
 
 [features]

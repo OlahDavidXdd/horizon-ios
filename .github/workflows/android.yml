@@ -122,7 +122,7 @@ jobs:
 
           ARM64 Android 8+ with Vulkan. Liquid glass refraction requires Android 13+; older versions use a solid material. Import prepared game files from your own copy of Minecraft. This APK contains no Mojang game assets.
 
-          Includes worlds, servers, game-file import/download, resource and shader packs, content mods, settings, screenshots, and Microsoft device-code sign-in. Online sign-in requires Microsoft/Mojang application approval. This is a prerelease; physical-device gameplay and complete iOS feature parity are still being validated.
+          Includes worlds, servers, game-file import/download, resource and shader packs, content mods, settings, screenshots/log sharing, touch-layout editing, a native software-keyboard bridge, Android gamepad input, system clipboard access, and Microsoft device-code sign-in. Online sign-in requires Microsoft/Mojang application approval. This is a prerelease; physical-device gameplay and complete iOS feature parity are still being validated.
           NOTES
           gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.92 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
           gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt

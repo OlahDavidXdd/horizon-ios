@@ -126,3 +126,65 @@ pub extern "system" fn Java_dev_horizon_android_HorizonActivity_controllerRemove
         pads.active = None;
     }
 }
+
+struct Platform {
+    vm: jni::JavaVM,
+    class: jni::objects::GlobalRef,
+}
+static PLATFORM: std::sync::OnceLock<Platform> = std::sync::OnceLock::new();
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_horizon_android_HorizonActivity_initPlatform(
+    env: JNIEnv,
+    class: JClass,
+) {
+    if let (Ok(vm), Ok(class)) = (env.get_java_vm(), env.new_global_ref(class)) {
+        let _ = PLATFORM.set(Platform { vm, class });
+    }
+}
+
+pub(super) fn clipboard_text() -> Option<String> {
+    let platform = PLATFORM.get()?;
+    let mut env = platform.vm.attach_current_thread().ok()?;
+    let class = JClass::from(env.new_local_ref(platform.class.as_obj()).ok()?);
+    let result = env.call_static_method(class, "readClipboard", "()Ljava/lang/String;", &[]);
+    let value = match result {
+        Ok(value) => value.l().ok()?,
+        Err(_) => {
+            let _ = env.exception_clear();
+            return None;
+        }
+    };
+    if value.is_null() {
+        return None;
+    }
+    let text = JString::from(value);
+    let result = env.get_string(&text).ok()?.into();
+    Some(result)
+}
+
+pub(super) fn set_clipboard_text(text: &str) {
+    let Some(platform) = PLATFORM.get() else {
+        return;
+    };
+    let Ok(mut env) = platform.vm.attach_current_thread() else {
+        return;
+    };
+    let Ok(class) = env.new_local_ref(platform.class.as_obj()) else {
+        return;
+    };
+    let Ok(text) = env.new_string(text) else {
+        return;
+    };
+    if env
+        .call_static_method(
+            JClass::from(class),
+            "writeClipboard",
+            "(Ljava/lang/String;)V",
+            &[jni::objects::JValue::Object(&text)],
+        )
+        .is_err()
+    {
+        let _ = env.exception_clear();
+    }
+}

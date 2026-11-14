@@ -20,6 +20,18 @@ public final class HorizonActivity extends NativeActivity {
     private static native long submit(String line);
     private static native String poll(long id);
     private static native void abandon(long id);
+    private static native void initPlatform();
+    private static java.lang.ref.WeakReference<HorizonActivity> current=new java.lang.ref.WeakReference<>(null);
+    public static String readClipboard() {
+        HorizonActivity activity=current.get();if(activity==null)return null;
+        android.content.ClipboardManager clipboard=(android.content.ClipboardManager)activity.getSystemService(CLIPBOARD_SERVICE);
+        ClipData data=clipboard.getPrimaryClip();if(data==null||data.getItemCount()==0)return "";
+        CharSequence text=data.getItemAt(0).coerceToText(activity);return text==null?"":text.toString();
+    }
+    public static void writeClipboard(String text) {
+        HorizonActivity activity=current.get();if(activity==null)return;
+        activity.runOnUiThread(() -> ((android.content.ClipboardManager)activity.getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Horizon",text)));
+    }
     private static native boolean isCovered();
     private static native boolean keyboardWanted();
     private static native void controllerChanged(int device,String name,float[] axes,int buttons);
@@ -70,6 +82,7 @@ public final class HorizonActivity extends NativeActivity {
     };
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        current=new java.lang.ref.WeakReference<>(this);initPlatform();
         accounts = new Accounts(this);
         applyTouchPreferences();
         overlay = new FrameLayout(this);
@@ -132,7 +145,7 @@ public final class HorizonActivity extends NativeActivity {
         addContentView(inputBridge,new ViewGroup.LayoutParams(1,1));
         inputManager=(android.hardware.input.InputManager)getSystemService(INPUT_SERVICE);
         inputManager.registerInputDeviceListener(deviceListener,ui);
-        render(); ui.post(watch);
+        render(); ui.post(watch);checkUpdates();
     }
     int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
     String t(String key) {
@@ -179,7 +192,9 @@ public final class HorizonActivity extends NativeActivity {
         return o;
     }
     void setLauncherVisible(boolean value) {
-        visible = value; overlay.setVisibility(value ? View.VISIBLE : View.GONE);
+        visible = value;
+        setRequestedOrientation(value ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        overlay.setVisibility(value ? View.VISIBLE : View.GONE);
         if (value) render();
     }
     void render() {
@@ -520,7 +535,7 @@ public final class HorizonActivity extends NativeActivity {
         for (String key : keys) ask("options-get " + key, result -> {
             JSONObject options = result.optJSONObject("options"); if (options == null) return;
             JSONObject spec = options.optJSONObject(key); if (spec == null) return;
-            addButton(key + ": " + spec.opt("value"), () -> prompt(key, String.valueOf(spec.opt("value")), value -> ask("options-set " + key + " " + value, v -> gameSettings())));
+            addButton(t(key) + ": " + spec.opt("value"), () -> prompt(key, String.valueOf(spec.opt("value")), value -> ask("options-set " + key + " " + value, v -> gameSettings())));
         });
     }
     private void gallery() {
@@ -556,6 +571,29 @@ public final class HorizonActivity extends NativeActivity {
         }
         return super.dispatchKeyEvent(event);
     }
+    private void checkUpdates() {
+        workers.execute(() -> {
+            try {
+                java.net.HttpURLConnection connection=(java.net.HttpURLConnection)new java.net.URL("https://api.github.com/repos/OlahDavidXdd/horizon-ios/releases?per_page=20").openConnection();
+                connection.setConnectTimeout(15000);connection.setReadTimeout(15000);connection.setRequestProperty("Accept","application/vnd.github+json");
+                JSONArray releases;
+                try(InputStream in=connection.getInputStream()){releases=new JSONArray(new String(readBytes(in),java.nio.charset.StandardCharsets.UTF_8));}
+                finally{connection.disconnect();}
+                int installed=getPackageManager().getPackageInfo(getPackageName(),0).versionCode;
+                for(int i=0;i<releases.length();i++) {
+                    JSONObject release=releases.getJSONObject(i);String tag=release.optString("tag_name");
+                    if(!tag.matches("android-v[0-9.]+-build-[0-9]+"))continue;
+                    int build=Integer.parseInt(tag.substring(tag.lastIndexOf('-')+1));
+                    if(build>installed && !tag.equals(getPreferences(0).getString("offered_update",""))) {
+                        getPreferences(0).edit().putString("offered_update",tag).apply();
+                        runOnUiThread(() -> new AlertDialog.Builder(this).setTitle(t("update_available")).setMessage(tag)
+                            .setPositiveButton(t("view_release"),(d,w) -> startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse("https://github.com/OlahDavidXdd/horizon-ios/releases/tag/"+tag))))
+                            .setNegativeButton(android.R.string.cancel,null).show());
+                    }break;
+                }
+            } catch(Exception ignored) { /* Offline startup must remain usable. */ }
+        });
+    }
     private void share(File file,String type) {
         if(!file.isFile()){error(t("file_unavailable"));return;}
         Uri uri=androidx.core.content.FileProvider.getUriForFile(this,getPackageName()+".files",file);
@@ -570,6 +608,14 @@ public final class HorizonActivity extends NativeActivity {
             ask("launcher-cancel-start " + owner, v -> { launching = false; render(); });
         } else if (!visible) ask("launcher-visible true", v -> setLauncherVisible(true));
         else { tab = "play"; render(); }
+    }
+    @Override protected void onPause() {
+        ui.removeCallbacks(watch);keyboardVisible=false;
+        for(int i=0;i<controllers.size();i++)controllerRemoved(controllers.keyAt(i));controllers.clear();
+        super.onPause();
+    }
+    @Override protected void onResume() {
+        super.onResume();ui.removeCallbacks(watch);if(overlay!=null)ui.post(watch);
     }
     @Override protected void onDestroy() { destroyed = true; if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
 }

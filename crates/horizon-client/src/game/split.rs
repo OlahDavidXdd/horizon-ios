@@ -914,9 +914,9 @@ impl ApplicationHandler for Split<'_> {
                 }
             }
         }
-        // The native iOS controller bridge exposes input only; it has no
-        // rumble output capability yet. Desktop hardware keeps its output.
-        #[cfg(not(target_os = "ios"))]
+        // Mobile controller bridges expose input only; desktop hardware
+        // keeps its rumble output.
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
             self.pads
                 .play_rumbles(&mut self.host.pad, self.p1_pad.owner);

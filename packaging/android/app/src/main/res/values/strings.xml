@@ -112,4 +112,23 @@
     <string name="file_unavailable">This file is not available yet.</string>
     <string name="move_up">Higher Priority</string>
     <string name="move_down">Lower Priority</string>
+    <string name="renderDistance">Render Distance</string>
+    <string name="simulationDistance">Simulation Distance</string>
+    <string name="maxFps">Maximum Framerate</string>
+    <string name="fov">Field of View</string>
+    <string name="gamma">Brightness</string>
+    <string name="guiScale">GUI Scale</string>
+    <string name="particles">Particles</string>
+    <string name="renderClouds">Clouds</string>
+    <string name="entityShadows">Entity Shadows</string>
+    <string name="bobView">View Bobbing</string>
+    <string name="soundCategory_master">Master Volume</string>
+    <string name="soundCategory_music">Music Volume</string>
+    <string name="soundCategory_ambient">Ambient Volume</string>
+    <string name="showSubtitles">Show Subtitles</string>
+    <string name="mouseSensitivity">Look Sensitivity</string>
+    <string name="autoJump">Auto-Jump</string>
+    <string name="invertYMouse">Invert Look</string>
+    <string name="update_available">An Android update is available</string>
+    <string name="view_release">View Release</string>
 </resources>
