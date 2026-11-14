@@ -51,6 +51,7 @@ public final class HorizonActivity extends NativeActivity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     final ExecutorService workers = Executors.newCachedThreadPool();
     private FrameLayout overlay, backdrop;
+    private Dialog launcherWindow;
     private LinearLayout page, navigation;
     private TextView status;
     private boolean destroyed, launching, visible = true;
@@ -117,7 +118,18 @@ public final class HorizonActivity extends NativeActivity {
         glass.addView(navigation, new FrameLayout.LayoutParams(-1, -1));
         shell.addView(glass, new LinearLayout.LayoutParams(-1, dp(54)));
         overlay.addView(shell, new FrameLayout.LayoutParams(-1, -1));
-        addContentView(overlay, new ViewGroup.LayoutParams(-1, -1));
+        // NativeActivity owns its main window surface for Vulkan. A separate
+        // window lets Android render the launcher without sharing that producer.
+        launcherWindow=new Dialog(this,android.R.style.Theme_Material_NoActionBar);
+        launcherWindow.setContentView(overlay);launcherWindow.setCancelable(false);
+        launcherWindow.setOnKeyListener((dialog,key,event) -> {
+            if(key==android.view.KeyEvent.KEYCODE_BACK&&event.getAction()==android.view.KeyEvent.ACTION_UP){onBackPressed();return true;}
+            return false;
+        });
+        launcherWindow.show();
+        launcherWindow.getWindow().setLayout(ViewGroup.LayoutParams.MATCH_PARENT,ViewGroup.LayoutParams.MATCH_PARENT);
+        launcherWindow.getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        launcherWindow.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
         inputBridge = new View(this) {
             @Override public boolean onCheckIsTextEditor() {return true;}
             @Override public android.view.inputmethod.InputConnection onCreateInputConnection(android.view.inputmethod.EditorInfo info) {
@@ -194,8 +206,11 @@ public final class HorizonActivity extends NativeActivity {
     void setLauncherVisible(boolean value) {
         visible = value;
         setRequestedOrientation(value ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
-        overlay.setVisibility(value ? View.VISIBLE : View.GONE);
-        if (value) render();
+        if(value) {
+            overlay.setVisibility(View.VISIBLE);launcherWindow.show();
+            launcherWindow.getWindow().setLayout(ViewGroup.LayoutParams.MATCH_PARENT,ViewGroup.LayoutParams.MATCH_PARENT);
+            render();
+        } else launcherWindow.hide();
     }
     void render() {
         page.removeAllViews(); heading(tab);
@@ -617,5 +632,5 @@ public final class HorizonActivity extends NativeActivity {
     @Override protected void onResume() {
         super.onResume();ui.removeCallbacks(watch);if(overlay!=null)ui.post(watch);
     }
-    @Override protected void onDestroy() { destroyed = true; if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { destroyed = true; if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
 }
