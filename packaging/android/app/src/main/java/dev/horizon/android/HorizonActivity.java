@@ -60,9 +60,11 @@ public final class HorizonActivity extends NativeActivity {
     private ProgressBar setupProgress;
     private boolean needsResources = true, setupBusy, installingResources, automaticSetupAttempted;
     private String setupMessage;
+    private String setupStage;
     private long setupReceived, setupTotal;
     private volatile int setupAttempt;
     private volatile java.net.HttpURLConnection activeDownload;
+    private volatile android.os.CancellationSignal activePartsRead;
     private volatile boolean destroyed;
     private boolean launching, visible = true;
     private String tab = "play", importKind = "resources", phase = "unknown";
@@ -564,8 +566,94 @@ public final class HorizonActivity extends NativeActivity {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE);
         startActivityForResult(intent, 10);
     }
+    private void pickDriveParts() {
+        if(setupBusy) return;
+        Toast.makeText(this,t("select_drive_parts"),Toast.LENGTH_LONG).show();
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*")
+            .addCategory(Intent.CATEGORY_OPENABLE).putExtra(Intent.EXTRA_ALLOW_MULTIPLE,true);
+        startActivityForResult(intent,11);
+    }
+    private static final class UriPart {
+        final Uri uri; final long size;
+        UriPart(Uri uri,long size) { this.uri=uri; this.size=size; }
+    }
+    private void installDriveParts(Intent selection) {
+        if(setupBusy) return;
+        ArrayList<Uri> uris = new ArrayList<>();
+        ClipData clip = selection.getClipData();
+        if(clip != null) for(int i=0;i<clip.getItemCount();i++) uris.add(clip.getItemAt(i).getUri());
+        else if(selection.getData() != null) uris.add(selection.getData());
+        if(uris.size() != ResourceVolumes.PARTS) { error(t("select_drive_parts")); return; }
+        int attempt = beginSetup(false); setupStage="downloading_parts"; updateSetupProgress();
+        workers.execute(() -> {
+            File directory = null, zip = null;
+            try {
+                if(homeDir().getUsableSpace() < 3L*1024*1024*1024) throw new IOException("Archive parts need space");
+                UriPart[] selected = new UriPart[ResourceVolumes.PARTS]; String base = null;
+                long total = 0; boolean known = true;
+                for(Uri uri : uris) {
+                    String name = null; long size = -1;
+                    if(uri == null || !"content".equals(uri.getScheme())) throw new IOException("Invalid archive parts URI");
+                    try(android.database.Cursor cursor = getContentResolver().query(uri,new String[]{android.provider.OpenableColumns.DISPLAY_NAME,android.provider.OpenableColumns.SIZE},null,null,null)) {
+                        if(cursor != null && cursor.moveToFirst()) {
+                            int names = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME), sizes = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE);
+                            if(names >= 0) name = cursor.getString(names);
+                            if(sizes >= 0 && !cursor.isNull(sizes)) size = cursor.getLong(sizes);
+                        }
+                    }
+                    if(name == null) throw new IOException("Archive parts have no file name");
+                    int index = ResourceVolumes.partNumber(name);
+                    String prefix = name.substring(0,name.length()-3);
+                    if(selected[index] != null || (base != null && !base.equalsIgnoreCase(prefix))) throw new IOException("Mixed or duplicate archive parts");
+                    base = prefix; selected[index] = new UriPart(uri,size);
+                    if(size > ResourceVolumes.PART_LIMIT) throw new IOException("Oversized archive parts");
+                    if(size <= 0) known = false; else total += size;
+                }
+                for(UriPart part : selected) if(part == null) throw new IOException("Missing archive parts");
+                long expected = known ? total : -1;
+                File staging = new File(homeDir(),".horizon-import");
+                directory = new File(staging,"drive-parts-"+UUID.randomUUID());
+                if(!directory.mkdirs()) throw new IOException("Cannot create archive parts folder");
+                File[] parts = new File[ResourceVolumes.PARTS]; long received = 0, lastUpdate = 0;
+                for(int i=0;i<parts.length;i++) {
+                    if(destroyed || attempt != setupAttempt) throw new InterruptedIOException();
+                    parts[i] = new File(directory,"part-"+i);
+                    android.os.CancellationSignal signal = new android.os.CancellationSignal(); activePartsRead=signal;
+                    if(destroyed || attempt != setupAttempt) signal.cancel();
+                    try(android.content.res.AssetFileDescriptor asset = getContentResolver().openAssetFileDescriptor(selected[i].uri,"r",signal)) {
+                        if(asset == null) throw new IOException("Cannot read archive parts");
+                        try(InputStream in = asset.createInputStream(); OutputStream out = new FileOutputStream(parts[i])) {
+                            byte[] buffer = new byte[65536]; int count; long partBytes = 0;
+                            while((count = in.read(buffer)) != -1) {
+                                if(destroyed || attempt != setupAttempt) throw new InterruptedIOException();
+                                partBytes += count; received += count;
+                                if(partBytes > ResourceVolumes.PART_LIMIT) throw new IOException("Oversized archive parts");
+                                out.write(buffer,0,count);
+                                long now = SystemClock.uptimeMillis();
+                                if(now-lastUpdate >= 200) {
+                                    lastUpdate=now; long progress=received;
+                                    ui.post(() -> { if(attempt == setupAttempt) { setupReceived=progress; setupTotal=expected; updateSetupProgress(); } });
+                                }
+                            }
+                            if(selected[i].size > 0 && partBytes != selected[i].size) throw new IOException("Incomplete archive parts download");
+                        }
+                    } finally { if(activePartsRead == signal) activePartsRead=null; }
+                }
+                ui.post(() -> { if(attempt == setupAttempt) { installingResources=true; setupStage="assembling_parts"; render(); } });
+                zip = new File(staging,"import-"+UUID.randomUUID()+".zip");
+                try(OutputStream out = new FileOutputStream(zip)) { ResourceVolumes.extract(parts,out); }
+                if(destroyed || attempt != setupAttempt) throw new InterruptedIOException();
+                installResourceArchive(zip,attempt); zip=null; // Import now owns the reconstructed ZIP.
+            } catch(Exception failure) { ui.post(() -> finishSetup(attempt,"Archive parts: "+failure)); }
+            finally {
+                if(zip != null) zip.delete();
+                if(directory != null) { File[] files=directory.listFiles(); if(files != null) for(File file : files) file.delete(); directory.delete(); }
+            }
+        });
+    }
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if(request == 11 && result == RESULT_OK && data != null) { installDriveParts(data); return; }
         if (request != 10 || result != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData(); String kind = importKind;
         if (setupBusy) return;
@@ -609,6 +697,7 @@ public final class HorizonActivity extends NativeActivity {
     }
     private void settings() {
         addButton("import_resources", () -> pick("resources"));
+        addButton("install_drive_parts", this::pickDriveParts);
         addButton("download_files", this::requestDownloadSource);
         addButton("use_download_link", this::customResourceLink);
         addButton("offline_name", () -> prompt("offline_name", "", name -> {
@@ -634,7 +723,7 @@ public final class HorizonActivity extends NativeActivity {
         transparency.setChecked(getPreferences(0).getBoolean("reduce_transparency",false));
         transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); refreshNavigation(); });
         page.addView(transparency);
-        page.addView(label("Horizon · 0.2.98-android · ARM64",14));
+        page.addView(label("Horizon · 0.2.99-android · ARM64",14));
     }
     static byte[] readBytes(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -663,6 +752,7 @@ public final class HorizonActivity extends NativeActivity {
             primary(download);
             Button privateDownload = button("private_download", this::openPrivateDownload);
             box.addView(download, new LinearLayout.LayoutParams(-1, dp(49)));
+            box.addView(button("install_drive_parts", this::pickDriveParts), new LinearLayout.LayoutParams(-1, dp(49)));
             box.addView(privateDownload, new LinearLayout.LayoutParams(-1, dp(49)));
             Button choose = button("import_resources", () -> pick("resources"));
             LinearLayout.LayoutParams bounds = new LinearLayout.LayoutParams(-1, -2); bounds.setMargins(0, dp(9), 0, 0); box.addView(choose, bounds);
@@ -672,7 +762,7 @@ public final class HorizonActivity extends NativeActivity {
     }
     private void updateSetupProgress() {
         if(setupDescription != null) {
-            String text = setupBusy ? t(installingResources ? "installing_files" : "downloading") : setupMessage == null ? t("setup_explanation") : setupMessage;
+            String text = setupBusy ? t(setupStage != null ? setupStage : installingResources ? "installing_files" : "downloading") : setupMessage == null ? t("setup_explanation") : setupMessage;
             if(setupBusy && !installingResources && setupReceived > 0) {
                 text += "\n" + (setupReceived / 1048576) + " MB";
                 if(setupTotal > 0) text += " / " + (setupTotal / 1048576) + " MB";
@@ -689,13 +779,13 @@ public final class HorizonActivity extends NativeActivity {
     private int beginSetup(boolean installing) {
         automaticSetupAttempted = true;
         launcherWindow.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        setupBusy = true; installingResources = installing; setupMessage = null; setupReceived = 0; setupTotal = 0;
+        setupBusy = true; installingResources = installing; setupMessage = null; setupStage = null; setupReceived = 0; setupTotal = 0;
         int attempt = ++setupAttempt; render(); return attempt;
     }
     private void finishSetup(int attempt, String failure) {
         if(attempt != setupAttempt || destroyed) return;
         launcherWindow.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        setupBusy = false; installingResources = false;
+        setupBusy = false; installingResources = false; setupStage = null;
         if(failure != null || !hasGameFiles()) {
             android.util.Log.w("HorizonSetup", "Game-files setup failed: " + failure);
             needsResources = true;
@@ -703,7 +793,9 @@ public final class HorizonActivity extends NativeActivity {
             String key = reason.contains("incomplete resource") ? "incomplete_resources"
                 : reason.contains("http ") ? "download_server_error"
                 : reason.contains("html") ? "download_sign_in"
+                : reason.contains("parts need space") ? "parts_no_space"
                 : reason.contains("space") || reason.contains("enospc") ? "download_no_space"
+                : reason.contains("archive parts") ? "parts_failed"
                 : reason.contains("timeout") || reason.contains("unknownhost") || reason.contains("connect") ? "download_connection_error"
                 : "setup_failed";
             setupMessage = t(key);
@@ -713,7 +805,8 @@ public final class HorizonActivity extends NativeActivity {
     private void cancelResourceDownload() {
         if(installingResources) return;
         launcherWindow.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        ++setupAttempt; setupBusy = false; setupMessage = null;
+        ++setupAttempt; setupBusy = false; setupMessage = null; setupStage = null;
+        android.os.CancellationSignal read = activePartsRead; if(read != null) read.cancel();
         java.net.HttpURLConnection connection = activeDownload;
         activeDownload = null; if(connection != null) workers.execute(connection::disconnect);
         render();
@@ -791,7 +884,7 @@ public final class HorizonActivity extends NativeActivity {
         if(destroyed) { closeResourceArchive(source,zip); return; }
         ui.post(() -> {
             if(destroyed || attempt != setupAttempt) { closeResourceArchive(source,zip); return; }
-            installingResources = true; render();
+            installingResources = true; setupStage = null; render();
             request("import-game-files " + zip.getAbsolutePath(), result -> workers.execute(() -> {
                 String failure = null;
                 try {
@@ -1081,5 +1174,5 @@ public final class HorizonActivity extends NativeActivity {
     private void cancelGlassGesture() {
         if(glassNavigation != null && glassNavigationReady) glassNavigation.evaluateJavascript("window.horizonNav && window.horizonNav.suspend()",null);
     }
-    @Override protected void onDestroy() { destroyed = true; if(glassNavigation != null) { glassNavigation.removeJavascriptInterface("HorizonNav"); navigationDock.removeView(glassNavigation); glassNavigation.destroy(); glassNavigation=null; } if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { destroyed = true; if(activePartsRead != null)activePartsRead.cancel(); if(glassNavigation != null) { glassNavigation.removeJavascriptInterface("HorizonNav"); navigationDock.removeView(glassNavigation); glassNavigation.destroy(); glassNavigation=null; } if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
 }

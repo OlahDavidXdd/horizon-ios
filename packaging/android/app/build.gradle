@@ -7,7 +7,7 @@ android {
         minSdk 26
         targetSdk 35
         versionCode Integer.parseInt(System.getenv('HORIZON_ANDROID_BUILD') ?: '2')
-        versionName '0.2.98-android'
+        versionName '0.2.99-android'
         ndk { abiFilters 'arm64-v8a' }
     }
     signingConfigs {
@@ -20,8 +20,31 @@ android {
     }
     buildTypes { release { signingConfig signingConfigs.release; minifyEnabled false } }
     compileOptions { sourceCompatibility JavaVersion.VERSION_21; targetCompatibility JavaVersion.VERSION_21 }
-    packaging { jniLibs { useLegacyPackaging = true } }
+    packaging {
+        jniLibs { useLegacyPackaging = true }
+        // Individual upstream licenses/notices are retained under assets/archive-libraries/.
+        resources.excludes += ['META-INF/LICENSE.txt','META-INF/NOTICE.txt','META-INF/DEPENDENCIES']
+    }
 }
 dependencies {
     implementation 'androidx.core:core:1.16.0'
+    implementation 'org.apache.commons:commons-compress:1.28.0'
+    implementation 'org.tukaani:xz:1.10'
+}
+tasks.register('testResourceVolumeAssembly') {
+    group = 'verification'
+    doLast {
+        def output = layout.buildDirectory.dir('resource-volume-tests').get().asFile
+        output.mkdirs()
+        def runtime = configurations.releaseRuntimeClasspath.files.findAll { it.name.endsWith('.jar') }.collect { it.absolutePath }.join(File.pathSeparator)
+        def javaBin = new File(System.getProperty('java.home'), 'bin')
+        exec {
+            commandLine new File(javaBin,'javac'), '-classpath', runtime, '-d', output,
+                'src/main/java/dev/horizon/android/ResourceVolumes.java', '../tests/ResourceVolumesTest.java'
+        }
+        exec {
+            commandLine new File(javaBin,'java'), '-classpath', output.toString()+File.pathSeparator+runtime,
+                'dev.horizon.android.ResourceVolumesTest'
+        }
+    }
 }

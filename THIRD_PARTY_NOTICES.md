@@ -436,3 +436,7 @@ https://github.com/zakisheriff/Liquid-Glass (MIT, copyright 2026 Zaki Sheriff),
 with React and React DOM 19.2.0 (MIT, Meta Platforms). Full upstream notices and
 licenses are packaged in `assets/glass-nav/`. Source integration and build
 instructions are in `packaging/android/glass-nav/README.md`.
+
+## Android private archive assembly
+
+The Android launcher uses Apache Commons Compress 1.28.0, Commons IO 2.20.0, Commons Lang 3.18.0 and Commons Codec 1.19.0 (Apache-2.0), and XZ for Java 1.10 (0BSD) to assemble the owner’s five private Drive volumes. Complete upstream licenses and notices are packaged in `assets/archive-libraries/`. XZ’s COPYING comes from https://github.com/tukaani-project/xz-java/tree/v1.10. No Minecraft assets are packaged in the APK.

@@ -130,7 +130,7 @@ jobs:
             echo "::add-mask::$HORIZON_KEYSTORE_PASSWORD"
             keytool -genkeypair -keystore "$HORIZON_KEYSTORE" -alias horizon -keyalg RSA -keysize 2048 -validity 10000 -storepass:env HORIZON_KEYSTORE_PASSWORD -keypass:env HORIZON_KEYSTORE_PASSWORD -dname 'CN=Horizon Android Development'
           fi
-          gradle -p packaging/android --no-daemon assembleRelease lintRelease
+          gradle -p packaging/android --no-daemon assembleRelease lintRelease :app:testResourceVolumeAssembly
           cp packaging/android/app/build/outputs/apk/release/app-release.apk Horizon-Android.apk
           tools=$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
           "$tools/apksigner" verify --verbose Horizon-Android.apk
@@ -167,15 +167,13 @@ jobs:
           set -euo pipefail
           test "$(cat source-commit.txt)" = "$GITHUB_SHA"
           sha256sum --check Horizon-Android.apk.sha256
-          tag="android-v0.2.98-build-${GITHUB_RUN_NUMBER}"
+          tag="android-v0.2.99-build-${GITHUB_RUN_NUMBER}"
           cat > notes.md <<'NOTES'
-          Fixes native import recovery: an interrupted extraction is no longer promoted just because its staging folder exists. A completion record outside the ZIP's tree is required, and Android checks font, atlas, block-state and model files before publication. Uncommitted staging is discarded; a previous install is restored when available.
+          Adds installation directly from the owner's five private Google Drive parts. Choose Install from Google Drive Parts, open Drive in the file picker, long-press .001 and select .002 through .005. Horizon downloads the selected files, assembles and SHA-256 checks the prepared ZIP, then imports it. ZArchiver and public file sharing are not needed. Cached parts in Downloads also work. Keep at least 3 GB free.
 
-          Removes the Java post-publication repair from 0.2.97. The engine can begin loading immediately after native import, so all writes now finish in the native transaction. Android's post-import check is read-only.
+          Keeps the original iOS automatic download source, custom HTTPS links and normal ZIP import. The Drive route provides an in-launcher alternative when the original server is unavailable. The desktop launcher prepares raw Mojang files locally; it does not expose a separate ready-to-import ZIP source.
 
-          Restores the same automatic download/import commands used by the iOS launcher. The upstream CDN may still be unavailable; retry, custom HTTPS and prepared ZIP import remain available. Existing incomplete installs must reimport Horizon-26.3.zip from Downloads.
-
-          Routes Android MotionEvents directly to the requested Liquid-Glass component so WebView scroll/zoom arbitration cannot swallow drags. Share Logs includes recent native process-exit traces when Android makes them available.
+          Reuses the verified 0.2.98 engine with atomic resource publication and incomplete-import recovery. Retains the native touch route for the glass pill and system crash-trace export. Apache Commons Compress and XZ notices are bundled. No Minecraft assets or account credentials are bundled in this public APK; the Drive files remain private.
 
           Builds without repository signing secrets use a development key: back up saves before replacing an existing installation.
 
@@ -185,6 +183,6 @@ jobs:
 
           Includes worlds, servers, game-file import/download, resource and shader packs, content mods, settings, screenshots/log sharing, touch-layout editing, a native software-keyboard bridge, Android gamepad input, system clipboard access, and Microsoft device-code sign-in. Online sign-in requires Microsoft/Mojang application approval. This is a prerelease; physical-device gameplay and complete iOS feature parity are still being validated.
           NOTES
-          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.98 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
+          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.99 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
           gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt native-source-commit.txt
           gh release edit "$tag" --draft=false
