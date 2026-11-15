@@ -140,7 +140,7 @@
     <string name="installing_files">Installing game files…</string>
     <string name="server_unreachable">Unavailable</string>
     <string name="navigation">Navigation</string>
-    <string name="incomplete_resources">Game files are incomplete: font or texture definitions are missing. Import the full Horizon-26.3.zip again. Horizon will verify and restore missing files before enabling Play.</string>
+    <string name="incomplete_resources">Game files are incomplete: font or texture definitions are missing. Import the full Horizon-26.3.zip again. Horizon verifies the extracted files before enabling Play.</string>
     <string name="private_download">Open Private Game Files Download</string>
     <string name="private_download_help">Sign in to your ChatGPT account in the browser, download Horizon-26.3.zip, then return and choose Import Game Files ZIP. Keep at least 2 GB free. Android grants access when you select the ZIP; no storage permission prompt is needed.</string>
     <string name="browser_unavailable">Install a browser to open the private download page.</string>

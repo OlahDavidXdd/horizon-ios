@@ -35,7 +35,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - name: Test resource import recovery
+      - name: Test resource preflight and read-only verification
         run: |
           mkdir -p "$RUNNER_TEMP/resource-tests"
           javac -d "$RUNNER_TEMP/resource-tests" packaging/android/app/src/main/java/dev/horizon/android/PreparedResources.java packaging/android/tests/PreparedResourcesTest.java
@@ -47,6 +47,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.ANDROID_TARGET }}
+      - name: Test interrupted native imports
+        run: |
+          rustc --edition=2024 --test packaging/android/tests/import_transaction.rs -o "$RUNNER_TEMP/import-transaction-tests"
+          "$RUNNER_TEMP/import-transaction-tests"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/horizon-android
@@ -163,13 +167,15 @@ jobs:
           set -euo pipefail
           test "$(cat source-commit.txt)" = "$GITHUB_SHA"
           sha256sum --check Horizon-Android.apk.sha256
-          tag="android-v0.2.97-build-${GITHUB_RUN_NUMBER}"
+          tag="android-v0.2.98-build-${GITHUB_RUN_NUMBER}"
           cat > notes.md <<'NOTES'
-          Repairs incomplete game-file imports where PNG textures exist but font, atlas, block-state and model definitions are missing. The launcher validates the source ZIP before import, keeps it open while native import runs, then checks the published folder and restores missing or truncated entries with CRC verification. Play stays disabled until verification completes.
+          Fixes native import recovery: an interrupted extraction is no longer promoted just because its staging folder exists. A completion record outside the ZIP's tree is required, and Android checks font, atlas, block-state and model files before publication. Uncommitted staging is discarded; a previous install is restored when available.
 
-          Existing incomplete installations must reimport the original Horizon-26.3.zip from Downloads. The ZIP does not need to be downloaded again. Malformed or incomplete archives are rejected before replacing existing game files. The launcher now checks the core font/model files instead of relying only on horizon-resources.json.
+          Removes the Java post-publication repair from 0.2.97. The engine can begin loading immediately after native import, so all writes now finish in the native transaction. Android's post-import check is read-only.
 
-          Retains the interrupted glass-drag recovery from 0.2.96. Share Logs reports how many files were restored. Game assets are not bundled in the public APK.
+          Restores the same automatic download/import commands used by the iOS launcher. The upstream CDN may still be unavailable; retry, custom HTTPS and prepared ZIP import remain available. Existing incomplete installs must reimport Horizon-26.3.zip from Downloads.
+
+          Routes Android MotionEvents directly to the requested Liquid-Glass component so WebView scroll/zoom arbitration cannot swallow drags. Share Logs includes recent native process-exit traces when Android makes them available.
 
           Builds without repository signing secrets use a development key: back up saves before replacing an existing installation.
 
@@ -179,6 +185,6 @@ jobs:
 
           Includes worlds, servers, game-file import/download, resource and shader packs, content mods, settings, screenshots/log sharing, touch-layout editing, a native software-keyboard bridge, Android gamepad input, system clipboard access, and Microsoft device-code sign-in. Online sign-in requires Microsoft/Mojang application approval. This is a prerelease; physical-device gameplay and complete iOS feature parity are still being validated.
           NOTES
-          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.97 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
+          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.98 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
           gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt native-source-commit.txt
           gh release edit "$tag" --draft=false

@@ -16,3 +16,5 @@ range-checked `select(index)`. Native tab changes and translated labels update
 the component. The bar refracts a capture of the native gradient behind its dock;
 no account data, page text, or game controls enter the WebView. A renderer failure
 falls back to native navigation. Reduce Transparency disables refraction.
+
+Android owns the MotionEvent stream and forwards normalized coordinates into the bundled component. WebView gesture arbitration is bypassed for the dock; keyboard/accessibility tab actions still use GlassNav. The lifted lens edges accept a press, and lifecycle cancellation clears unfinished drags.

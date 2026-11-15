@@ -67,6 +67,34 @@ test('bundled GlassNav selects native tabs, accepts native updates, and drags it
     await touch('touchMove',from.x+from.width/2,from.y+from.height/2);
     await touch('touchEnd');
     await page.waitForFunction(()=>window.events.includes(2));
+    // Android's native MotionEvent bridge bypasses WebView gesture arbitration.
+    await page.evaluate(()=> {
+      window.events=[];
+      const tabs=[...document.querySelectorAll('#root > .lg-track > [data-lg-item]')];
+      window.nativePoint=i=>{const b=tabs[i].getBoundingClientRect();return[(b.x+b.width/2)/innerWidth,(b.y+b.height/2)/innerHeight];};
+      window.horizonNav.touch('down',...window.nativePoint(2));
+    });
+    await page.waitForTimeout(200);
+    const nativeStart=(await lens.boundingBox()).x;
+    await page.evaluate(()=>window.horizonNav.touch('move',...window.nativePoint(0)));
+    await page.waitForTimeout(200);
+    assert.ok((await lens.boundingBox()).x<nativeStart-100,'native input must move the pill while the finger is held');
+    assert.deepEqual(await page.evaluate(()=>window.events),[],'native drag commits its page only on release');
+    await page.evaluate(()=>window.horizonNav.touch('up',...window.nativePoint(0)));
+    await page.waitForFunction(()=>window.events.includes(0));
+    await page.evaluate(()=> {
+      const b=document.querySelector('#root > .lg-track > [data-lg-item="0"]').getBoundingClientRect();
+      window.horizonNav.touch('down',(b.x+b.width/2)/innerWidth,(b.y+b.height/2)/innerHeight);
+      window.horizonNav.suspend();
+    });
+    await page.evaluate(()=> {
+      const bar=document.querySelector('#root > .lg-track').getBoundingClientRect();
+      const tab=document.querySelector('#root > .lg-track > [data-lg-item="2"]').getBoundingClientRect();
+      window.horizonNav.touch('down',(bar.left+10)/innerWidth,(bar.top-6)/innerHeight);
+      window.horizonNav.touch('move',(tab.x+tab.width/2)/innerWidth,(tab.y+tab.height/2)/innerHeight);
+      window.horizonNav.touch('up',(tab.x+tab.width/2)/innerWidth,(tab.y+tab.height/2)/innerHeight);
+    });
+    await page.waitForFunction(()=>window.events.includes(2));
     await page.evaluate(()=>window.horizonNav.configure({index:1,labels:['Jouer','Packs','Réglages'],reduced:true}));
     await page.waitForFunction(()=>document.documentElement.classList.contains('reduced'));
     assert.equal(await page.getByRole('tab',{name:'Jouer',exact:true}).count(),1);

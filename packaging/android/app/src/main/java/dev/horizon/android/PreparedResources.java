@@ -1,11 +1,10 @@
 package dev.horizon.android;
 
 import java.io.*;
-import java.nio.file.*;
 import java.util.*;
 import java.util.zip.*;
 
-/** Keep the source archive open across native import, then verify the published tree. */
+/** Preflight the source ZIP; only the native importer writes or publishes game files. */
 final class PreparedResources implements AutoCloseable {
     private static final long LIMIT = 4L << 30;
     private static final String MARKER = "horizon-resources.json";
@@ -63,41 +62,28 @@ final class PreparedResources implements AutoCloseable {
             File file = new File(root,path);
             if(!file.isFile() || file.length() == 0) return false;
         }
-        return true;
+        // Native writes this only after the whole extraction and its checks finish.
+        File seal = new File(root,".horizon-import-verified");
+        byte[] expected = "horizon-resource-import-v1\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        if(seal.length() != expected.length) return false;
+        try(InputStream in = new FileInputStream(seal)) {
+            for(byte value : expected) if(in.read() != (value & 255)) return false;
+            return in.read() == -1;
+        } catch(IOException missing) { return false; }
     }
 
-    /** Native import has finished and the launcher keeps Play disabled until this returns. */
-    int restoreMissing(File root) throws IOException {
-        if(!root.isDirectory() || Files.isSymbolicLink(root.toPath())) throw new IOException("Missing resource destination");
+    /** Read-only check: the engine can reload the native publication immediately. */
+    int verifyPublished(File root) throws IOException {
         String base = root.getCanonicalPath() + File.separator;
-        int repaired = 0;
+        int checked = 0;
         for(Map.Entry<String,ZipEntry> item : files.entrySet()) {
-            if(Thread.currentThread().isInterrupted()) throw new InterruptedIOException();
             File file = new File(root,item.getKey());
             if(!file.getCanonicalPath().startsWith(base)) throw new IOException("Resource destination escapes root");
-            ZipEntry entry = item.getValue();
-            if(file.isFile() && file.length() == entry.getSize()) continue;
-            File parent = file.getParentFile();
-            if(!parent.isDirectory() && !parent.mkdirs()) throw new IOException("Cannot create resource folder");
-            File temp = File.createTempFile(".resource-", ".tmp",parent);
-            try {
-                CRC32 crc = new CRC32(); long count = 0;
-                try(InputStream in = archive.getInputStream(entry); OutputStream out = new FileOutputStream(temp)) {
-                    byte[] buffer = new byte[65536]; int n;
-                    while((n = in.read(buffer)) != -1) {
-                        count += n;
-                        if(count > entry.getSize()) throw new IOException("Resource entry exceeds declared size");
-                        out.write(buffer,0,n); crc.update(buffer,0,n);
-                    }
-                }
-                if(count != entry.getSize() || crc.getValue() != entry.getCrc()) throw new IOException("Resource ZIP checksum mismatch");
-                try { Files.move(temp.toPath(),file.toPath(),StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.ATOMIC_MOVE); }
-                catch(AtomicMoveNotSupportedException ignored) { Files.move(temp.toPath(),file.toPath(),StandardCopyOption.REPLACE_EXISTING); }
-                repaired++;
-            } finally { temp.delete(); }
+            if(!file.isFile() || file.length() != item.getValue().getSize()) throw new IOException("Incomplete resource folder: missing or truncated " + item.getKey());
+            checked++;
         }
         if(!complete(root)) throw new IOException("Incomplete resource folder after import");
-        return repaired;
+        return checked;
     }
 
     @Override public void close() throws IOException { archive.close(); }

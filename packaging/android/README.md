@@ -24,7 +24,7 @@ licenses are embedded in the APK. See [glass-nav/README.md](glass-nav/README.md)
 for build instructions. Reduce Transparency applies immediately. If the web
 renderer fails, native navigation remains available. Interrupted gestures are canceled on activity pause/resume, launcher visibility changes, lost capture, and a fresh pointer-down. Long presses suppress Android context menus and retain the touch stream for lens dragging.
 
-Game-file setup opens an owner-private download page in the system browser. Sign in, save the prepared ZIP, and select it with Import Game Files ZIP. No broad storage permission is needed: downloads/import staging use app-private storage, and the system picker grants access to the chosen file. Custom HTTPS direct links still download inside the app; Retry reuses the saved link.
+Game-file setup tries the same automatic source used by iOS. ZIP import and an owner-private browser download remain available when that source fails. No broad storage permission is needed: downloads/import staging use app-private storage, and the system picker grants access to the chosen file. Custom HTTPS direct links still download inside the app; Retry reuses the saved link.
 
 This is a developing Android port, **not yet verified as a complete 1:1 replacement
 for the SwiftUI launcher**. iOS-specific features (AirPlay, UIKit gesture recognizers,
@@ -76,4 +76,8 @@ the port releases it and creates a new surface when the activity resumes.
 
 Share Logs includes file fingerprints for the prepared fonts and representative block resources, selected rendering options, Android/WebView versions and the start and last 256 KiB of the engine log. It does not attach game assets, saves or account files. Base-file mismatches are diagnostic evidence; custom packs can override the checked resources.
 
-Resource imports are preflighted for the core font, atlas, block-state and model files. The Java launcher retains a ZipFile handle across native import (which unlinks its input), then restores any missing/truncated entries in the published resources tree with CRC-32 verification. Play remains disabled throughout. No additional copy of the source ZIP is needed. Share Logs records the repair count. Host regression tests cover the PNG-only failure, source unlink, incomplete archives and path traversal.
+Resource imports use the same native checked importer as iOS. Android preflights the ZIP, then verifies the publication without writing to files the engine may already be loading. Native import writes an external completion marker only after extraction and required Android font/model checks, and seals the published tree so the Android engine and launcher reject older unverified installations. Recovery discards uncommitted staging folders and restores the previous tree when available. No Java repair runs after publication.
+
+First launch asks the shared `game-files-source` command for the automatic URL, as SwiftUI GameFilesDownload does. Download failure offers retry, a custom HTTPS source and ZIP import. The native source currently names `https://cdn.gayfeet.lol/horizon/26.3.zip`; its reachability is independent of Android versus iOS.
+
+Android MotionEvents are forwarded directly to the bundled GlassNav using normalized coordinates. Android retains the touch stream, including release/cancel, rather than asking WebView to recognize a drag. Diagnostics include bounded native process-exit traces when Android provides them. Native protobuf tombstones are preserved as binary attachments in a diagnostic ZIP, alongside the readable report.

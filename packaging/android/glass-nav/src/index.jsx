@@ -4,8 +4,10 @@ import {GlassNav} from '@zakisheriff/liquid-glass';
 import '@zakisheriff/liquid-glass/styles.css';
 import './nav.css';
 import {guardGestures} from './gesture-guard';
+import {nativeTouch} from './native-touch';
 
 const cancelGesture = guardGestures(document.getElementById('root'));
+const routeNativeTouch = nativeTouch(document.getElementById('root'), cancelGesture);
 
 const paths = [
   'M8 5 L19 12 L8 19 Z',
@@ -16,7 +18,8 @@ function App() {
   const [state, setState] = useState({index: 0, labels: ['Play', 'Packs', 'Settings'], reduced: false});
   useEffect(() => {
     window.horizonNav = {
-      suspend: cancelGesture,
+      suspend() { routeNativeTouch('cancel', 0, 0); },
+      touch: routeNativeTouch,
       configure(next) {
         if (!Number.isInteger(next.index) || next.index < 0 || next.index > 2) return;
         if (!Array.isArray(next.labels) || next.labels.length !== 3 || !next.labels.every(x => typeof x === 'string')) return;

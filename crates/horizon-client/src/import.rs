@@ -15,6 +15,7 @@
 pub mod download;
 pub mod http;
 pub mod screen;
+mod transaction;
 
 use std::{
     collections::BTreeMap,
@@ -286,7 +287,10 @@ pub struct Installed {
 /// dotfolder iOS neither shows nor lets a player create. A desktop is not asked (`home` is `None`)
 /// because a `resources` folder under its working directory means something else there.
 pub fn resources_root(sibling: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    let has = |dir: &Path| dir.join(Kind::Resources.marker()).exists();
+    let has = |dir: &Path| {
+        dir.join(Kind::Resources.marker()).exists()
+            && (!cfg!(target_os = "android") || transaction::published_ready(dir))
+    };
     if has(sibling) {
         return Some(sibling.to_owned());
     }
@@ -640,11 +644,12 @@ impl Pack {
                     (dest, files, bytes)
                 }
                 Kind::Resources => {
-                    let scratch = home.join("resources.unpacking");
-                    let _ = fs::remove_dir_all(&scratch);
+                    let scratch = transaction::begin(home)?;
                     let (files, bytes) = self.unpack(&scratch, &mut report_progress)?;
+                    transaction::mark_ready(home, cfg!(target_os = "android"))?;
                     let dest = home.join(folder);
                     publish(&scratch, &dest)?;
+                    transaction::clear_ready(home);
                     fs::remove_file(&archive)?;
                     (dest, files, bytes)
                 }
@@ -690,23 +695,11 @@ pub fn recover(home: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     with_home_access(home, || {
-        let scratch = home.join("resources.unpacking");
-        let dest = home.join(Kind::Resources.folder());
-        let previous = home.join("resources.previous");
-        if scratch.is_dir() && !dest.exists() {
-            fs::rename(&scratch, &dest)?;
-            horizon_core::prepared_files::invalidate(&dest);
-            return Ok(Some(dest));
+        let recovered = transaction::recover(home, cfg!(target_os = "android"))?;
+        if let Some(dest) = &recovered {
+            horizon_core::prepared_files::invalidate(dest);
         }
-        if !dest.exists() && previous.is_dir() {
-            fs::rename(&previous, &dest)?;
-            horizon_core::prepared_files::invalidate(&dest);
-            return Ok(Some(dest));
-        }
-        // Both landed: the new tree is in place, so what is left over is scratch and the old copy.
-        let _ = fs::remove_dir_all(&scratch);
-        let _ = fs::remove_dir_all(&previous);
-        Ok(None)
+        Ok(recovered)
     })
 }
 
@@ -1069,6 +1062,7 @@ mod tests {
                 entered.send(()).unwrap();
                 release_rx.recv().unwrap();
                 fs::write(scratch.join("complete.txt"), "complete")?;
+                transaction::mark_ready(&writer_home, false)?;
                 Ok(())
             })
             .map_err(|e| e.to_string())
@@ -1703,6 +1697,7 @@ mod tests {
             "{}",
         )
         .unwrap();
+        transaction::mark_ready(&home, false).unwrap();
         assert_eq!(recover(&home).unwrap(), Some(home.join("resources")));
         assert!(home.join("resources/horizon-resources.json").is_file());
         fs::remove_dir_all(home).unwrap();

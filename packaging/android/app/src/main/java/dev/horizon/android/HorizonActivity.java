@@ -55,6 +55,7 @@ public final class HorizonActivity extends NativeActivity {
     private FrameLayout navigationDock;
     private android.webkit.WebView glassNavigation;
     private boolean glassNavigationReady;
+    private long lastGlassMove;
     private TextView status, setupDescription;
     private ProgressBar setupProgress;
     private boolean needsResources = true, setupBusy, installingResources, automaticSetupAttempted;
@@ -62,7 +63,6 @@ public final class HorizonActivity extends NativeActivity {
     private long setupReceived, setupTotal;
     private volatile int setupAttempt;
     private volatile java.net.HttpURLConnection activeDownload;
-    private volatile PreparedResources resourceArchive;
     private volatile boolean destroyed;
     private boolean launching, visible = true;
     private String tab = "play", importKind = "resources", phase = "unknown";
@@ -95,7 +95,8 @@ public final class HorizonActivity extends NativeActivity {
                         && !state.optBoolean("importing") && state.optJSONObject("import") == null
                         && "waiting".equals(phase)) {
                     automaticSetupAttempted = true;
-                    setupMessage = resourceSetupExplanation(); render();
+                    if(!new File(homeDir(),"resources/horizon-resources.json").isFile()) requestDownloadSource();
+                    else { setupMessage = resourceSetupExplanation(); render(); }
                 }
             });
             ui.postDelayed(this, 1000);
@@ -203,10 +204,21 @@ public final class HorizonActivity extends NativeActivity {
             web.setOnLongClickListener(view -> true);
             web.setLongClickable(false);
             web.setOnTouchListener((view, event) -> {
+                if(!glassNavigationReady) return false;
                 int action = event.getActionMasked();
                 android.view.ViewParent parent = view.getParent();
                 if(parent != null) parent.requestDisallowInterceptTouchEvent(action != MotionEvent.ACTION_UP && action != MotionEvent.ACTION_CANCEL);
-                return false; // Keep delivering the complete gesture to GlassNav.
+                String kind;
+                if(action == MotionEvent.ACTION_DOWN) { kind = "down"; lastGlassMove = 0; }
+                else if(action == MotionEvent.ACTION_MOVE) {
+                    if(event.getEventTime()-lastGlassMove < 16) return true;
+                    kind = "move"; lastGlassMove = event.getEventTime();
+                } else if(action == MotionEvent.ACTION_UP) kind = "up";
+                else if(action == MotionEvent.ACTION_CANCEL || (action == MotionEvent.ACTION_POINTER_UP && event.getActionIndex() == 0)) kind = "cancel";
+                else return true;
+                float x = event.getX() / Math.max(1,view.getWidth()), y = event.getY() / Math.max(1,view.getHeight());
+                web.evaluateJavascript("window.horizonNav && window.horizonNav.touch('"+kind+"',"+x+","+y+")",null);
+                return true; // Android retains the stream; WebView cannot turn it into scroll/zoom.
             });
             android.webkit.WebSettings settings = web.getSettings();
             settings.setJavaScriptEnabled(true); // Trusted bundled code only; all network/file access is blocked.
@@ -622,7 +634,7 @@ public final class HorizonActivity extends NativeActivity {
         transparency.setChecked(getPreferences(0).getBoolean("reduce_transparency",false));
         transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); refreshNavigation(); });
         page.addView(transparency);
-        page.addView(label("Horizon · 0.2.97-android · ARM64",14));
+        page.addView(label("Horizon · 0.2.98-android · ARM64",14));
     }
     static byte[] readBytes(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -648,9 +660,10 @@ public final class HorizonActivity extends NativeActivity {
             if(!installingResources) box.addView(button("cancel", this::cancelResourceDownload));
         } else {
             Button download = button(setupMessage == null ? "download_files" : "retry_download", this::requestDownloadSource);
-            Button privateDownload = button("private_download", this::openPrivateDownload); primary(privateDownload);
+            primary(download);
+            Button privateDownload = button("private_download", this::openPrivateDownload);
+            box.addView(download, new LinearLayout.LayoutParams(-1, dp(49)));
             box.addView(privateDownload, new LinearLayout.LayoutParams(-1, dp(49)));
-            if(!getPreferences(0).getString("resource_link", "").isEmpty()) box.addView(download, new LinearLayout.LayoutParams(-1, dp(49)));
             Button choose = button("import_resources", () -> pick("resources"));
             LinearLayout.LayoutParams bounds = new LinearLayout.LayoutParams(-1, -2); bounds.setMargins(0, dp(9), 0, 0); box.addView(choose, bounds);
             box.addView(button("use_download_link", this::customResourceLink));
@@ -721,7 +734,15 @@ public final class HorizonActivity extends NativeActivity {
         automaticSetupAttempted = true;
         String saved = getPreferences(0).getString("resource_link", "");
         if(!saved.isEmpty()) { download(saved); return; }
-        openPrivateDownload();
+        int attempt = beginSetup(false);
+        // Same automatic source and checked importer as SwiftUI GameFilesDownload.
+        request("game-files-source", source -> {
+            if(attempt != setupAttempt || destroyed) return;
+            setupBusy = false;
+            String address = source.optString("url");
+            if(address.isEmpty()) { finishSetup(attempt,"missing download source"); return; }
+            download(address);
+        }, failure -> finishSetup(attempt,failure));
     }
 
     private void download(String address) {
@@ -762,12 +783,11 @@ public final class HorizonActivity extends NativeActivity {
             finally { if(connection != null) { connection.disconnect(); if(activeDownload == connection) activeDownload = null; } }
         });
     }
-    /** Called on a worker; keep the source handle alive even when native import unlinks it. */
+    /** Use the same checked native importer as iOS; never modify a published resource tree. */
     private void installResourceArchive(File zip, int attempt) {
         final PreparedResources source;
-        try { source = new PreparedResources(zip); }
+        try { source = new PreparedResources(zip); source.close(); }
         catch(Exception failure) { zip.delete(); ui.post(() -> finishSetup(attempt,failure.toString())); return; }
-        resourceArchive = source;
         if(destroyed) { closeResourceArchive(source,zip); return; }
         ui.post(() -> {
             if(destroyed || attempt != setupAttempt) { closeResourceArchive(source,zip); return; }
@@ -775,8 +795,8 @@ public final class HorizonActivity extends NativeActivity {
             request("import-game-files " + zip.getAbsolutePath(), result -> workers.execute(() -> {
                 String failure = null;
                 try {
-                    int repaired = source.restoreMissing(new File(homeDir(),"resources"));
-                    getPreferences(0).edit().putInt("resource_repairs",repaired).apply();
+                    int checked = source.verifyPublished(new File(homeDir(),"resources"));
+                    getPreferences(0).edit().putInt("resource_verified_files",checked).apply();
                 } catch(Exception error) { failure = error.toString(); }
                 finally { closeResourceArchive(source,zip); }
                 String outcome = failure;
@@ -786,7 +806,6 @@ public final class HorizonActivity extends NativeActivity {
     }
     private void closeResourceArchive(PreparedResources source, File zip) {
         try { source.close(); } catch(IOException ignored) { /* Read-only source handle. */ }
-        if(resourceArchive == source) resourceArchive = null;
         zip.delete();
     }
     private void openPrivateDownload() {
@@ -949,13 +968,41 @@ public final class HorizonActivity extends NativeActivity {
     private void shareDiagnostics() {
         workers.execute(() -> {
             try {
+                File dir = new File(getCacheDir(),"diagnostics");
+                if(!dir.isDirectory() && !dir.mkdirs()) throw new IOException("Cannot create report folder");
+                ArrayList<File> traces = new ArrayList<>();
                 StringBuilder report = new StringBuilder("Horizon Android diagnostics\n");
                 report.append("App: ").append(getPackageManager().getPackageInfo(getPackageName(),0).versionName).append('\n');
                 report.append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append(" API ").append(Build.VERSION.SDK_INT).append('\n');
                 android.content.pm.PackageInfo web = android.webkit.WebView.getCurrentWebViewPackage();
                 report.append("WebView: ").append(web == null ? "unavailable" : web.packageName + " " + web.versionName).append('\n');
                 report.append("Free bytes: ").append(homeDir().getUsableSpace()).append('\n');
-                report.append("Files restored after last import: ").append(getPreferences(0).getInt("resource_repairs",-1)).append('\n');
+                if(Build.VERSION.SDK_INT >= 30) {
+                    report.append("\nRecent process exits:\n");
+                    try {
+                        ActivityManager manager = (ActivityManager)getSystemService(ACTIVITY_SERVICE);
+                        for(android.app.ApplicationExitInfo exit : manager.getHistoricalProcessExitReasons(getPackageName(),0,2)) {
+                            report.append("reason=").append(exit.getReason()).append(" status=").append(exit.getStatus())
+                                .append(" timestamp=").append(exit.getTimestamp()).append(" pssKiB=").append(exit.getPss())
+                                .append(" rssKiB=").append(exit.getRss()).append(" description=").append(exit.getDescription()).append('\n');
+                            try(InputStream trace = exit.getTraceInputStream()) {
+                                if(trace == null) continue;
+                                // Native tombstones are protobuf, not UTF-8 log text. Preserve their bytes.
+                                String extension = exit.getReason() == android.app.ApplicationExitInfo.REASON_CRASH_NATIVE ? ".pb" : ".trace";
+                                File dump = new File(dir,"exit-"+exit.getPid()+"-"+exit.getTimestamp()+extension);
+                                try(OutputStream out = new FileOutputStream(dump)) {
+                                    byte[] buffer = new byte[8192]; int remaining = 4*1024*1024, count;
+                                    while(remaining > 0 && (count = trace.read(buffer,0,Math.min(buffer.length,remaining))) != -1) {
+                                        out.write(buffer,0,count); remaining -= count;
+                                    }
+                                    if(remaining == 0) report.append("Trace capture limited to 4 MiB\n");
+                                }
+                                traces.add(dump); report.append("Trace attachment: ").append(dump.getName()).append('\n');
+                            }
+                        }
+                    } catch(IOException | RuntimeException unavailable) { report.append("System exit trace unavailable\n"); }
+                }
+                report.append("Files verified after last import: ").append(getPreferences(0).getInt("resource_verified_files",-1)).append('\n');
                 Properties checks = new Properties();
                 try(InputStream in = getAssets().open("resource-checks.properties")) { checks.load(in); }
                 report.append("\nBase resource checks (custom packs can override these files):\n");
@@ -993,11 +1040,24 @@ public final class HorizonActivity extends NativeActivity {
                     }
                     break;
                 }
-                File dir = new File(getCacheDir(),"diagnostics");
-                if(!dir.isDirectory() && !dir.mkdirs()) throw new IOException("Cannot create report folder");
                 File output = new File(dir,"horizon-diagnostics.txt");
                 try(OutputStream out = new FileOutputStream(output)) { out.write(report.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
-                ui.post(() -> { if(!destroyed) share(output,"text/plain"); });
+                if(traces.isEmpty()) ui.post(() -> { if(!destroyed) share(output,"text/plain"); });
+                else {
+                    File bundle = new File(dir,"horizon-diagnostics.zip");
+                    try(java.util.zip.ZipOutputStream out = new java.util.zip.ZipOutputStream(new FileOutputStream(bundle))) {
+                        ArrayList<File> entries = new ArrayList<>(traces); entries.add(output);
+                        for(File file : entries) {
+                            out.putNextEntry(new java.util.zip.ZipEntry(file.getName()));
+                            try(InputStream in = new FileInputStream(file)) {
+                                byte[] buffer = new byte[8192]; int count;
+                                while((count = in.read(buffer)) != -1) out.write(buffer,0,count);
+                            }
+                            out.closeEntry();
+                        }
+                    }
+                    ui.post(() -> { if(!destroyed) share(bundle,"application/zip"); });
+                }
             } catch(Exception e) { ui.post(() -> { if(!destroyed) error(t("file_unavailable")); }); }
         });
     }
@@ -1021,5 +1081,5 @@ public final class HorizonActivity extends NativeActivity {
     private void cancelGlassGesture() {
         if(glassNavigation != null && glassNavigationReady) glassNavigation.evaluateJavascript("window.horizonNav && window.horizonNav.suspend()",null);
     }
-    @Override protected void onDestroy() { destroyed = true; if(resourceArchive != null) { try { resourceArchive.close(); } catch(IOException ignored) { /* Already closing. */ } resourceArchive=null; } if(glassNavigation != null) { glassNavigation.removeJavascriptInterface("HorizonNav"); navigationDock.removeView(glassNavigation); glassNavigation.destroy(); glassNavigation=null; } if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
+    @Override protected void onDestroy() { destroyed = true; if(glassNavigation != null) { glassNavigation.removeJavascriptInterface("HorizonNav"); navigationDock.removeView(glassNavigation); glassNavigation.destroy(); glassNavigation=null; } if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
 }
