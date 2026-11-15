@@ -161,7 +161,8 @@ jobs:
           tools=$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
           if [ "$apk" = Horizon-Android.apk ]; then
             "$tools/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/signature.txt"
-            grep -Fx "Signer #1 certificate SHA-256 digest: $EXPECTED_ANDROID_CERT_SHA256" "$RUNNER_TEMP/signature.txt"
+            cat "$RUNNER_TEMP/signature.txt"
+            grep -Fxi "Signer #1 certificate SHA-256 digest: $EXPECTED_ANDROID_CERT_SHA256" "$RUNNER_TEMP/signature.txt"
           fi
           "$tools/aapt" dump badging "$apk" | tee /tmp/horizon-badging.txt
           grep -q "launchable-activity: name='dev.horizon.android.HorizonActivity'" /tmp/horizon-badging.txt
@@ -215,7 +216,8 @@ jobs:
           sha256sum --check Horizon-Android.apk.sha256
           tools=$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
           "$tools/apksigner" verify --print-certs Horizon-Android.apk > "$RUNNER_TEMP/signature.txt"
-          grep -Fx "Signer #1 certificate SHA-256 digest: $EXPECTED_ANDROID_CERT_SHA256" "$RUNNER_TEMP/signature.txt"
+          cat "$RUNNER_TEMP/signature.txt"
+          grep -Fxi "Signer #1 certificate SHA-256 digest: $EXPECTED_ANDROID_CERT_SHA256" "$RUNNER_TEMP/signature.txt"
           "$tools/aapt" dump badging Horizon-Android.apk | grep "versionCode='$number'"
           tag="android-v0.2.101-build-${number}"
           cat > notes.md <<'NOTES'
