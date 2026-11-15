@@ -558,13 +558,15 @@ public final class HorizonActivity extends NativeActivity {
                 check.setChecked(mod.optBoolean("enabled"));
                 String problem=mod.optString("problem","");
                 boolean available=problem.isEmpty() && !mod.optBoolean("code"); check.setEnabled(available);
+                boolean[] reverting={false};
                 check.setOnCheckedChangeListener((b,on) -> {
+                    if(reverting[0]) return;
                     check.setEnabled(false);
                     JSONObject args=object("id",mod.optString("id"));
                     try { args.put("on",on); } catch(JSONException e) { throw new IllegalStateException(e); }
                     request("mods-set "+args,v -> { if(currentPacks(generation)) render(); },message -> {
                         if(!currentPacks(generation)) return;
-                        check.setOnCheckedChangeListener(null); check.setChecked(!on); check.setEnabled(available); error(message);
+                        reverting[0]=true; check.setChecked(!on); reverting[0]=false; check.setEnabled(available); error(message);
                     });
                 });
                 modsSection.addView(check);

@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       launcher_only:
-        description: Reuse the verified build-16 native library if native sources are unchanged
+        description: Reuse the verified build-18 native library if native sources are unchanged
         type: boolean
         default: false
       publish_release:
@@ -81,7 +81,7 @@ jobs:
           if [ "$LAUNCHER_ONLY" = true ]; then
             # This baseline was built with these exact native options. Reject a
             # launcher-only request if any engine, dependency or native build input changed.
-            baseline=d5efb985fbe09b99ca903159d93eed3b0041acc0
+            baseline=bafb6408565ee5e21b203b3f813b341053290f3a
             test "$ANDROID_TARGET" = aarch64-linux-android
             test "$ANDROID_API" = 26
             test "$HORIZON_TELEMETRY_URL" = off
@@ -97,7 +97,7 @@ jobs:
           PYCODE
             original="$RUNNER_TEMP/native-baseline"
             mkdir -p "$original" "$(dirname "$so")"
-            gh release download android-v0.2.98-build-16 --repo "$GITHUB_REPOSITORY" --dir "$original" \
+            gh release download android-v0.2.100-build-18 --repo "$GITHUB_REPOSITORY" --dir "$original" \
               --pattern 'Horizon-Android.apk*' --pattern source-commit.txt
             test "$(cat "$original/source-commit.txt")" = "$baseline"
             ( cd "$original" && sha256sum --check Horizon-Android.apk.sha256 )
@@ -185,7 +185,7 @@ jobs:
 
           Builds without repository signing secrets use a development key. Export worlds/backups outside the app before uninstalling an existing installation. A replacement signed with a different key requires reinstalling and removes app-local files.
 
-          Full native rebuild. Source provenance is recorded in source-commit.txt and native-source-commit.txt. ARM64 Android 8+ with Vulkan. Physical-device verification of this glass fix is still needed.
+          Uses the verified native library rebuilt for the Packs fix in build 18. Source provenance is recorded in source-commit.txt and native-source-commit.txt. ARM64 Android 8+ with Vulkan. Physical-device verification of this glass fix is still needed.
           NOTES
           gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.100 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
           gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt native-source-commit.txt
