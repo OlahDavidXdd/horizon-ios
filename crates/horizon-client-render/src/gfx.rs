@@ -5493,12 +5493,24 @@ impl Renderer {
         if !self.android_surface.needs_resume(self.surface.is_some(), self.offscreen.is_some()) {
             return Ok(());
         }
+        if self.offscreen.is_some() {
+            // Explicit offscreen targets keep their requested dimensions across native-window events.
+            self.android_surface.resumed();
+            self.suspended = !drawable_size(self.config.width, self.config.height, self.device.limits().max_texture_dimension_2d);
+            return Ok(());
+        }
         self.recreate_surface()?;
         self.android_surface.resumed();
         // Preserve zero-size suspension and rebuild size-dependent targets for the new window.
         let size=self.window.inner_size();
         self.resize(size.width,size.height);
         Ok(())
+    }
+
+    /// A successful CPU load may only build the world renderer while the Android target is usable.
+    #[cfg(target_os = "android")]
+    pub fn android_handoff_ready(&self) -> bool {
+        self.android_surface.handoff_ready(self.surface.is_some(), self.offscreen.is_some(), !self.suspended)
     }
 
     /// Hand the window surface over to the renderer that replaces this one on

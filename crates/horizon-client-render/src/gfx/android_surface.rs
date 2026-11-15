@@ -13,6 +13,9 @@ impl Lifecycle {
     pub(crate) fn needs_resume(&self, has_surface: bool, offscreen: bool) -> bool {
         self.unavailable || (!has_surface && !offscreen)
     }
+    pub(crate) fn handoff_ready(&self, has_surface: bool, offscreen: bool, drawable: bool) -> bool {
+        !self.unavailable && drawable && (has_surface || offscreen)
+    }
     pub(crate) fn resumed(&mut self) {
         self.unavailable = false;
     }
@@ -38,6 +41,19 @@ mod tests {
         let state = Lifecycle::default();
         assert!(!state.needs_resume(true, false));
         assert!(state.needs_resume(false, false));
+    }
+    #[test]
+    fn completed_load_waits_for_a_drawable_surface() {
+        let mut state = Lifecycle::default();
+        assert!(!state.handoff_ready(false, false, true));
+        assert!(state.handoff_ready(true, false, true));
+        state.suspend();
+        assert!(!state.handoff_ready(true, false, true));
+        assert!(!state.handoff_ready(false, false, true));
+        state.resumed();
+        assert!(!state.handoff_ready(true, false, false));
+        assert!(state.handoff_ready(true, false, true));
+        assert!(state.handoff_ready(false, true, true));
     }
     #[test]
     fn explicit_offscreen_target_survives_a_suspend_resume_cycle() {

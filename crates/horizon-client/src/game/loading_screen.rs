@@ -958,6 +958,14 @@ impl App {
                     event_loop.exit();
                     return;
                 }
+                #[cfg(target_os = "android")]
+                if loading.loaded.as_ref().is_some_and(|loaded| loaded.is_ok())
+                    && !loading.renderer.as_ref().is_some_and(|renderer| renderer.android_handoff_ready())
+                {
+                    // Preserve the completed CPU load while TermWindow/rotation has no drawable target.
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now()+Duration::from_millis(33)));
+                    return;
+                }
                 match if loading.menu.reload_packs || !loading.ready_for_handoff() {
                     None
                 } else {
