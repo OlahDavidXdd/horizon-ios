@@ -42,7 +42,7 @@ final class Accounts {
                 .setNegativeButton(android.R.string.cancel,null).show();
         } catch (Exception e) { activity.error(activity.t("account_storage")); }
     }
-    void handOver(Runnable ready) {
+    void handOver(Runnable ready,java.util.function.Consumer<String> failed) {
         final int epoch = generation;
         activity.workers.execute(() -> {
             try {
@@ -62,8 +62,14 @@ final class Accounts {
                     save(catalog); account=updated;
                 }
                 String command = account == null ? "launcher-session off" : "launcher-session " + activity.object("name",account.getString("name"),"uuid",account.getString("uuid"),"access_token",account.getString("token"),"user_type","msa");
-                main(() -> { if(epoch==generation) activity.ask(command, reply -> { if(reply.optBoolean("ok")) ready.run(); }); });
-            } catch (Exception e) { main(() -> activity.error(activity.t("sign_in_again"))); }
+                main(() -> {
+                    if(epoch!=generation) { failed.accept(activity.t("sign_in_again")); return; }
+                    activity.request(command,reply -> {
+                        if(epoch==generation && reply.optBoolean("ok")) ready.run();
+                        else failed.accept(activity.t("sign_in_again"));
+                    },ignored -> failed.accept(activity.t("sign_in_again")));
+                });
+            } catch (Exception e) { main(() -> failed.accept(activity.t("sign_in_again"))); }
         });
     }
     private void signIn() {

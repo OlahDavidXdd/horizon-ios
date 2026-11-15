@@ -158,4 +158,12 @@
     <string name="no_shader_packs">No shader packs installed</string>
     <string name="no_mods">No content mods installed</string>
     <string name="mods_next_launch">Changes apply next time the game starts</string>
+    <string name="display_refresh_rate">Display refresh rate</string>
+    <string name="refresh_system">System default</string>
+    <string name="refresh_60">60 Hz</string>
+    <string name="refresh_120">120 Hz (when supported)</string>
+    <string name="display_refresh_summary">Requested display rate: %.1f Hz. Android power settings and device performance can limit it.</string>
+    <string name="waiting_for_engine">Waiting for the game engine. Try again shortly.</string>
+    <string name="previous_launch_failed">The previous game launch did not finish. If it keeps closing, use Settings → Share Logs to send the crash report.</string>
+    <string name="landscape_not_ready">The game display is not ready. Try Play again after the phone rotates to landscape.</string>
 </resources>

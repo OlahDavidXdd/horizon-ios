@@ -66,7 +66,11 @@ public final class HorizonActivity extends NativeActivity {
     private volatile java.net.HttpURLConnection activeDownload;
     private volatile android.os.CancellationSignal activePartsRead;
     private volatile boolean destroyed;
-    private boolean launching, visible = true;
+    private boolean launching, visible = true, watchPending;
+    private final LaunchSurfaceState launchSurface=new LaunchSurfaceState();
+    private SurfaceHolder gameSurface;
+    private float requestedHz;
+    private boolean previousLaunchFailed;
     private String tab = "play", importKind = "resources", phase = "unknown";
     private String launchOwner;
     private Accounts accounts;
@@ -82,7 +86,10 @@ public final class HorizonActivity extends NativeActivity {
                 if(wantKeyboard) {inputBridge.requestFocus();ime.showSoftInput(inputBridge,android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);}
                 else {ime.hideSoftInputFromWindow(inputBridge.getWindowToken(),0);inputBridge.clearFocus();}
             }
-            if (visible) ask("launcher-state", state -> {
+            if (visible && !watchPending) {
+                watchPending=true;
+                request("launcher-state", state -> {
+                watchPending=false;
                 phase = state.optString("phase");
                 String message = t(phase);
                 if (state.has("progress")) message += " " + Math.round(state.optDouble("progress") * 100) + "%";
@@ -100,13 +107,16 @@ public final class HorizonActivity extends NativeActivity {
                     if(!new File(homeDir(),"resources/horizon-resources.json").isFile()) requestDownloadSource();
                     else { setupMessage = resourceSetupExplanation(); render(); }
                 }
-            });
+            }, failure -> { watchPending=false; if(!destroyed && visible) status.setText(t("waiting_for_engine")); });
+            }
             ui.postDelayed(this, 1000);
         }
     };
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         current=new java.lang.ref.WeakReference<>(this);initPlatform();
+        previousLaunchFailed=getPreferences(0).getBoolean("launch_in_progress",false);
+        applyDisplayRate();
         accounts = new Accounts(this);
         needsResources = !hasGameFiles();
         applyTouchPreferences();
@@ -157,7 +167,7 @@ public final class HorizonActivity extends NativeActivity {
         // NativeActivity owns its main window surface for Vulkan. A separate
         // window lets Android render the launcher without sharing that producer.
         launcherWindow=new Dialog(this,R.style.HorizonTheme);
-        launcherWindow.setContentView(overlay);launcherWindow.setCancelable(false);
+        launcherWindow.setContentView(overlay);launcherWindow.setCancelable(false);applyDisplayRate();
         launcherWindow.setOnKeyListener((dialog,key,event) -> {
             if(key==android.view.KeyEvent.KEYCODE_BACK&&event.getAction()==android.view.KeyEvent.ACTION_UP){onBackPressed();return true;}
             return false;
@@ -332,14 +342,14 @@ public final class HorizonActivity extends NativeActivity {
     }
     interface Reply { void done(JSONObject value); }
     void ask(String line, Reply reply) { request(line, reply, this::error); }
-    private void request(String line, Reply reply, java.util.function.Consumer<String> failed) {
+    void request(String line, Reply reply, java.util.function.Consumer<String> failed) {
         long id = submit(line);
         final long deadline = SystemClock.uptimeMillis() + (line.startsWith("import-game-files ") ? 20 * 60000L : 120000L);
         ui.post(new Runnable() { public void run() {
             if (destroyed) { abandon(id); return; }
             String result = poll(id);
             if (result == null && SystemClock.uptimeMillis() < deadline) { ui.postDelayed(this, 30); return; }
-            if (result == null) { abandon(id); launching = false; failed.accept(t("timeout")); return; }
+            if (result == null) { abandon(id); failed.accept(t("timeout")); return; }
             try {
                 JSONObject answer = new JSONObject(result);
                 if (answer.has("error")) { failed.accept(answer.optString("error")); return; }
@@ -348,7 +358,6 @@ public final class HorizonActivity extends NativeActivity {
         }});
     }
     void error(String message) {
-        launching = false;
         if (!destroyed) new AlertDialog.Builder(this).setTitle(t("error")).setMessage(message)
             .setPositiveButton(android.R.string.ok, null).show();
     }
@@ -379,6 +388,7 @@ public final class HorizonActivity extends NativeActivity {
         }
     }
     private void home() {
+        if(previousLaunchFailed) page.addView(detail(t("previous_launch_failed")));
         TextView edition = detail(t("java_edition")); edition.setTextSize(11); edition.setLetterSpacing(0.15f); page.addView(edition);
         if (needsResources || !hasGameFiles() || setupBusy || setupMessage != null) resourceSetupCard();
         Button play = button(needsResources || !hasGameFiles() ? "setup_game" : "play", () -> launch(null)); primary(play);
@@ -423,30 +433,67 @@ public final class HorizonActivity extends NativeActivity {
             }
         });
     }
+    private boolean ownsLaunch(String owner) { return !destroyed && launching && owner.equals(launchOwner); }
+    private void failLaunch(String owner,String message) {
+        if(!ownsLaunch(owner)) return;
+        launching=false; launchOwner=null;
+        getPreferences(0).edit().putBoolean("launch_in_progress",false).apply();
+        request("launcher-cancel-start "+owner,v -> {},ignored -> {});
+        setLauncherVisible(true); error(message);
+    }
     private void launch(String command) {
-        if (setupBusy || launching) return;
-        if (needsResources || !hasGameFiles()) { showResourceSetup(); return; }
-        launching = true; launchOwner = UUID.randomUUID().toString();
-        String owner = launchOwner;
-        accounts.handOver(() -> ask("launcher-start " + owner, answer -> {
-            if (!answer.optBoolean("ok")) { launching = false; return; }
-            ui.post(new Runnable() { public void run() {
-                if (destroyed || !owner.equals(launchOwner)) return;
-                ask("launcher-state", state -> {
-                    String p = state.optString("phase");
-                    if (p.equals("title") || p.equals("world")) {
-                        Runnable finish = () -> ask("launcher-commit-start " + owner, commit -> {
-                            if (!commit.optBoolean("ok")) { launching = false; return; }
-                            ask("launcher-visible false", v -> { launching = false; setLauncherVisible(false); });
-                        });
-                        if (command == null) finish.run(); else ask(command, v -> finish.run());
-                    } else if (p.equals("needs_files")) {
-                        launching = false; launchOwner = null; needsResources = true;
-                        request("launcher-cancel-start " + owner, v -> showResourceSetup(), failure -> showResourceSetup());
-                    } else { status.setText(t("loading")); ui.postDelayed(this, 300); }
-                });
-            }});
-        }));
+        if(setupBusy || launching) return;
+        if(needsResources || !hasGameFiles()) { showResourceSetup(); return; }
+        launching=true; launchOwner=UUID.randomUUID().toString(); String owner=launchOwner;
+        getPreferences(0).edit().putBoolean("launch_in_progress",true).apply();
+        // Rotate before requesting GPU startup, rather than resizing the newly loaded game.
+        setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        final long deadline=SystemClock.uptimeMillis()+8000;
+        ui.post(new Runnable() { public void run() {
+            if(!ownsLaunch(owner)) return;
+            boolean landscape=getResources().getConfiguration().orientation==android.content.res.Configuration.ORIENTATION_LANDSCAPE;
+            if(!launchSurface.ready(landscape,SystemClock.uptimeMillis())) {
+                if(SystemClock.uptimeMillis()>=deadline) failLaunch(owner,t("landscape_not_ready"));
+                else ui.postDelayed(this,50);
+                return;
+            }
+            accounts.handOver(() -> {
+                if(!ownsLaunch(owner)) return;
+                request("launcher-start "+owner,answer -> {
+                    if(!ownsLaunch(owner)) return;
+                    if(!answer.optBoolean("ok")) { failLaunch(owner,t("waiting_for_engine")); return; }
+                    awaitGame(owner,command);
+                },message -> failLaunch(owner,message));
+            },message -> failLaunch(owner,message));
+        }});
+    }
+    private void awaitGame(String owner,String command) {
+        if(!ownsLaunch(owner)) return;
+        request("launcher-state",state -> {
+            if(!ownsLaunch(owner)) return;
+            String p=state.optString("phase");
+            if(p.equals("title") || p.equals("world")) {
+                Runnable finish=() -> {
+                    if(!ownsLaunch(owner)) return;
+                    request("launcher-commit-start "+owner,commit -> {
+                        if(!ownsLaunch(owner)) return;
+                        if(!commit.optBoolean("ok")) { failLaunch(owner,t("waiting_for_engine")); return; }
+                        request("launcher-visible false",v -> {
+                            if(!ownsLaunch(owner)) return;
+                            launching=false; setLauncherVisible(false);
+                            ui.postDelayed(() -> {
+                                if(!destroyed && owner.equals(launchOwner)) {
+                                    getPreferences(0).edit().putBoolean("launch_in_progress",false).apply(); previousLaunchFailed=false;
+                                }
+                            },15000);
+                        },message -> failLaunch(owner,message));
+                    },message -> failLaunch(owner,message));
+                };
+                if(command==null) finish.run(); else request(command,v -> finish.run(),message -> failLaunch(owner,message));
+            } else if(p.equals("needs_files")) {
+                failLaunch(owner,t("needs_files")); needsResources=true; showResourceSetup();
+            } else { status.setText(t("loading")); ui.postDelayed(() -> awaitGame(owner,command),300); }
+        },message -> failLaunch(owner,message));
     }
     void confirm(String title, Runnable yes) {
         new AlertDialog.Builder(this).setTitle(t(title)).setPositiveButton(android.R.string.ok, (d,w) -> yes.run())
@@ -725,6 +772,8 @@ public final class HorizonActivity extends NativeActivity {
             } catch(IOException e){error(e.getLocalizedMessage());}
         }));
         addButton("game_settings", this::gameSettings);
+        addButton("display_refresh_rate", this::chooseDisplayRate);
+        page.addView(detail(getString(R.string.display_refresh_summary,requestedHz)));
         addButton("touch_controls", this::touchControls);
         addButton("screenshots", this::gallery);
         addButton("share_logs", this::shareDiagnostics);
@@ -738,7 +787,7 @@ public final class HorizonActivity extends NativeActivity {
         transparency.setChecked(getPreferences(0).getBoolean("reduce_transparency",false));
         transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); refreshNavigation(); });
         page.addView(transparency);
-        page.addView(label("Horizon · 0.2.100-android · ARM64",14));
+        page.addView(label("Horizon · 0.2.101-android · ARM64",14));
     }
     static byte[] readBytes(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -1000,6 +1049,44 @@ public final class HorizonActivity extends NativeActivity {
         control.setLayoutParams(size);
         if(!Float.isNaN(values[80+id]))control.setAlpha(values[80+id]);
     }
+    private void chooseDisplayRate() {
+        String[] labels={t("refresh_system"),t("refresh_60"),t("refresh_120")}; int[] values={0,60,120};
+        int current=getPreferences(0).getInt("display_hz",120), checked=current==0 ? 0 : current==60 ? 1 : 2;
+        new AlertDialog.Builder(this).setTitle(t("display_refresh_rate")).setSingleChoiceItems(labels,checked,(dialog,index) -> {
+            getPreferences(0).edit().putInt("display_hz",values[index]).apply(); applyDisplayRate();
+            dialog.dismiss();
+            if(values[index]>0) request("options-set maxFps "+values[index],v -> render(),this::error); else render();
+        }).setNegativeButton(android.R.string.cancel,null).show();
+    }
+    private void applyDisplayRate() {
+        Display display=getWindowManager().getDefaultDisplay(); if(display==null) return;
+        int target=getPreferences(0).getInt("display_hz",120), modeId=0; requestedHz=0;
+        if(target>0) {
+            Display.Mode current=display.getMode(); Display.Mode[] modes=display.getSupportedModes();
+            int[] widths=new int[modes.length],heights=new int[modes.length];float[] rates=new float[modes.length];
+            for(int i=0;i<modes.length;i++) { widths[i]=modes[i].getPhysicalWidth();heights[i]=modes[i].getPhysicalHeight();rates[i]=modes[i].getRefreshRate(); }
+            int best=RefreshRatePolicy.choose(current.getPhysicalWidth(),current.getPhysicalHeight(),widths,heights,rates,target);
+            if(best>=0) { modeId=modes[best].getModeId();requestedHz=rates[best]; }
+        }
+        for(Window window:new Window[]{getWindow(),launcherWindow==null ? null : launcherWindow.getWindow()}) if(window!=null) {
+            WindowManager.LayoutParams attributes=window.getAttributes();
+            attributes.preferredDisplayModeId=modeId;attributes.preferredRefreshRate=requestedHz;window.setAttributes(attributes);
+        }
+        applySurfaceRate();
+    }
+    private void applySurfaceRate() {
+        if(Build.VERSION.SDK_INT>=30 && gameSurface!=null && gameSurface.getSurface().isValid()) {
+            try {
+                if(Build.VERSION.SDK_INT>=31) gameSurface.getSurface().setFrameRate(requestedHz,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS);
+                else gameSurface.getSurface().setFrameRate(requestedHz,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+            } catch(IllegalStateException | IllegalArgumentException unavailable) { android.util.Log.w("Horizon","Surface refresh hint unavailable"); }
+        }
+    }
+    @Override public void surfaceCreated(SurfaceHolder holder) { super.surfaceCreated(holder);gameSurface=holder;applySurfaceRate(); }
+    @Override public void surfaceChanged(SurfaceHolder holder,int format,int width,int height) {
+        super.surfaceChanged(holder,format,width,height);gameSurface=holder;launchSurface.changed(width,height,SystemClock.uptimeMillis());applySurfaceRate();
+    }
+    @Override public void surfaceDestroyed(SurfaceHolder holder) { gameSurface=null;launchSurface.destroyed();super.surfaceDestroyed(holder); }
     private void gameSettings() {
         page.removeAllViews(); heading("game_settings");
         String[] keys = {"renderDistance","simulationDistance","maxFps","fov","gamma","guiScale","particles","renderClouds","entityShadows","bobView","soundCategory_master","soundCategory_music","soundCategory_ambient","showSubtitles","mouseSensitivity","autoJump","invertYMouse"};
@@ -1085,6 +1172,7 @@ public final class HorizonActivity extends NativeActivity {
                 android.content.pm.PackageInfo web = android.webkit.WebView.getCurrentWebViewPackage();
                 report.append("WebView: ").append(web == null ? "unavailable" : web.packageName + " " + web.versionName).append('\n');
                 report.append("Navigation: native UI-thread selector; artwork=").append(glassNavigationReady ? "Liquid-Glass WebView" : "Android fallback").append('\n');
+                report.append("Display requested Hz: ").append(requestedHz).append("; previous startup incomplete: ").append(previousLaunchFailed).append('\n');
                 report.append("Free bytes: ").append(homeDir().getUsableSpace()).append('\n');
                 if(Build.VERSION.SDK_INT >= 30) {
                     report.append("\nRecent process exits:\n");
@@ -1173,7 +1261,7 @@ public final class HorizonActivity extends NativeActivity {
     @Override public void onBackPressed() {
         if (launching && launchOwner != null) {
             String owner = launchOwner; launchOwner = null;
-            ask("launcher-cancel-start " + owner, v -> { launching = false; render(); });
+            request("launcher-cancel-start " + owner, v -> { launching = false; getPreferences(0).edit().putBoolean("launch_in_progress",false).apply(); setLauncherVisible(true); },failure -> { launching=false; setLauncherVisible(true); });
         } else if (!visible) ask("launcher-visible true", v -> setLauncherVisible(true));
         else { tab = "play"; render(); }
     }
@@ -1185,7 +1273,7 @@ public final class HorizonActivity extends NativeActivity {
         super.onPause();
     }
     @Override protected void onResume() {
-        super.onResume();if(glassNavigation != null) glassNavigation.onResume();cancelGlassGesture();ui.removeCallbacks(watch);if(overlay!=null)ui.post(watch);
+        super.onResume();applyDisplayRate();if(glassNavigation != null) glassNavigation.onResume();cancelGlassGesture();ui.removeCallbacks(watch);if(overlay!=null)ui.post(watch);
     }
     private void cancelGlassGesture() {
         if(navigationDock != null) navigationDock.cancelGesture();

@@ -2,6 +2,10 @@ name: android
 on:
   workflow_dispatch:
     inputs:
+      signed_artifact_ref:
+        description: Temporary branch or commit holding the permanently signed APK (optional)
+        type: string
+        default: ''
       existing_run:
         description: Republish the verified APK artifact from an earlier Android run (leave empty for a new build)
         type: string
@@ -24,9 +28,10 @@ env:
   ANDROID_TARGET: aarch64-linux-android
   ANDROID_API: '26'
   CARGO_INCREMENTAL: '0'
+  EXPECTED_ANDROID_CERT_SHA256: dbdefbbbd6f467d8737042f4f4de93c360d5f98c341a1e4d79938bba1fd17a01
 jobs:
   apk:
-    if: inputs.existing_run == ''
+    if: inputs.existing_run == '' && inputs.signed_artifact_ref == ''
     runs-on: ubuntu-latest
     timeout-minutes: 120
     defaults:
@@ -49,6 +54,10 @@ jobs:
         run: |
           javac -d "$RUNNER_TEMP/resource-tests" packaging/android/app/src/main/java/dev/horizon/android/GlassDragState.java packaging/android/tests/GlassDragStateTest.java
           java -cp "$RUNNER_TEMP/resource-tests" dev.horizon.android.GlassDragStateTest
+      - name: Test refresh-rate selection and startup surface lifecycle
+        run: |
+          javac -d "$RUNNER_TEMP/resource-tests" packaging/android/app/src/main/java/dev/horizon/android/RefreshRatePolicy.java packaging/android/app/src/main/java/dev/horizon/android/LaunchSurfaceState.java packaging/android/tests/DisplayStartupTest.java
+          java -cp "$RUNNER_TEMP/resource-tests" dev.horizon.android.DisplayStartupTest
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
@@ -134,30 +143,37 @@ jobs:
         run: |
           set -euo pipefail
           export HORIZON_KEYSTORE="$RUNNER_TEMP/horizon.jks"
-          trap 'rm -f "$HORIZON_KEYSTORE"' EXIT
+          trap 'if [ -n "${HORIZON_KEYSTORE:-}" ]; then rm -f "$HORIZON_KEYSTORE"; fi' EXIT
           if [ -n "$KEYSTORE" ]; then
             printf '%s' "$KEYSTORE" | base64 --decode > "$HORIZON_KEYSTORE"
           else
-            echo '::warning::No repository signing key configured. This prerelease uses a development key and cannot update an existing installation.'
-            export HORIZON_KEYSTORE_PASSWORD="$(openssl rand -hex 24)"
-            echo "::add-mask::$HORIZON_KEYSTORE_PASSWORD"
-            keytool -genkeypair -keystore "$HORIZON_KEYSTORE" -alias horizon -keyalg RSA -keysize 2048 -validity 10000 -storepass:env HORIZON_KEYSTORE_PASSWORD -keypass:env HORIZON_KEYSTORE_PASSWORD -dname 'CN=Horizon Android Development'
+            echo '::notice::Signing secrets are absent. Building an unsigned artifact for private permanent-key signing; it cannot be published unsigned.'
+            unset HORIZON_KEYSTORE_PASSWORD HORIZON_KEYSTORE
           fi
           gradle -p packaging/android --no-daemon assembleRelease lintRelease :app:testResourceVolumeAssembly
-          cp packaging/android/app/build/outputs/apk/release/app-release.apk Horizon-Android.apk
+          if [ -n "$KEYSTORE" ]; then
+            apk=Horizon-Android.apk
+            cp packaging/android/app/build/outputs/apk/release/app-release.apk "$apk"
+          else
+            apk=Horizon-Android-unsigned.apk
+            cp packaging/android/app/build/outputs/apk/release/app-release-unsigned.apk "$apk"
+          fi
           tools=$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
-          "$tools/apksigner" verify --verbose Horizon-Android.apk
-          "$tools/aapt" dump badging Horizon-Android.apk | tee /tmp/horizon-badging.txt
+          if [ "$apk" = Horizon-Android.apk ]; then
+            "$tools/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/signature.txt"
+            grep -Fx "Signer #1 certificate SHA-256 digest: $EXPECTED_ANDROID_CERT_SHA256" "$RUNNER_TEMP/signature.txt"
+          fi
+          "$tools/aapt" dump badging "$apk" | tee /tmp/horizon-badging.txt
           grep -q "launchable-activity: name='dev.horizon.android.HorizonActivity'" /tmp/horizon-badging.txt
-          unzip -l Horizon-Android.apk | grep 'lib/arm64-v8a/libhorizon_android.so'
-          sha256sum Horizon-Android.apk > Horizon-Android.apk.sha256
+          unzip -l "$apk" | grep 'lib/arm64-v8a/libhorizon_android.so'
+          sha256sum "$apk" > "$apk.sha256"
           printf '%s\n' "$GITHUB_SHA" > source-commit.txt
       - uses: actions/upload-artifact@v4
         with:
           name: horizon-android
           path: |
-            Horizon-Android.apk
-            Horizon-Android.apk.sha256
+            Horizon-Android*.apk
+            Horizon-Android*.apk.sha256
             source-commit.txt
             native-source-commit.txt
           retention-days: 14
@@ -171,10 +187,20 @@ jobs:
       actions: read
     steps:
       - uses: actions/download-artifact@v4
+        if: inputs.signed_artifact_ref == ''
         with:
           name: horizon-android
           run-id: ${{ inputs.existing_run || github.run_id }}
           github-token: ${{ github.token }}
+      - uses: actions/checkout@v4
+        if: inputs.signed_artifact_ref != ''
+        with:
+          ref: ${{ inputs.signed_artifact_ref }}
+          path: signed-apk
+          persist-credentials: false
+      - name: Read signed publication artifact
+        if: inputs.signed_artifact_ref != ''
+        run: cp signed-apk/Horizon-Android.apk signed-apk/Horizon-Android.apk.sha256 signed-apk/source-commit.txt signed-apk/native-source-commit.txt .
       - name: Publish APK from this successful build
         env:
           GH_TOKEN: ${{ github.token }}
@@ -185,19 +211,22 @@ jobs:
           expected=$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN" --jq .head_sha)
           number=$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN" --jq .run_number)
           test "$(cat source-commit.txt)" = "$expected"
+          test -f Horizon-Android.apk || { echo 'No signed APK. Configure the permanent-key signing secrets or provide a locally signed artifact.'; exit 1; }
           sha256sum --check Horizon-Android.apk.sha256
-          tag="android-v0.2.100-build-${number}"
+          tools=$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$tools/apksigner" verify --print-certs Horizon-Android.apk > "$RUNNER_TEMP/signature.txt"
+          grep -Fx "Signer #1 certificate SHA-256 digest: $EXPECTED_ANDROID_CERT_SHA256" "$RUNNER_TEMP/signature.txt"
+          "$tools/aapt" dump badging Horizon-Android.apk | grep "versionCode='$number'"
+          tag="android-v0.2.101-build-${number}"
           cat > notes.md <<'NOTES'
-          Fixes Packs opening before Play: connects the existing native content-mod listing/install/toggle/delete commands in both startup and running-game launchers. Pack replies stay in their own sections and stale replies cannot append controls to another page. Empty collections have inline messages; Disable Shaders stays under Shader Packs.
+          Uses the permanent Horizon Android signing certificate. Future releases signed with this certificate install as updates and retain app data. Older 0.2.100 and earlier APKs used discarded per-build keys, so moving from those versions requires one final reinstall. Export saves outside the app first. Signing secrets are never bundled or committed; the release pipeline rejects unsigned or differently signed APKs.
 
-          The highlighted glass pill now follows Android touch events and draws on Android's UI thread, independently of WebView animation frames. Keeps zakisheriff/Liquid-Glass for the bar artwork and accessible tabs, hides its duplicate selector, and uses the same native moving pill if WebView falls back. Includes drag/cancel/resize regression tests and tests of the actual pre-game mod file API.
+          Adds Settings → Display refresh rate with System default, 60 Hz and 120 Hz. Selects supported modes at the current resolution, requests the same mode for the game and launcher windows, and sets Android's game-surface refresh hint. Selecting 120 Hz sets the engine cap to 120 FPS. Power settings, hardware and scene complexity can limit actual performance.
 
-          Retains the working game resources, original automatic download source, private Google Drive parts installation, ZIP import and verified resource publication. No Minecraft assets or credentials are bundled.
+          Hardens Play startup: rotates and waits for a valid settled landscape surface before asking the engine to load, guards asynchronous account/start callbacks against cancelled or replaced launches, and limits background state polling to one outstanding request. Failed launches restore the launcher and leave a diagnostic hint on the next start. This addresses a startup race; a device crash trace is still needed to establish the cause of the reported intermittent crash.
 
-          Builds without repository signing secrets use a development key. Export worlds/backups outside the app before uninstalling an existing installation. A replacement signed with a different key requires reinstalling and removes app-local files.
-
-          Uses the verified native library rebuilt for the Packs fix in build 18. Source provenance is recorded in source-commit.txt and native-source-commit.txt. ARM64 Android 8+ with Vulkan. Physical-device verification of this glass fix is still needed.
+          Retains the working downloads/imports, Packs fix and native glass selector. Uses the verified build-18 native engine. Source provenance is attached. ARM64 Android 8+ with Vulkan. No Mojang game assets or account credentials are included.
           NOTES
-          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --target "$expected" --title "Horizon Android 0.2.100 · build ${number}" --notes-file notes.md --prerelease --draft
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --target "$expected" --title "Horizon Android 0.2.101 · build ${number}" --notes-file notes.md --prerelease --draft
           gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt native-source-commit.txt
           gh release edit "$tag" --draft=false

@@ -46,11 +46,26 @@ the APK signature and launcher activity, and uploads the APK, SHA-256 and source
 The publishing job alone gets `contents: write`, checks provenance and checksum,
 uploads assets to a draft, then makes it public.
 
-For update-compatible signatures configure `ANDROID_KEYSTORE` (base64 JKS with alias
-`horizon`) and `ANDROID_KEYSTORE_PASSWORD` as repository Actions secrets. Without
-these, the workflow makes a development key for that build. Such an APK cannot
-update a differently signed installation: **back up worlds before uninstalling**.
-The signing key is never committed or attached to a release.
+Releases from 0.2.101 use the permanent certificate pinned in
+`release-signing-cert.sha256`. Configure `ANDROID_KEYSTORE` (base64 JKS, alias
+`horizon`) and `ANDROID_KEYSTORE_PASSWORD` as Actions secrets to sign in CI.
+When secrets are absent, CI builds an **unsigned artifact**. It never generates a
+throwaway release key. Publication verifies the permanent certificate and refuses
+unsigned or differently signed APKs.
+
+A maintainer with the private permanent key can extract that artifact and run
+`python3 packaging/android/sign-release.py ARTIFACT_DIR --keystore PRIVATE_JKS
+--password-file PRIVATE_PASSWORD_FILE --apksigner SDK_APKSIGNER`. This checks the
+unsigned checksum and pinned signer and writes `Horizon-Android.apk` plus its
+checksum. Neither key nor password belongs in git, artifacts or public releases.
+A temporary artifact branch can hold only the signed APK, checksum and two source
+records; dispatch `existing_run` with the original build ID and `signed_artifact_ref`
+with that branch's exact commit, then delete the temporary branch after publication.
+The release job checks source-run provenance, version code, checksum and signature.
+
+Old releases through 0.2.100 used discarded temporary keys. Android cannot update
+those with a different signer: **export saves outside the app before the one-time
+reinstall**. Subsequent releases with the permanent signer install in place.
 
 Local prerequisites: Rust stable with `aarch64-linux-android`, Android SDK 35,
 NDK, JDK 21 and Gradle 8.11.1. The workflow records the exact build commands.
@@ -80,6 +95,8 @@ Resource imports use the same native checked importer as iOS. Android preflights
 
 First launch asks the shared `game-files-source` command for the automatic URL, as SwiftUI GameFilesDownload does. Download failure offers retry, a custom HTTPS source and ZIP import. The native source currently names `https://cdn.gayfeet.lol/horizon/26.3.zip`; its reachability is independent of Android versus iOS.
 
-Android MotionEvents are forwarded directly to the bundled GlassNav using normalized coordinates. Android retains the touch stream, including release/cancel, rather than asking WebView to recognize a drag. Diagnostics include bounded native process-exit traces when Android provides them. Native protobuf tombstones are preserved as binary attachments in a diagnostic ZIP, alongside the readable report.
+Android draws and moves the selected pill on its UI thread, retaining release/cancel handling. The bundled Liquid-Glass component supplies the bar artwork; native navigation uses the same pill if WebView fails. Diagnostics include bounded native process-exit traces when Android provides them. Native protobuf tombstones are preserved as binary attachments in a diagnostic ZIP, alongside the readable report.
 
 Install from Google Drive Parts opens Android’s system file picker with multiple selection. Choose all five `Horizon-download.7z.001` through `.005` files from Drive or Downloads. The selected provider handles its own account authentication; Horizon reads only the granted URIs, downloads them into private staging, and reconstructs the known prepared ZIP with SHA-256 verification before native import. ZArchiver is not required. Keep at least 3 GB free. Commons Compress/XZ licenses are bundled in `assets/archive-libraries/`.
+
+Display refresh rate defaults to requesting a supported mode up to 120 Hz at the current resolution. Settings offers System default, 60 Hz and 120 Hz; selecting a fixed rate also sets maxFps. Both the native game surface and launcher window receive refresh hints. Android power policy and GPU performance still determine actual refresh/FPS. Play waits for a settled landscape surface before startup. Share Logs includes the requested rate and whether the previous startup was incomplete.
