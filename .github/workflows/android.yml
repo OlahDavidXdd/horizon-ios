@@ -11,7 +11,7 @@ on:
         type: string
         default: ''
       launcher_only:
-        description: Reuse the verified build-25 native library if native sources are unchanged
+        description: Reuse the verified build-28 native library if native sources are unchanged
         type: boolean
         default: false
       publish_release:
@@ -103,7 +103,7 @@ jobs:
           if [ "$LAUNCHER_ONLY" = true ]; then
             # This baseline was built with these exact native options. Reject a
             # launcher-only request if any engine, dependency or native build input changed.
-            baseline=ec7745777b9dae47c578f998b19bfd0493306e65
+            baseline=23429ce201b836ccbd9da26b16e24199ef0e182f
             test "$ANDROID_TARGET" = aarch64-linux-android
             test "$ANDROID_API" = 26
             test "$HORIZON_TELEMETRY_URL" = off
@@ -119,7 +119,7 @@ jobs:
           PYCODE
             original="$RUNNER_TEMP/native-baseline"
             mkdir -p "$original" "$(dirname "$so")"
-            gh release download android-v0.2.102-build-25 --repo "$GITHUB_REPOSITORY" --dir "$original" \
+            gh release download android-v0.2.103-build-28 --repo "$GITHUB_REPOSITORY" --dir "$original" \
               --pattern 'Horizon-Android.apk*' --pattern source-commit.txt
             test "$(cat "$original/source-commit.txt")" = "$baseline"
             ( cd "$original" && sha256sum --check Horizon-Android.apk.sha256 )
