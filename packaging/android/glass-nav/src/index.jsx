@@ -25,6 +25,7 @@ function App() {
         if (!Array.isArray(next.labels) || next.labels.length !== 3 || !next.labels.every(x => typeof x === 'string')) return;
         setState({index: next.index, labels: next.labels, reduced: !!next.reduced});
         document.documentElement.classList.toggle('reduced', !!next.reduced);
+        document.documentElement.classList.toggle('native-pill', !!next.nativePill);
       },
       backdrop(image) {
         if (typeof image === 'string' && image.startsWith('data:image/png;base64,')) {

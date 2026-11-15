@@ -6,3 +6,5 @@
 .lg-nav__label{font-size:11px!important;font-weight:600}.lg-nav__icon svg{width:22px;height:22px}
 .reduced .lg-glass{filter:none!important;backdrop-filter:none!important;background:#1b2d38!important}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+
+.native-pill .lg-track__select,.native-pill .lg-track__lens{visibility:hidden!important}

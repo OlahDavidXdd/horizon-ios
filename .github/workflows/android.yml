@@ -40,6 +40,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/resource-tests"
           javac -d "$RUNNER_TEMP/resource-tests" packaging/android/app/src/main/java/dev/horizon/android/PreparedResources.java packaging/android/tests/PreparedResourcesTest.java
           java -cp "$RUNNER_TEMP/resource-tests" dev.horizon.android.PreparedResourcesTest
+      - name: Test native glass finger tracking
+        run: |
+          javac -d "$RUNNER_TEMP/resource-tests" packaging/android/app/src/main/java/dev/horizon/android/GlassDragState.java packaging/android/tests/GlassDragStateTest.java
+          java -cp "$RUNNER_TEMP/resource-tests" dev.horizon.android.GlassDragStateTest
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
@@ -51,6 +55,10 @@ jobs:
         run: |
           rustc --edition=2024 --test packaging/android/tests/import_transaction.rs -o "$RUNNER_TEMP/import-transaction-tests"
           "$RUNNER_TEMP/import-transaction-tests"
+      - name: Test pre-game mod management
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/mobile-mod-tests
+        run: cargo test --locked --manifest-path packaging/android/tests/mobile_mods/Cargo.toml
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/horizon-android
@@ -167,22 +175,18 @@ jobs:
           set -euo pipefail
           test "$(cat source-commit.txt)" = "$GITHUB_SHA"
           sha256sum --check Horizon-Android.apk.sha256
-          tag="android-v0.2.99-build-${GITHUB_RUN_NUMBER}"
+          tag="android-v0.2.100-build-${GITHUB_RUN_NUMBER}"
           cat > notes.md <<'NOTES'
-          Adds installation directly from the owner's five private Google Drive parts. Choose Install from Google Drive Parts, open Drive in the file picker, long-press .001 and select .002 through .005. Horizon downloads the selected files, assembles and SHA-256 checks the prepared ZIP, then imports it. ZArchiver and public file sharing are not needed. Cached parts in Downloads also work. Keep at least 3 GB free.
+          Fixes Packs opening before Play: connects the existing native content-mod listing/install/toggle/delete commands in both startup and running-game launchers. Pack replies stay in their own sections and stale replies cannot append controls to another page. Empty collections have inline messages; Disable Shaders stays under Shader Packs.
 
-          Keeps the original iOS automatic download source, custom HTTPS links and normal ZIP import. The Drive route provides an in-launcher alternative when the original server is unavailable. The desktop launcher prepares raw Mojang files locally; it does not expose a separate ready-to-import ZIP source.
+          The highlighted glass pill now follows Android touch events and draws on Android's UI thread, independently of WebView animation frames. Keeps zakisheriff/Liquid-Glass for the bar artwork and accessible tabs, hides its duplicate selector, and uses the same native moving pill if WebView falls back. Includes drag/cancel/resize regression tests and tests of the actual pre-game mod file API.
 
-          Reuses the verified 0.2.98 engine with atomic resource publication and incomplete-import recovery. Retains the native touch route for the glass pill and system crash-trace export. Apache Commons Compress and XZ notices are bundled. No Minecraft assets or account credentials are bundled in this public APK; the Drive files remain private.
+          Retains the working game resources, original automatic download source, private Google Drive parts installation, ZIP import and verified resource publication. No Minecraft assets or credentials are bundled.
 
-          Builds without repository signing secrets use a development key: back up saves before replacing an existing installation.
+          Builds without repository signing secrets use a development key. Export worlds/backups outside the app before uninstalling an existing installation. A replacement signed with a different key requires reinstalling and removes app-local files.
 
-          Source provenance is recorded in `source-commit.txt` (launcher) and `native-source-commit.txt` (game library). Launcher-only builds verify that native sources, dependencies and native build inputs are unchanged before reusing the verified build-16 game library.
-
-          ARM64 Android 8+ with Vulkan. The web glass effect uses the installed Android System WebView. A renderer failure falls back to native navigation. Import prepared game files from your own copy of Minecraft. This APK contains no Mojang game assets.
-
-          Includes worlds, servers, game-file import/download, resource and shader packs, content mods, settings, screenshots/log sharing, touch-layout editing, a native software-keyboard bridge, Android gamepad input, system clipboard access, and Microsoft device-code sign-in. Online sign-in requires Microsoft/Mojang application approval. This is a prerelease; physical-device gameplay and complete iOS feature parity are still being validated.
+          Full native rebuild. Source provenance is recorded in source-commit.txt and native-source-commit.txt. ARM64 Android 8+ with Vulkan. Physical-device verification of this glass fix is still needed.
           NOTES
-          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.99 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
+          gh release create "$tag" --target "$GITHUB_SHA" --title "Horizon Android 0.2.100 · build ${GITHUB_RUN_NUMBER}" --notes-file notes.md --prerelease --draft
           gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt native-source-commit.txt
           gh release edit "$tag" --draft=false

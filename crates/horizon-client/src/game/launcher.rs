@@ -9,6 +9,8 @@
 //! waits for the title.
 use super::event_loop::EventLoopCtl;
 use super::{Game, Loading};
+#[path = "mods_control.rs"]
+mod mods_control;
 use horizon_client::{
     Result,
     import::{Installed, Kind, Pack},
@@ -61,6 +63,7 @@ fn import_state() -> Value {
 enum Waiting {
     Control(Receiver<String>),
     Import(Receiver<std::result::Result<Installed, String>>),
+    Mods(Receiver<std::result::Result<Value, String>>),
     CancelStart(String),
 }
 
@@ -91,6 +94,12 @@ fn deliver() -> bool {
                 Ok(Err(error)) => request.answer(&json!({ "error": error }).to_string()),
                 Err(TryRecvError::Disconnected) => {}
                 Err(TryRecvError::Empty) => still.push((Waiting::Import(result), request)),
+            },
+            Waiting::Mods(result) => match result.try_recv() {
+                Ok(Ok(value)) => request.answer(&value.to_string()),
+                Ok(Err(error)) => request.answer(&json!({"error":error}).to_string()),
+                Err(TryRecvError::Empty) => still.push((Waiting::Mods(result), request)),
+                Err(TryRecvError::Disconnected) => {}
             },
         }
     }
@@ -126,6 +135,7 @@ fn allowed_while_stopping(command: &str) -> bool {
             | "download-state"
             | "game-files-source"
             | "options-get"
+            | "mods-list"
             | "worlds"
             | "servers"
             | "server-ping"
@@ -167,19 +177,57 @@ fn cancel_start(request: horizon_ios_launcher::Request) {
     }
 }
 
-/// A native import owns its destination until its completion is delivered.
-fn importing_archive() -> bool {
+/// A native file operation owns its destination until completion is delivered.
+fn pending_file_operations() -> bool {
     PENDING.with_borrow(|pending| {
         pending
             .iter()
-            .any(|(waiting, _)| matches!(waiting, Waiting::Import(_)))
+            .any(|(waiting, _)| matches!(waiting, Waiting::Import(_) | Waiting::Mods(_)))
     })
+}
+
+/// Mod inventory and installation are file operations, available before Play too.
+fn mod_request(request: horizon_ios_launcher::Request) -> Option<horizon_ios_launcher::Request> {
+    let command = request.line.split_whitespace().next().unwrap_or_default();
+    if !matches!(
+        command,
+        "mods-list" | "mods-set" | "mods-delete" | "mods-install"
+    ) {
+        return Some(request);
+    }
+    let install = command == "mods-install";
+    let line = request.line.clone();
+    let home = Game::game_dir();
+    let (sender, receiver) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("launcher-mod-files".into())
+        .spawn(move || {
+            let result = horizon_client::mod_registry::with_content_snapshot(&home, || {
+                if install {
+                    mods_control::install_arg(&line)
+                        .and_then(|path| mods_control::install(&home, &path))
+                } else {
+                    mods_control::command(&home, &line)
+                        .map(|value| value.unwrap_or_default())
+                        .map_err(|error| error.to_string())
+                }
+            })
+            .and_then(|result| result);
+            let _ = sender.send(result);
+        });
+    match spawned {
+        Ok(_) => {
+            PENDING.with_borrow_mut(|pending| pending.push((Waiting::Mods(receiver), request)))
+        }
+        Err(error) => request.answer(&json!({"error":error.to_string()}).to_string()),
+    }
+    None
 }
 
 /// Install the archive named by `import PATH` on a worker: a prepared tree is hundreds of megabytes.
 fn start_import(request: horizon_ios_launcher::Request) {
-    if importing_archive() {
-        request.answer(r#"{"error":"Wait for the current import to finish."}"#);
+    if pending_file_operations() {
+        request.answer(r#"{"error":"Wait for the current file operation to finish."}"#);
         return;
     }
     let command = request.line.split_whitespace().next().unwrap_or_default();
@@ -250,6 +298,10 @@ impl Game<'_> {
                 request.answer(r#"{"error":"The game is stopping. Try again shortly."}"#);
                 continue;
             }
+            let Some(request) = mod_request(request) else {
+                continue;
+            };
+            let command = request.line.split_whitespace().next().unwrap_or_default();
             match command {
                 "launcher-visible" => {
                     let accepted = launcher_visibility(
@@ -274,6 +326,7 @@ impl Game<'_> {
                 "download-state" => request.answer(r#"{"phase":"done"}"#),
                 "launcher-start" => {
                     let accepted = !self.quit_to_launcher
+                        && !pending_file_operations()
                         && horizon_ios_launcher::start_owned(start_owner(&request.line));
                     request.answer(
                         &json!({
@@ -307,6 +360,9 @@ impl Game<'_> {
         }
         // Game files that arrive while the game runs are read on its next start.
         deliver();
+        if mods_control::take_dirty() {
+            mods_control::reload(&mut self.settings, &Game::game_dir());
+        }
     }
 
     /// `launcher-world`: Select World's Play by folder here; the rest is files (`world_files`).
@@ -492,6 +548,10 @@ impl Loading {
                 request.answer(r#"{"error":"The game is stopping. Try again shortly."}"#);
                 continue;
             }
+            let Some(request) = mod_request(request) else {
+                continue;
+            };
+            let command = request.line.split_whitespace().next().unwrap_or_default();
             match command {
                 "launcher-visible" => {
                     let accepted = launcher_visibility(
@@ -509,8 +569,10 @@ impl Loading {
                     .to_string(),
                 ),
                 "launcher-start" => {
-                    if importing_archive() {
-                        request.answer(r#"{"error":"Wait for the current import to finish."}"#);
+                    if pending_file_operations() {
+                        request.answer(
+                            r#"{"error":"Wait for the current file operation to finish."}"#,
+                        );
                     } else {
                         if horizon_ios_launcher::waiting() {
                             self.refresh_import_root(&horizon_client::import::home())?;
@@ -588,6 +650,9 @@ impl Loading {
         }
         if deliver() && self.importing() && !horizon_ios_launcher::cancellation_requested() {
             self.files_arrived()?;
+        }
+        if mods_control::take_dirty() {
+            mods_control::reload(&mut self.settings, &Game::game_dir());
         }
         Ok(())
     }

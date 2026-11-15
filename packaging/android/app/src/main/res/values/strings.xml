@@ -154,4 +154,8 @@
     <string name="download_sign_in">This link opens a sign-in page. Download the ZIP in your browser first, then choose Import Game Files ZIP.</string>
     <string name="download_no_space">There is not enough free space for the game files. Free at least 2 GB, then retry or import your ZIP.</string>
     <string name="download_connection_error">The download connection failed. Check your connection and retry, or download the ZIP in your browser and import it.</string>
+    <string name="no_resource_packs">No resource packs installed</string>
+    <string name="no_shader_packs">No shader packs installed</string>
+    <string name="no_mods">No content mods installed</string>
+    <string name="mods_next_launch">Changes apply next time the game starts</string>
 </resources>

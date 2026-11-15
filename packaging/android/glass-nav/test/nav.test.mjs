@@ -101,6 +101,10 @@ test('bundled GlassNav selects native tabs, accepts native updates, and drags it
     assert.equal(await page.locator('#root > .lg-track > .lg-track__glass').evaluate(el=>getComputedStyle(el).backdropFilter),'none');
     await page.evaluate(()=>window.horizonNav.configure({index:99,labels:['Bad'],reduced:false}));
     assert.equal(await page.getByRole('tab',{name:'Jouer',exact:true}).count(),1);
+    await page.evaluate(()=>window.horizonNav.configure({index:1,labels:['Play','Packs','Settings'],nativePill:true}));
+    await page.waitForFunction(()=>document.documentElement.classList.contains('native-pill'));
+    assert.equal(await page.locator('.lg-track__lens').first().evaluate(el=>getComputedStyle(el).visibility),'hidden');
+    assert.equal(await page.getByRole('tab',{name:'Packs',exact:true}).count(),1);
     assert.deepEqual(network,[],'the bundled navigation must work without network requests');
     await page.evaluate(()=>window.horizonNav.configure({index:0,labels:['Play','Packs','Settings'],reduced:false}));
     await page.screenshot({path:'/workspace/scratch/horizon-glass-nav.png'});

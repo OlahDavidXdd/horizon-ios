@@ -52,10 +52,10 @@ public final class HorizonActivity extends NativeActivity {
     private FrameLayout overlay, backdrop;
     private Dialog launcherWindow;
     private LinearLayout page, navigation;
-    private FrameLayout navigationDock;
+    private GlassNavigationDock navigationDock;
     private android.webkit.WebView glassNavigation;
     private boolean glassNavigationReady;
-    private long lastGlassMove;
+    private int pageGeneration;
     private TextView status, setupDescription;
     private ProgressBar setupProgress;
     private boolean needsResources = true, setupBusy, installingResources, automaticSetupAttempted;
@@ -146,7 +146,7 @@ public final class HorizonActivity extends NativeActivity {
             item.setMargins(dp(3), 0, dp(3), 0); navigation.addView(b, item);
         }
         navigation.setPadding(dp(5), dp(5), dp(5), dp(5));
-        navigationDock = new FrameLayout(this);
+        navigationDock = new GlassNavigationDock(this, this::selectNavigationIndex);
         FrameLayout.LayoutParams fallbackBounds = new FrameLayout.LayoutParams(-1, dp(70));
         fallbackBounds.gravity = Gravity.CENTER; navigationDock.addView(navigation, fallbackBounds);
         navigation.setBackground(rounded(0xff1b2d38, 0x267fa59f, 30));
@@ -205,23 +205,6 @@ public final class HorizonActivity extends NativeActivity {
             web.setOverScrollMode(View.OVER_SCROLL_NEVER); web.setContentDescription(t("navigation"));
             web.setOnLongClickListener(view -> true);
             web.setLongClickable(false);
-            web.setOnTouchListener((view, event) -> {
-                if(!glassNavigationReady) return false;
-                int action = event.getActionMasked();
-                android.view.ViewParent parent = view.getParent();
-                if(parent != null) parent.requestDisallowInterceptTouchEvent(action != MotionEvent.ACTION_UP && action != MotionEvent.ACTION_CANCEL);
-                String kind;
-                if(action == MotionEvent.ACTION_DOWN) { kind = "down"; lastGlassMove = 0; }
-                else if(action == MotionEvent.ACTION_MOVE) {
-                    if(event.getEventTime()-lastGlassMove < 16) return true;
-                    kind = "move"; lastGlassMove = event.getEventTime();
-                } else if(action == MotionEvent.ACTION_UP) kind = "up";
-                else if(action == MotionEvent.ACTION_CANCEL || (action == MotionEvent.ACTION_POINTER_UP && event.getActionIndex() == 0)) kind = "cancel";
-                else return true;
-                float x = event.getX() / Math.max(1,view.getWidth()), y = event.getY() / Math.max(1,view.getHeight());
-                web.evaluateJavascript("window.horizonNav && window.horizonNav.touch('"+kind+"',"+x+","+y+")",null);
-                return true; // Android retains the stream; WebView cannot turn it into scroll/zoom.
-            });
             android.webkit.WebSettings settings = web.getSettings();
             settings.setJavaScriptEnabled(true); // Trusted bundled code only; all network/file access is blocked.
             settings.setBlockNetworkLoads(true); settings.setAllowFileAccess(false); settings.setAllowContentAccess(false);
@@ -255,8 +238,13 @@ public final class HorizonActivity extends NativeActivity {
         }
         @android.webkit.JavascriptInterface public void select(int index) {
             if(index < 0 || index > 2) return;
-            ui.post(() -> { if(!destroyed && glassNavigationReady) { tab = new String[]{"play","packs","settings"}[index]; render(); } });
+            ui.post(() -> { if(!destroyed && glassNavigationReady) selectNavigationIndex(index); });
         }
+    }
+    private void selectNavigationIndex(int index) {
+        if(index < 0 || index > 2) return;
+        String next = new String[]{"play","packs","settings"}[index];
+        if(!tab.equals(next)) { tab=next; render(); }
     }
     private void nativeNavigationFallback(android.webkit.WebView view) {
         glassNavigationReady = false; navigation.setVisibility(View.VISIBLE);
@@ -324,9 +312,11 @@ public final class HorizonActivity extends NativeActivity {
         page.addView(box, bounds); return box;
     }
     private void refreshNavigation() {
+        navigationDock.select(tab.equals("play") ? 0 : tab.equals("packs") ? 1 : 2);
         if(glassNavigationReady && glassNavigation != null) {
             JSONObject state = new JSONObject();
             try {
+                state.put("nativePill",true);
                 state.put("index", tab.equals("play") ? 0 : tab.equals("packs") ? 1 : 2);
                 state.put("labels", new JSONArray(new String[]{t("play"),t("packs"),t("settings")}));
                 state.put("reduced",getPreferences(0).getBoolean("reduce_transparency",false));
@@ -335,7 +325,7 @@ public final class HorizonActivity extends NativeActivity {
         }
         for(int i=0;i<navigation.getChildCount();i++) {
             Button item = (Button)navigation.getChildAt(i); boolean selected = tab.equals(item.getTag());
-            item.setBackground(rounded(selected ? 0x294b9b8c : Color.TRANSPARENT, selected ? 0x205fb7a6 : 0, 24));
+            item.setBackgroundColor(Color.TRANSPARENT);
             item.setTextColor(selected ? 0xffb3ffea : 0xffa1b6bf);
             for(android.graphics.drawable.Drawable icon : item.getCompoundDrawablesRelative()) if(icon != null) icon.setTint(selected ? 0xffb3ffea : 0xffa1b6bf);
         }
@@ -379,6 +369,7 @@ public final class HorizonActivity extends NativeActivity {
         } else launcherWindow.hide();
     }
     void render() {
+        pageGeneration++;
         setupDescription = null; setupProgress = null;
         page.removeAllViews(); refreshNavigation(); heading(tab);
         switch (tab) {
@@ -507,57 +498,79 @@ public final class HorizonActivity extends NativeActivity {
             prompt("server_name", "", name -> ask("server-add " + address + " " + (name.isEmpty() ? address : name), v -> render()));
         });
     }
+    private boolean currentPacks(int generation) { return !destroyed && pageGeneration==generation && tab.equals("packs"); }
+    private LinearLayout packSection(String title) {
+        heading(title);
+        LinearLayout section=new LinearLayout(this); section.setOrientation(LinearLayout.VERTICAL);
+        page.addView(section); return section;
+    }
     private void packs() {
+        final int generation=pageGeneration;
         addButton("import_resources", () -> pick("resources"));
         addButton("import_pack", () -> pick("pack"));
         addButton("import_shader", () -> pick("shader"));
         addButton("import_mod", () -> pick("mod"));
-        heading("resource_packs");
-        File[] files = new File(homeDir(), "resourcepacks").listFiles();
-        if (files != null) ask("options-get resourcePacks", result -> {
-            JSONObject option = result.optJSONObject("options");
-            JSONObject description = option == null ? null : option.optJSONObject("resourcePacks");
-            JSONArray selected = description == null ? new JSONArray() : description.optJSONArray("value");
-            Set<String> active = new LinkedHashSet<>();
-            if (selected != null) for (int i=0; i<selected.length(); i++) active.add(selected.optString(i));
-            for (File file : files) {
-                CheckBox check = new CheckBox(this); check.setText(file.getName()); check.setTextColor(Color.WHITE);
-                check.setChecked(active.contains("file/" + file.getName()));
-                check.setOnCheckedChangeListener((b, on) -> {
-                    if (on) active.add("file/" + file.getName()); else active.remove("file/" + file.getName());
-                    ask("options-set resourcePacks " + new JSONArray(active), v -> {});
-                });
-                LinearLayout packRow=row();packRow.addView(check,new LinearLayout.LayoutParams(0,-2,1));
-                packRow.addView(button("move_up",() -> {
-                    String id="file/"+file.getName();List<String> order=new ArrayList<>(active);int index=order.indexOf(id);
-                    if(index>=0&&index<order.size()-1){Collections.swap(order,index,index+1);active.clear();active.addAll(order);ask("options-set resourcePacks "+new JSONArray(order),v -> render());}
-                }));
-                packRow.addView(button("move_down",() -> {
-                    String id="file/"+file.getName();List<String> order=new ArrayList<>(active);int index=order.indexOf(id);
-                    if(index>0){Collections.swap(order,index,index-1);active.clear();active.addAll(order);ask("options-set resourcePacks "+new JSONArray(order),v -> render());}
-                }));page.addView(packRow);
-            }
-        });
-        heading("shader_packs");
-        ask("shader-pack list", result -> {
-            addButton("disable_shader", () -> ask("shader-pack off", v -> render()));
-            File[] shaders = new File(homeDir(), "shaderpacks").listFiles();
-            if (shaders != null) for (File shader : shaders) addButton(shader.getName(), () -> ask("shader-pack " + shader.getName(), v -> render()));
-        });
-        heading("mods");
-        ask("mods-list", result -> {
-            JSONArray mods = result.optJSONArray("mods");
-            if (mods != null) for (int i=0; i<mods.length(); i++) {
-                JSONObject mod = mods.optJSONObject(i); if (mod == null) continue;
-                CheckBox check = new CheckBox(this); check.setText(mod.optString("name", mod.optString("id"))); check.setTextColor(Color.WHITE);
-                check.setChecked(mod.optBoolean("enabled"));
+        LinearLayout resources=packSection("resource_packs");
+        LinearLayout shaders=packSection("shader_packs");
+        LinearLayout modsSection=packSection("mods");
+        File[] files = new File(homeDir(), "resourcepacks").listFiles(file -> file.isDirectory() || file.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".zip"));
+        if(files==null || files.length==0) resources.addView(detail(t("no_resource_packs")));
+        else request("options-get resourcePacks", result -> {
+            if(!currentPacks(generation)) return;
+            JSONObject option=result.optJSONObject("options");
+            JSONObject description=option==null ? null : option.optJSONObject("resourcePacks");
+            JSONArray selected=description==null ? null : description.optJSONArray("value");
+            Set<String> active=new LinkedHashSet<>();
+            if(selected!=null) for(int i=0;i<selected.length();i++) active.add(selected.optString(i));
+            for(File file:files) {
+                String id="file/"+file.getName();
+                CheckBox check=new CheckBox(this); check.setText(file.getName()); check.setTextColor(Color.WHITE); check.setChecked(active.contains(id));
                 check.setOnCheckedChangeListener((b,on) -> {
-                    JSONObject args = object("id", mod.optString("id"));
-                    try { args.put("on", on); } catch (JSONException e) { throw new IllegalStateException(e); }
-                    ask("mods-set " + args, v -> {});
-                }); page.addView(check);
+                    if(on) active.add(id); else active.remove(id);
+                    ask("options-set resourcePacks "+new JSONArray(active),v -> {});
+                });
+                LinearLayout packRow=row(); packRow.addView(check,new LinearLayout.LayoutParams(0,-2,1));
+                for(int direction:new int[]{1,-1}) packRow.addView(button(direction==1 ? "move_up" : "move_down", () -> {
+                    List<String> order=new ArrayList<>(active); int index=order.indexOf(id), target=index+direction;
+                    if(index>=0 && target>=0 && target<order.size()) {
+                        Collections.swap(order,index,target); active.clear(); active.addAll(order);
+                        ask("options-set resourcePacks "+new JSONArray(order),v -> { if(currentPacks(generation)) render(); });
+                    }
+                }));
+                resources.addView(packRow);
             }
-        });
+        }, message -> { if(currentPacks(generation)) resources.addView(detail(message)); });
+        request("shader-pack list", result -> {
+            if(!currentPacks(generation)) return;
+            shaders.addView(button("disable_shader", () -> ask("shader-pack off",v -> { if(currentPacks(generation)) render(); })));
+            File[] installed=new File(homeDir(),"shaderpacks").listFiles(file -> file.isDirectory() || file.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".zip"));
+            if(installed==null || installed.length==0) shaders.addView(detail(t("no_shader_packs")));
+            else for(File shader:installed) shaders.addView(button(shader.getName(), () -> ask("shader-pack "+shader.getName(),v -> { if(currentPacks(generation)) render(); })));
+        }, message -> { if(currentPacks(generation)) shaders.addView(detail(message)); });
+        request("mods-list", result -> {
+            if(!currentPacks(generation)) return;
+            JSONArray mods=result.optJSONArray("mods");
+            if(mods==null || mods.length()==0) modsSection.addView(detail(t("no_mods")));
+            else modsSection.addView(detail(t("mods_next_launch")));
+            if(mods!=null) for(int i=0;i<mods.length();i++) {
+                JSONObject mod=mods.optJSONObject(i); if(mod==null) continue;
+                CheckBox check=new CheckBox(this); check.setText(mod.optString("name",mod.optString("id"))); check.setTextColor(Color.WHITE);
+                check.setChecked(mod.optBoolean("enabled"));
+                String problem=mod.optString("problem","");
+                boolean available=problem.isEmpty() && !mod.optBoolean("code"); check.setEnabled(available);
+                check.setOnCheckedChangeListener((b,on) -> {
+                    check.setEnabled(false);
+                    JSONObject args=object("id",mod.optString("id"));
+                    try { args.put("on",on); } catch(JSONException e) { throw new IllegalStateException(e); }
+                    request("mods-set "+args,v -> { if(currentPacks(generation)) render(); },message -> {
+                        if(!currentPacks(generation)) return;
+                        check.setOnCheckedChangeListener(null); check.setChecked(!on); check.setEnabled(available); error(message);
+                    });
+                });
+                modsSection.addView(check);
+                if(!problem.isEmpty()) modsSection.addView(detail(problem));
+            }
+        }, message -> { if(currentPacks(generation)) modsSection.addView(detail(message)); });
     }
     File homeDir() { File f = getExternalFilesDir(null); return f == null ? getFilesDir() : f; }
     private void pick(String kind) {
@@ -723,7 +736,7 @@ public final class HorizonActivity extends NativeActivity {
         transparency.setChecked(getPreferences(0).getBoolean("reduce_transparency",false));
         transparency.setOnCheckedChangeListener((b,on) -> { getPreferences(0).edit().putBoolean("reduce_transparency",on).apply(); refreshNavigation(); });
         page.addView(transparency);
-        page.addView(label("Horizon · 0.2.99-android · ARM64",14));
+        page.addView(label("Horizon · 0.2.100-android · ARM64",14));
     }
     static byte[] readBytes(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -1069,6 +1082,7 @@ public final class HorizonActivity extends NativeActivity {
                 report.append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append(" API ").append(Build.VERSION.SDK_INT).append('\n');
                 android.content.pm.PackageInfo web = android.webkit.WebView.getCurrentWebViewPackage();
                 report.append("WebView: ").append(web == null ? "unavailable" : web.packageName + " " + web.versionName).append('\n');
+                report.append("Navigation: native UI-thread selector; artwork=").append(glassNavigationReady ? "Liquid-Glass WebView" : "Android fallback").append('\n');
                 report.append("Free bytes: ").append(homeDir().getUsableSpace()).append('\n');
                 if(Build.VERSION.SDK_INT >= 30) {
                     report.append("\nRecent process exits:\n");
@@ -1172,6 +1186,7 @@ public final class HorizonActivity extends NativeActivity {
         super.onResume();if(glassNavigation != null) glassNavigation.onResume();cancelGlassGesture();ui.removeCallbacks(watch);if(overlay!=null)ui.post(watch);
     }
     private void cancelGlassGesture() {
+        if(navigationDock != null) navigationDock.cancelGesture();
         if(glassNavigation != null && glassNavigationReady) glassNavigation.evaluateJavascript("window.horizonNav && window.horizonNav.suspend()",null);
     }
     @Override protected void onDestroy() { destroyed = true; if(activePartsRead != null)activePartsRead.cancel(); if(glassNavigation != null) { glassNavigation.removeJavascriptInterface("HorizonNav"); navigationDock.removeView(glassNavigation); glassNavigation.destroy(); glassNavigation=null; } if(launcherWindow!=null)launcherWindow.dismiss(); if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener); ui.removeCallbacksAndMessages(null); workers.shutdownNow(); super.onDestroy(); }
