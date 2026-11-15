@@ -65,6 +65,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.ANDROID_TARGET }}
+      - name: Test Android surface lifecycle ordering
+        run: |
+          rustc --edition=2024 --test crates/horizon-client-render/src/gfx/android_surface.rs -o "$RUNNER_TEMP/android-surface-tests"
+          "$RUNNER_TEMP/android-surface-tests"
       - name: Test Max Performance distance preservation
         run: |
           rustc --edition=2024 --test packaging/android/tests/max_performance.rs -o "$RUNNER_TEMP/max-performance-tests"
@@ -225,16 +229,16 @@ jobs:
           actual=$(sed -nE 's/.*certificate SHA-256 digest: ([[:xdigit:]]{64}).*/\1/p' "$RUNNER_TEMP/signature.txt" | tr '[:upper:]' '[:lower:]' | sort -u)
           test "$actual" = "$EXPECTED_ANDROID_CERT_SHA256"
           "$tools/aapt" dump badging Horizon-Android.apk | grep "versionCode='$number'"
-          tag="android-v0.2.102-build-${number}"
+          tag="android-v0.2.103-build-${number}"
           cat > notes.md <<'NOTES'
-          Replaces the launcher glass rendering path with a native Android bar using the rounded-rectangle refraction shader from Seyud/WeaveMask (GPL-3.0-or-later). The bar and highlighted pill draw behind native icons/labels and follow Android touch events directly. Android 13+ uses native AGSL refraction with local backdrop capture and vibrancy; older devices retain visible native highlights. The glass no longer depends on WebView. License, shader source and attribution are bundled; full corresponding source is available at the attached source commit.
+          Restores the pre-WeaveMask zakisheriff/Liquid-Glass launcher bar and the native finger-tracking pill. Retains bundled offline assets, reduced-transparency preference and native fallback. Repeated WebView failure callbacks now detach the failed view only once. WeaveMask shader code is removed.
 
-          Adds Max Performance to the in-game Video Settings graphics preset slider and launcher Settings → Game Settings. Turns off clouds, sky, fog, weather, animated textures, particles rendering, shadows, AO, mipmaps/filtering, post effects, shader packs, HDR and frame generation, and uses minimum simulation distance. Keeps the chosen chunk render distance, FPS cap, controls, audio and resource-pack selection. Resolution stays native. Culling remains enabled as a performance optimization.
+          Fixes an Android renderer lifecycle bug: after native-window destruction, queued resizes must not unpause rendering or allocate an offscreen target. Resizes are deferred until the native surface returns, duplicate resumes keep a live swapchain, and resume respects zero-size suspension while refreshing size-dependent targets. Includes regression tests for late resize, duplicate resume and explicit offscreen rendering. This fixes a concrete lifecycle failure; the reported intermittent Play crash still needs a device trace to confirm its cause.
 
-          Uses the same permanent signing key as 0.2.101, so install this APK directly over 0.2.101 to retain game files and saves. The release gate verifies the pinned certificate. No uninstall is needed when upgrading from 0.2.101. Older temporary-key builds still require the previously documented one-time migration.
+          Share Logs now includes bounded startup lifecycle records (surface events, startup phases and app pause/resume), alongside existing engine logs and Android process-exit traces. No account responses, commands or credentials are recorded.
 
-          Retains the working Play surface-settling, 120 Hz display mode, game-file downloads/imports and Packs controls. Full native rebuild. ARM64 Android 8+ with Vulkan. Device confirmation of glass appearance and the new preset is still needed. No Mojang game files or credentials are bundled.
+          Keeps Max Performance, your selected chunk render distance, 120 Hz support, downloads/imports and the permanent signing key. Install over 0.2.101/0.2.102 without uninstalling to retain files. Full native rebuild. ARM64 Android 8+ with Vulkan. Physical-device confirmation is still needed.
           NOTES
-          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --target "$expected" --title "Horizon Android 0.2.102 · build ${number}" --notes-file notes.md --prerelease --draft
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --target "$expected" --title "Horizon Android 0.2.103 · build ${number}" --notes-file notes.md --prerelease --draft
           gh release upload "$tag" Horizon-Android.apk Horizon-Android.apk.sha256 source-commit.txt native-source-commit.txt
           gh release edit "$tag" --draft=false

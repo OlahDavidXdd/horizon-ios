@@ -21,7 +21,6 @@ ORIGINAL_JDK_TOOLS = {
     "packaging/android/app/src/main/java/dev/horizon/android/PreparedResources.java",
     "packaging/android/app/src/main/java/dev/horizon/android/RefreshRatePolicy.java",
     "packaging/android/app/src/main/java/dev/horizon/android/ResourceVolumes.java",
-    "packaging/android/app/src/main/java/dev/horizon/android/WeaveGlassPainter.java",
     "packaging/android/tests/DisplayStartupTest.java",
     "packaging/android/tests/GlassDragStateTest.java",
     "packaging/android/tests/PreparedResourcesTest.java",

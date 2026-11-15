@@ -62,6 +62,8 @@ fn static_entity_shader() -> String {
 
 #[cfg(test)]
 mod crumbling_tests;
+#[cfg(any(target_os = "android", test))]
+mod android_surface;
 mod entity_batch;
 mod entity_outline;
 mod fluid;
@@ -1547,6 +1549,8 @@ pub struct Renderer {
     readback: readback::Readback,
     pub info: wgpu::AdapterInfo,
     pub suspended: bool,
+    #[cfg(target_os = "android")]
+    android_surface: android_surface::Lifecycle,
     /// Consecutive frames whose surface acquisition failed validation. The
     /// first gets the swapchain a fresh configuration; later ones reattach
     /// the window, as a lost surface does.
@@ -5264,6 +5268,8 @@ impl Renderer {
             readback: readback::Readback::default(),
             info,
             suspended: !drawable_size(size.width, size.height, max_side),
+            #[cfg(target_os = "android")]
+            android_surface: android_surface::Lifecycle::default(),
             acquire_validation_failures: 0,
             surface_unconfigured: false,
             drawn_sections: 0,
@@ -5471,6 +5477,7 @@ impl Renderer {
     /// the old surface in the renderer-replacement slot across that boundary.
     #[cfg(target_os = "android")]
     pub fn suspend_android_surface(&mut self) {
+        self.android_surface.suspend();
         self.frame_gen.stop();
         self.queue.wait();
         self.surface = None;
@@ -5483,8 +5490,14 @@ impl Renderer {
 
     #[cfg(target_os = "android")]
     pub fn resume_android_surface(&mut self) -> Result<()> {
+        if !self.android_surface.needs_resume(self.surface.is_some(), self.offscreen.is_some()) {
+            return Ok(());
+        }
         self.recreate_surface()?;
-        self.suspended = false;
+        self.android_surface.resumed();
+        // Preserve zero-size suspension and rebuild size-dependent targets for the new window.
+        let size=self.window.inner_size();
+        self.resize(size.width,size.height);
         Ok(())
     }
 
@@ -5635,6 +5648,11 @@ impl Renderer {
     /// Follows the window to `width` x `height`. A size the swapchain can't take
     /// ([`drawable_size`]) keeps the last one and draws nothing until the next.
     pub fn resize(&mut self, width: u32, height: u32) {
+        #[cfg(target_os = "android")]
+        if self.android_surface.defer_resize() {
+            // TermWindow has no swapchain. A queued resize is not an offscreen-render request.
+            return;
+        }
         if [width, height] != [self.config.width, self.config.height]
             || self.suspended
             || self.offscreen.is_some()

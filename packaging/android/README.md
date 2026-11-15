@@ -15,17 +15,13 @@ queue and start/cancel ownership protocol as the iOS launcher. Refresh tokens an
 Minecraft sessions are encrypted with a device-local Android Keystore AES-GCM key;
 app backups are disabled. The launcher never logs authentication responses.
 
-The bottom bar uses the native rounded-rectangle refraction shader from
-[Seyud/WeaveMask](https://github.com/Seyud/WeaveMask), pinned at commit
-`cc5c705265ad0f0db5f68348d4dc3435ca9d3f6d` (GPL-3.0-or-later). The AGSL lens,
-blur/vibrancy, native icons and Android finger-tracking pill draw in one native
-View tree. There is no WebView navigation rendering dependency. Android 13+ uses
-RuntimeShader; older devices and reduced-transparency mode keep a visible native
-bar and highlights. The local background capture excludes controls and account
-content. The shader's complete source, license and upstream attribution are bundled
-under `assets/weave-glass/`; the original compatible component notices are retained.
-The combined APK is distributed in accordance with GPL-3.0-or-later, with complete
-corresponding source in this repository at its recorded source commit.
+The bottom bar restores [zakisheriff/Liquid-Glass](https://github.com/zakisheriff/Liquid-Glass)
+(MIT, bundled npm 4.0.0) from before the WeaveMask change. A trusted local WebView
+supplies the bar artwork; Android owns the finger-tracking pill and tab selection.
+No remote content is loaded. The native fallback remains usable if WebView fails,
+and repeated failure callbacks detach the failed view only once. See
+[glass-nav/README.md](glass-nav/README.md) for the local bundle build/test commands.
+WeaveMask's shader and adapter are removed from the app.
 
 Game-file setup tries the same automatic source used by iOS. ZIP import and an owner-private browser download remain available when that source fails. No broad storage permission is needed: downloads/import staging use app-private storage, and the system picker grants access to the chosen file. Custom HTTPS direct links still download inside the app; Retry reuses the saved link.
 
@@ -111,3 +107,15 @@ effects and shader packs, and leaves audio, controls and resource packs selected
 The world still draws at native resolution. Particle geometry is omitted while
 this preset is selected. Returning to another preset restores that preset's
 settings; individually changing options can make the preset Custom.
+
+Android renderer suspension now tracks native-window availability separately from
+a zero-size drawable. Late resize events cannot unpause rendering or manufacture
+an offscreen target after surface destruction. Resume recreates a missing surface
+once, refreshes size-dependent targets, and retains suspension for zero dimensions.
+Duplicate resume events preserve an already-live swapchain. The pure lifecycle
+policy is regression-tested without a GPU and the Android build checks integration.
+
+Share Logs includes bounded `startup-lifecycle.log` records of Play phases, surface
+dimensions and pause/resume, plus the previous journal segment. These records do
+not contain commands, account names, authentication responses, URLs or tokens.
+An actual process-exit trace is still needed to identify any remaining device crash.

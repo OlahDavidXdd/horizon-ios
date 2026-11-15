@@ -1,5 +1,0 @@
-WeaveMask native liquid glass lens
-https://github.com/Seyud/WeaveMask/blob/cc5c705265ad0f0db5f68348d4dc3435ca9d3f6d/app/apk/src/main/java/io/github/seyud/weave/ui/component/liquid/Lens.kt
-License: GPL-3.0-or-later (LICENSE.txt).
-The non-dispersion shader and rounded-rectangle SDF are imported verbatim from the Kotlin string constants, with the string interpolation expanded. The Android View adapter binds dock coordinates and a locally captured background instead of Compose BackdropEffectScope. Vibrancy uses the source component saturation of 1.5.
-Complete Horizon source: https://github.com/OlahDavidXdd/horizon-ios/tree/android-port
