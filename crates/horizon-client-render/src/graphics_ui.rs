@@ -188,7 +188,7 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         v(
                             Opt::Preset,
                             None,
-                            "Vanilla's own preset: sets only vanilla's options, as Minecraft does.",
+                            "horizon.graphics.preset.description",
                         ),
                     ],
                 ),

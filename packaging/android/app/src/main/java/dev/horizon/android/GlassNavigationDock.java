@@ -7,18 +7,21 @@ import android.view.*;
 import android.widget.FrameLayout;
 import java.util.function.IntConsumer;
 
-/** Liquid-Glass supplies the bar artwork; Android draws the moving foreground lens. */
+/** Native glass bar and finger-tracking pill; no WebView or animation-frame bridge. */
 final class GlassNavigationDock extends FrameLayout {
     private final GlassDragState drag=new GlassDragState(3);
-    private final Paint fill=new Paint(Paint.ANTI_ALIAS_FLAG), rim=new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final WeaveGlassPainter glass;
     private final IntConsumer selected;
     private ValueAnimator settle;
     private float center;
     GlassNavigationDock(Context context,IntConsumer selected) {
         super(context); this.selected=selected; setWillNotDraw(false);
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
-        rim.setStyle(Paint.Style.STROKE); rim.setStrokeWidth(dp(1)); rim.setColor(0x507df5d4);
+        glass=new WeaveGlassPainter(context);
     }
+    void backdrop(Bitmap bitmap) { glass.backdrop(bitmap); invalidate(); }
+    void reduced(boolean reduced) { glass.reduced(reduced); invalidate(); }
+    String backend() { return glass.backend(); }
     private float dp(float value) { return value*getResources().getDisplayMetrics().density; }
     @Override protected void onSizeChanged(int w,int h,int ow,int oh) {
         super.onSizeChanged(w,h,ow,oh); stop(); drag.layout(w,dp(5)); center=drag.position;
@@ -60,15 +63,13 @@ final class GlassNavigationDock extends FrameLayout {
     @Override public boolean performClick() { super.performClick(); return true; }
     @Override public void onWindowFocusChanged(boolean focus) { super.onWindowFocusChanged(focus); if(!focus) cancelGesture(); }
     @Override protected void onDetachedFromWindow() { stop(); super.onDetachedFromWindow(); }
-    @Override protected void dispatchDraw(Canvas canvas) {
-        super.dispatchDraw(canvas);
+    @Override protected void onDraw(Canvas canvas) {
+        super.onDraw(canvas);
         if(drag.slot<=1) return;
-        float width=drag.slot-dp(drag.pressed?0:8), height=dp(drag.pressed?58:48);
-        float cy=getHeight()/2f, top=cy-height/2f, bottom=cy+height/2f;
-        RectF lens=new RectF(center-width/2f,top,center+width/2f,bottom);
-        fill.setShader(new LinearGradient(lens.left,top,lens.right,bottom,
-            new int[]{0x327cffe0,0x0ef1fffc,0x2460d7c4},null,Shader.TileMode.CLAMP));
-        canvas.drawRoundRect(lens,height/2f,height/2f,fill);
-        canvas.drawRoundRect(lens,height/2f,height/2f,rim);
+        float cy=getHeight()/2f;
+        glass.draw(canvas,new RectF(dp(5),cy-dp(35),getWidth()-dp(5),cy+dp(35)),dp(1),false,false);
+        float width=drag.slot-dp(drag.pressed?0:8), height=dp(drag.pressed?58:50);
+        glass.draw(canvas,new RectF(center-width/2,cy-height/2,center+width/2,cy+height/2),dp(1),true,drag.pressed);
+        // Children (native icons/labels/accessibility targets) are drawn above the refracted backdrop.
     }
 }

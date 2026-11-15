@@ -1,5 +1,7 @@
 {
   "options.graphics.low": "Low",
+  "options.graphics.max_performance": "Max Performance",
+  "horizon.graphics.preset.description": "Graphics preset. Max Performance turns off visual effects and keeps your chunk render distance.",
   "horizon.no_resources.title": "No prepared game files",
   "horizon.no_resources.prepare": "Prepare them with horizon-prepare --prepare, or pass --resources <folder>.",
   "horizon.no_resources.looked_in": "No prepared game files in %s",

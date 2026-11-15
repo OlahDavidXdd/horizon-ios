@@ -166,4 +166,7 @@
     <string name="waiting_for_engine">Waiting for the game engine. Try again shortly.</string>
     <string name="previous_launch_failed">The previous game launch did not finish. If it keeps closing, use Settings → Share Logs to send the crash report.</string>
     <string name="landscape_not_ready">The game display is not ready. Try Play again after the phone rotates to landscape.</string>
+    <string name="max_performance">Max Performance</string>
+    <string name="max_performance_description">Disables visual effects and shader packs, uses minimum simulation distance, and keeps your chunk render distance and FPS limit.</string>
+    <string name="max_performance_applied">Max Performance applied. Render distance unchanged.</string>
 </resources>

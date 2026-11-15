@@ -440,3 +440,7 @@ instructions are in `packaging/android/glass-nav/README.md`.
 ## Android private archive assembly
 
 The Android launcher uses Apache Commons Compress 1.28.0, Commons IO 2.20.0, Commons Lang 3.18.0 and Commons Codec 1.19.0 (Apache-2.0), and XZ for Java 1.10 (0BSD) to assemble the owner’s five private Drive volumes. Complete upstream licenses and notices are packaged in `assets/archive-libraries/`. XZ’s COPYING comes from https://github.com/tukaani-project/xz-java/tree/v1.10. No Minecraft assets are packaged in the APK.
+
+## WeaveMask native liquid-glass shader
+
+The rounded-rectangle refraction shader in `packaging/android/app/src/main/assets/weave-glass/lens.agsl` is from [Seyud/WeaveMask Lens.kt](https://github.com/Seyud/WeaveMask/blob/cc5c705265ad0f0db5f68348d4dc3435ca9d3f6d/app/apk/src/main/java/io/github/seyud/weave/ui/component/liquid/Lens.kt), commit `cc5c705265ad0f0db5f68348d4dc3435ca9d3f6d`, licensed GPL-3.0-or-later. The shader constants are expanded from their Kotlin strings and used by an original Android View adapter. No Magisk/root implementation is included. The full GPL license and attribution are bundled under `assets/weave-glass/`. Distribution of the combined APK observes GPL-3.0-or-later; the existing MIT components retain their notices. Complete corresponding source, including build scripts, is public in this repository at the release's source commit.

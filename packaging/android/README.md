@@ -15,14 +15,17 @@ queue and start/cancel ownership protocol as the iOS launcher. Refresh tokens an
 Minecraft sessions are encrypted with a device-local Android Keystore AES-GCM key;
 app backups are disabled. The launcher never logs authentication responses.
 
-The bottom bar uses the actual `GlassNav` from
-[zakisheriff/Liquid-Glass](https://github.com/zakisheriff/Liquid-Glass), pinned to
-npm 4.0.0 (MIT). A local, network-blocked WebView hosts the React component and
-connects tap/drag selection to the native pages. It samples only the native dock
-background; no account data enters the web content. The JavaScript bundle and
-licenses are embedded in the APK. See [glass-nav/README.md](glass-nav/README.md)
-for build instructions. Reduce Transparency applies immediately. If the web
-renderer fails, native navigation remains available. Interrupted gestures are canceled on activity pause/resume, launcher visibility changes, lost capture, and a fresh pointer-down. Long presses suppress Android context menus and retain the touch stream for lens dragging.
+The bottom bar uses the native rounded-rectangle refraction shader from
+[Seyud/WeaveMask](https://github.com/Seyud/WeaveMask), pinned at commit
+`cc5c705265ad0f0db5f68348d4dc3435ca9d3f6d` (GPL-3.0-or-later). The AGSL lens,
+blur/vibrancy, native icons and Android finger-tracking pill draw in one native
+View tree. There is no WebView navigation rendering dependency. Android 13+ uses
+RuntimeShader; older devices and reduced-transparency mode keep a visible native
+bar and highlights. The local background capture excludes controls and account
+content. The shader's complete source, license and upstream attribution are bundled
+under `assets/weave-glass/`; the original compatible component notices are retained.
+The combined APK is distributed in accordance with GPL-3.0-or-later, with complete
+corresponding source in this repository at its recorded source commit.
 
 Game-file setup tries the same automatic source used by iOS. ZIP import and an owner-private browser download remain available when that source fails. No broad storage permission is needed: downloads/import staging use app-private storage, and the system picker grants access to the chosen file. Custom HTTPS direct links still download inside the app; Retry reuses the saved link.
 
@@ -100,3 +103,11 @@ Android draws and moves the selected pill on its UI thread, retaining release/ca
 Install from Google Drive Parts opens Android’s system file picker with multiple selection. Choose all five `Horizon-download.7z.001` through `.005` files from Drive or Downloads. The selected provider handles its own account authentication; Horizon reads only the granted URIs, downloads them into private staging, and reconstructs the known prepared ZIP with SHA-256 verification before native import. ZArchiver is not required. Keep at least 3 GB free. Commons Compress/XZ licenses are bundled in `assets/archive-libraries/`.
 
 Display refresh rate defaults to requesting a supported mode up to 120 Hz at the current resolution. Settings offers System default, 60 Hz and 120 Hz; selecting a fixed rate also sets maxFps. Both the native game surface and launcher window receive refresh hints. Android power policy and GPU performance still determine actual refresh/FPS. Play waits for a settled landscape surface before startup. Share Logs includes the requested rate and whether the previous startup was incomplete.
+
+Max Performance is a graphics preset in the in-game Video Settings slider, also
+available at launcher Settings → Game Settings. It preserves `renderDistance` and
+`maxFps`, lowers simulation to the supported minimum of 5, disables graphical
+effects and shader packs, and leaves audio, controls and resource packs selected.
+The world still draws at native resolution. Particle geometry is omitted while
+this preset is selected. Returning to another preset restores that preset's
+settings; individually changing options can make the preset Custom.

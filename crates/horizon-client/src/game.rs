@@ -7385,41 +7385,43 @@ impl Game<'_> {
         laps.lap("eg_objects");
         // Particles (ParticleEngine.extract): camera-facing quads.
         self.mark_stage(out.len(), "PARTICLES");
-        let world = &self.world;
-        let particle_mode = self.settings.horizon.particle_culling;
-        if particle_mode == horizon_client::graphics::ParticleCullingMode::Off {
-            self.particles.render(
-                camera,
-                self.particle_rotation(),
-                alpha as f32,
-                &|b| world.light(b[0], b[1], b[2]),
-                &mut out,
-            );
-        } else {
-            let frustum = self.view_frustum;
-            let pixel_focal_length = self.renderer.as_ref().map_or(0.0, |renderer| {
-                let tangent = (f64::from(fov_degrees).to_radians() * 0.5).tan();
-                if tangent.is_finite() && tangent > 0.0 {
-                    (f64::from(renderer.config.height.max(1)) / (2.0 * tangent)) as f32
-                } else {
-                    0.0
-                }
-            });
-            {
-                let mut particle_culling = self.particle_occlusion_context(camera);
-                self.particles.render_culled(
+        if self.settings.graphics_preset != "max_performance" {
+            let world = &self.world;
+            let particle_mode = self.settings.horizon.particle_culling;
+            if particle_mode == horizon_client::graphics::ParticleCullingMode::Off {
+                self.particles.render(
                     camera,
                     self.particle_rotation(),
                     alpha as f32,
-                    pixel_focal_length,
-                    true,
-                    frustum.as_ref(),
-                    &mut |min, max| particle_culling.hidden(min, max),
                     &|b| world.light(b[0], b[1], b[2]),
                     &mut out,
                 );
+            } else {
+                let frustum = self.view_frustum;
+                let pixel_focal_length = self.renderer.as_ref().map_or(0.0, |renderer| {
+                    let tangent = (f64::from(fov_degrees).to_radians() * 0.5).tan();
+                    if tangent.is_finite() && tangent > 0.0 {
+                        (f64::from(renderer.config.height.max(1)) / (2.0 * tangent)) as f32
+                    } else {
+                        0.0
+                    }
+                });
+                {
+                    let mut particle_culling = self.particle_occlusion_context(camera);
+                    self.particles.render_culled(
+                        camera,
+                        self.particle_rotation(),
+                        alpha as f32,
+                        pixel_focal_length,
+                        true,
+                        frustum.as_ref(),
+                        &mut |min, max| particle_culling.hidden(min, max),
+                        &|b| world.light(b[0], b[1], b[2]),
+                        &mut out,
+                    );
+                }
+                self.finish_async_particle_culling();
             }
-            self.finish_async_particle_culling();
         }
         laps.lap("eg_particles");
         // Breaking progress overlays (destroy_stage_0..9): ours and the other players'.

@@ -522,7 +522,7 @@ impl Opt {
             Opt::CloudRange => Some(126),
             Opt::EntityDistance => Some(18),
             Opt::BiomeBlend => Some(7),
-            Opt::Preset => Some(3),
+            Opt::Preset => Some((PRESETS.len() - 1) as u32),
             Opt::Mipmaps => Some(4),
             Opt::WeatherRadius => Some(7),
             Opt::ChunkFade => Some(40),
@@ -1279,7 +1279,7 @@ impl Opt {
         }
     }
 }
-const PRESETS: [&str; 5] = ["low", "fast", "fancy", "fabulous", "custom"];
+const PRESETS: [&str; 6] = ["low", "fast", "fancy", "fabulous", "max_performance", "custom"];
 fn preset_index(p: &str) -> usize {
     PRESETS.iter().position(|x| *x == p).unwrap_or(2)
 }
@@ -1312,6 +1312,10 @@ fn drag_slider(opt: Opt, s: &mut Settings, v: f32, events: &mut Vec<Event>) {
 }
 /// GraphicsPreset.apply: the options Low, Fast, Fancy and Fabulous set.
 pub fn apply_preset(s: &mut Settings) {
+    if s.graphics_preset == "max_performance" {
+        crate::max_performance::apply(s);
+        return;
+    }
     let fabulous = s.graphics_preset == "fabulous";
     match s.graphics_preset.as_str() {
         // Below vanilla's Fast: the preset a phone under memory pressure picks.

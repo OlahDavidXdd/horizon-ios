@@ -516,15 +516,11 @@ impl Loading {
             .and_then(|rest| rest.trim_start().strip_prefix(key))
             .map(str::trim)
             .unwrap_or_default();
-        if let Err(e) = file.set_text(key, value) {
-            return json!({ "error": e });
+        // Use the same validated preset callback and preserve all sidecar settings as the game.
+        match self.settings.with_option(key, value) {
+            Ok(settings) => self.settings = settings,
+            Err(error) => return json!({"error":error}),
         }
-        let mut settings = horizon_client::settings::Settings::from_file(file);
-        // Horizon's own files are not in options.txt.
-        std::mem::swap(&mut settings.horizon, &mut self.settings.horizon);
-        std::mem::swap(&mut settings.controller, &mut self.settings.controller);
-        std::mem::swap(&mut settings.extras, &mut self.settings.extras);
-        self.settings = settings;
         self.settings.save(
             &std::env::current_dir()
                 .unwrap_or_default()

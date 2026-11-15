@@ -561,6 +561,7 @@ impl Game<'_> {
     }
     /// Settings that Horizon applies beyond render distance, volume and GUI scale.
     pub(super) fn apply_ui_settings(&mut self) {
+        if self.settings.graphics_preset == "max_performance" { self.particles.clear(); }
         if horizon_client_render::mipmap::set_dither_cutouts(
             self.settings.horizon.dither_cutout_mips,
         ) {
