@@ -109,7 +109,7 @@ jobs:
             python3 - "$RUNNER_TEMP/native-input-changes.txt" <<'PYCODE'
           import pathlib, sys
           changed = pathlib.Path(sys.argv[1]).read_text().splitlines()
-          forbidden = [p for p in changed if not (p.startswith("packaging/android/") or p in {".github/workflows/android.yml", ".gitignore", "THIRD_PARTY_NOTICES.md"})]
+          forbidden = [p for p in changed if not (p.startswith("packaging/android/") or p in {".github/workflows/android.yml", "tools/check_public_tree.py", ".gitignore", "THIRD_PARTY_NOTICES.md"})]
           if forbidden:
               raise SystemExit("Native inputs changed; run a full Android build: " + ", ".join(forbidden))
           PYCODE
