@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       launcher_only:
-        description: Reuse the verified build-9 native library if native sources are unchanged
+        description: Reuse the verified build-16 native library if native sources are unchanged
         type: boolean
         default: false
       publish_release:
@@ -73,7 +73,7 @@ jobs:
           if [ "$LAUNCHER_ONLY" = true ]; then
             # This baseline was built with these exact native options. Reject a
             # launcher-only request if any engine, dependency or native build input changed.
-            baseline=f4824eaf996638689302a2a38e5e7712d0eb1449
+            baseline=d5efb985fbe09b99ca903159d93eed3b0041acc0
             test "$ANDROID_TARGET" = aarch64-linux-android
             test "$ANDROID_API" = 26
             test "$HORIZON_TELEMETRY_URL" = off
@@ -89,7 +89,7 @@ jobs:
           PYCODE
             original="$RUNNER_TEMP/native-baseline"
             mkdir -p "$original" "$(dirname "$so")"
-            gh release download android-v0.2.92-build-9 --repo "$GITHUB_REPOSITORY" --dir "$original" \
+            gh release download android-v0.2.98-build-16 --repo "$GITHUB_REPOSITORY" --dir "$original" \
               --pattern 'Horizon-Android.apk*' --pattern source-commit.txt
             test "$(cat "$original/source-commit.txt")" = "$baseline"
             ( cd "$original" && sha256sum --check Horizon-Android.apk.sha256 )
@@ -179,7 +179,7 @@ jobs:
 
           Builds without repository signing secrets use a development key: back up saves before replacing an existing installation.
 
-          Source provenance is recorded in `source-commit.txt` (launcher) and `native-source-commit.txt` (game library). Launcher-only builds verify that native sources, dependencies and native build inputs are unchanged before reusing the verified build-9 game library.
+          Source provenance is recorded in `source-commit.txt` (launcher) and `native-source-commit.txt` (game library). Launcher-only builds verify that native sources, dependencies and native build inputs are unchanged before reusing the verified build-16 game library.
 
           ARM64 Android 8+ with Vulkan. The web glass effect uses the installed Android System WebView. A renderer failure falls back to native navigation. Import prepared game files from your own copy of Minecraft. This APK contains no Mojang game assets.
 
