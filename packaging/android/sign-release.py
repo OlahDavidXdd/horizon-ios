@@ -2,6 +2,7 @@
 """Sign an unsigned CI artifact with the private permanent key, never a generated key."""
 import argparse
 import hashlib
+import re
 from pathlib import Path
 import subprocess
 
@@ -27,9 +28,8 @@ def main():
                     '--ks-key-alias', 'horizon', '--ks-pass', 'file:' + str(args.password_file.resolve()),
                     '--out', str(output), str(source)], check=True)
     verification = subprocess.check_output([str(args.apksigner), 'verify', '--print-certs', str(output)], text=True)
-    signers = [line.removeprefix('Signer #1 certificate SHA-256 digest: ') for line in verification.splitlines()
-               if line.startswith('Signer #1 certificate SHA-256 digest: ')]
-    if signers != [expected]:
+    signers = {digest.lower() for digest in re.findall(r'certificate SHA-256 digest:\s*([a-fA-F0-9]{64})\b', verification)}
+    if signers != {expected}:
         output.unlink(missing_ok=True)
         raise SystemExit('APK was not signed by the pinned permanent certificate')
     with output.open('rb') as stream:
